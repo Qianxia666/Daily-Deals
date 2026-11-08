@@ -783,7 +783,7 @@ export function AdminDashboard() {
               全局刷新间隔、AI 接口、代理与管理员密码都在这里设置。保存后立即生效；标注「需重建容器」的容器级参数除外。
             </p>
             <p className="mt-1 text-[11px] leading-relaxed text-amber-700">
-              若某项已在服务器 .env 中填写了非空值，则以 .env 为准，这里的修改不会生效；清空 .env 中该项后即可恢复由后台管理。
+              这里的修改优先于服务器 .env，保存后立即生效；未在后台修改过的项会读取 .env，修改 .env 后需重建容器才会生效。
             </p>
           </div>
 

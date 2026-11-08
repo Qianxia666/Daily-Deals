@@ -724,16 +724,16 @@ export function setSetting(key: string, value: string): void {
 }
 
 /**
- * 读取运行时配置：优先使用 .env / 环境变量中显式填写的非空值，
- * 其次回退到后台保存到 settings 的值，最后返回 null 表示都未配置。
- * 这样所有后台变量都可以在 .env 中直接覆盖；留空则继续沿用后台配置。
+ * 读取运行时配置：优先使用管理后台保存到 settings 的值，
+ * 其次回退到 .env / 环境变量，最后返回 null 表示都未配置。
+ * 网页配置始终优先，.env 作为首次部署或未在后台修改时的默认值。
  */
 export function getRuntimeEnvRaw(key: string): string | null {
-  const env = process.env[key];
-  if (env !== undefined && env.trim() !== '') return env;
-
   const stored = getSetting(`env:${key}`);
   if (stored !== null && stored.trim() !== '') return stored;
+
+  const env = process.env[key];
+  if (env !== undefined && env.trim() !== '') return env;
 
   return null;
 }

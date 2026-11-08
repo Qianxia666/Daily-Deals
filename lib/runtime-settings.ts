@@ -496,7 +496,7 @@ function effectiveValue(def: RuntimeFieldDef): string {
   return raw;
 }
 
-/** 读取运行时字符串配置：.env 非空值优先，其次后台保存的值。 */
+/** 读取运行时字符串配置：后台保存的值优先，其次 .env 中的非空值。 */
 export function getRuntimeEnv(key: string, fallback = ''): string {
   const raw = getRuntimeEnvRaw(key);
   return raw === null ? fallback : raw;
