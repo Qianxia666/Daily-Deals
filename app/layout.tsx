@@ -1,13 +1,39 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
+import { getSiteSettings } from '@/lib/runtime-settings';
+import { getSiteOrigin } from '@/lib/site-origin';
 import './globals.css';
 
-export const metadata: Metadata = {
-  title: '每日优惠情报 · Daily Deals',
-  description:
-    '定时自动聚合多个真实来源的免费、限免与低价优惠信息，只展示真实抓取到的内容。',
-  applicationName: '每日优惠情报',
-};
+export async function generateMetadata(): Promise<Metadata> {
+  const site = getSiteSettings();
+  const origin = await getSiteOrigin();
+  const title =
+    site.label && site.label !== site.title
+      ? `${site.title} · ${site.label}`
+      : site.title;
+
+  return {
+    metadataBase: new URL(origin),
+    title,
+    description: site.tagline,
+    applicationName: site.title,
+    alternates: { canonical: '/' },
+    openGraph: {
+      title,
+      description: site.tagline,
+      url: '/',
+      siteName: site.title,
+      locale: 'zh_CN',
+      type: 'website',
+    },
+    twitter: {
+      card: 'summary',
+      title,
+      description: site.tagline,
+    },
+    robots: { index: true, follow: true },
+  };
+}
 
 export const viewport: Viewport = {
   width: 'device-width',

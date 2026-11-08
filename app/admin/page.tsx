@@ -5,6 +5,7 @@ import { isAdmin } from '@/lib/admin';
 
 export const metadata: Metadata = {
   title: '管理后台 · 每日优惠情报',
+  robots: { index: false, follow: false },
 };
 
 export const dynamic = 'force-dynamic';
