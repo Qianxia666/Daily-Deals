@@ -101,10 +101,19 @@ export interface RuntimeSettingView {
   max?: number;
 }
 
+export interface SearchIndexStatus {
+  available: boolean;
+  indexed: number;
+  deals: number;
+  version: string | null;
+  builtAt: string | null;
+}
+
 export interface AdminData {
   fetchedAt: string | null;
   announcement: Announcement;
   sources: AdminSource[];
+  searchIndex: SearchIndexStatus;
   globalIntervalMinutes: number;
   runtimeSettings: RuntimeSettingView[];
 }

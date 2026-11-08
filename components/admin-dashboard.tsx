@@ -88,6 +88,7 @@ export function AdminDashboard() {
   const [saving, setSaving] = useState(false);
   const [savingAnnouncement, setSavingAnnouncement] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [rebuildingIndex, setRebuildingIndex] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -353,6 +354,53 @@ export function AdminDashboard() {
       );
     } finally {
       setTriggering(false);
+    }
+  };
+
+  const rebuildIndex = async () => {
+    if (rebuildingIndex) return;
+
+    setRebuildingIndex(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const response = await fetch('/api/admin/search-index', {
+        method: 'POST',
+      });
+      if (response.status === 401) {
+        window.location.reload();
+        return;
+      }
+
+      const payload = (await response.json().catch(() => null)) as
+        | {
+            searchIndex?: AdminData['searchIndex'];
+            elapsedMs?: number;
+            error?: string;
+          }
+        | null;
+
+      if (!response.ok) {
+        throw new Error(payload?.error ?? `HTTP ${response.status}`);
+      }
+
+      const searchIndex = payload?.searchIndex;
+      if (searchIndex) {
+        setData((previous) =>
+          previous ? { ...previous, searchIndex } : previous,
+        );
+        setNotice(
+          `索引重建完成：${searchIndex.indexed} / ${searchIndex.deals} 条，用时 ${payload?.elapsedMs ?? 0} ms`,
+        );
+        window.setTimeout(() => setNotice(null), 5000);
+      }
+    } catch (rebuildError) {
+      setError(
+        rebuildError instanceof Error ? rebuildError.message : '重建索引失败',
+      );
+    } finally {
+      setRebuildingIndex(false);
     }
   };
 
@@ -773,6 +821,58 @@ export function AdminDashboard() {
               )}
               {saving ? '保存中' : '保存全部设置'}
             </Button>
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-ink">搜索索引</h2>
+              <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                全文索引负责为 AI 搜索召回候选。索引与数据条数不一致、或修改了「索引文本最大长度」后，可在这里手动重建。
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void rebuildIndex()}
+              disabled={rebuildingIndex || !data?.searchIndex.available}
+            >
+              <RefreshCw
+                className={cn(
+                  'h-4 w-4',
+                  rebuildingIndex && 'animate-spin',
+                )}
+                aria-hidden="true"
+              />
+              {rebuildingIndex ? '重建中' : '重建索引'}
+            </Button>
+          </div>
+
+          <div className="mt-3 grid gap-2 text-[11px] text-slate-600 sm:grid-cols-3">
+            <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
+              状态：
+              <span
+                className={cn(
+                  'font-medium',
+                  data?.searchIndex.available
+                    ? 'text-emerald-700'
+                    : 'text-red-700',
+                )}
+              >
+                {data?.searchIndex.available ? '可用' : '不可用'}
+              </span>
+            </div>
+            <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
+              已索引：
+              <span className="font-medium tabular-nums text-ink">
+                {data?.searchIndex.indexed ?? 0}
+              </span>{' '}
+              / {data?.searchIndex.deals ?? 0} 条
+            </div>
+            <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
+              最近重建：{formatDateTime(data?.searchIndex.builtAt ?? null)}
+            </div>
           </div>
         </section>
 

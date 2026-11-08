@@ -54,22 +54,149 @@ const FIELDS: RuntimeFieldDef[] = [
     ],
   },
   {
+    key: 'AI_SEARCH_SCOPE',
+    label: 'AI 搜索范围',
+    group: 'AI 改写与搜索',
+    description:
+      '所有在架：只要未过期就能搜到；按天数：只查最近 N 天。',
+    type: 'select',
+    defaultValue: 'active',
+    options: [
+      { value: 'active', label: '所有在架优惠' },
+      { value: 'days', label: '按天数' },
+    ],
+  },
+  {
     key: 'AI_SEARCH_DAYS',
     label: 'AI 搜索时间范围（天）',
     group: 'AI 改写与搜索',
     description:
-      'AI 搜索只查最近多少天的优惠，默认 3 天；实际范围不会超过数据保留天数。',
+      '仅当「AI 搜索范围」选择按天数时生效；实际范围不会超过数据保留天数。',
     type: 'number',
     defaultValue: '3',
     min: 1,
     max: 365,
   },
   {
-    key: 'AI_SEARCH_MAX_ITEMS',
-    label: 'AI 搜索最多提交条数',
+    key: 'AI_SEARCH_RECALL_LIMIT',
+    label: '全文召回候选条数',
     group: 'AI 改写与搜索',
     description:
-      '每次 AI 搜索最多把多少条标题交给模型，默认 500；设为足够大即可覆盖全部时间范围。',
+      '先由全文索引筛出多少条候选，再交给 AI 精排；默认 60，数据量大时可调到 80–100。',
+    type: 'number',
+    defaultValue: '60',
+    min: 20,
+    max: 200,
+  },
+  {
+    key: 'AI_SEARCH_RERANK_LIMIT',
+    label: 'AI 精排返回条数',
+    group: 'AI 改写与搜索',
+    description: 'AI 从候选中最多选出多少条结果，默认 20。',
+    type: 'number',
+    defaultValue: '20',
+    min: 5,
+    max: 30,
+  },
+  {
+    key: 'AI_SEARCH_RERANK_ENABLED',
+    label: '启用 AI 精排',
+    group: 'AI 改写与搜索',
+    description:
+      '关闭后直接返回全文索引排序结果，不调用 AI，速度更快但语义理解较弱。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'AI_SEARCH_USE_SUMMARY',
+    label: 'AI 精排参考摘要',
+    group: 'AI 改写与搜索',
+    description:
+      '开启后把 AI 摘要一起交给模型，比只看标题更准；关闭则只发标题。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'AI_SEARCH_FTS_ENABLED',
+    label: '启用全文索引',
+    group: 'AI 改写与搜索',
+    description:
+      '关闭后回退到旧的关键词粗筛逻辑；仅在索引异常时临时关闭。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'AI_SEARCH_SYNONYM_ENABLED',
+    label: '启用同义词扩展',
+    group: 'AI 改写与搜索',
+    description:
+      '例如白嫖→免费、云服务器→VPS/主机，提升口语化搜索的命中率。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'AI_SEARCH_INDEX_MAX_CHARS',
+    label: '索引文本最大长度',
+    group: 'AI 改写与搜索',
+    description:
+      '每条优惠进入全文索引时最多截取多少字符，默认 400；修改后需在后台重建索引。',
+    type: 'number',
+    defaultValue: '400',
+    min: 200,
+    max: 1000,
+  },
+  {
+    key: 'AI_SEARCH_MAX_PER_SOURCE',
+    label: '单来源候选上限',
+    group: 'AI 改写与搜索',
+    description:
+      '每个来源最多进入多少条候选，0 表示不限制；用于避免大来源占满结果。',
+    type: 'number',
+    defaultValue: '0',
+    min: 0,
+    max: 50,
+  },
+  {
+    key: 'AI_SEARCH_MODEL',
+    label: 'AI 搜索专用模型',
+    group: 'AI 改写与搜索',
+    description:
+      '留空则沿用上方 AI 模型；可单独为搜索精排配置更强的模型。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
+    key: 'KEYWORD_SEARCH_MAX_RESULTS',
+    label: '普通搜索最多返回条数',
+    group: 'AI 改写与搜索',
+    description: '普通搜索最多返回多少条匹配结果，默认 100。',
+    type: 'number',
+    defaultValue: '100',
+    min: 20,
+    max: 500,
+  },
+  {
+    key: 'AI_SEARCH_MAX_ITEMS',
+    label: '旧版粗筛提交上限',
+    group: 'AI 改写与搜索',
+    description:
+      '仅在「启用全文索引」关闭时生效；新版全文索引使用上面的召回条数。',
     type: 'number',
     defaultValue: '500',
     min: 50,
@@ -77,10 +204,10 @@ const FIELDS: RuntimeFieldDef[] = [
   },
   {
     key: 'AI_SEARCH_COARSE_STRATEGY',
-    label: 'AI 搜索粗筛策略',
+    label: '旧版粗筛策略',
     group: 'AI 改写与搜索',
     description:
-      '条目超过提交上限时如何取舍：均衡按来源轮流取样，或只保留最新条目。',
+      '仅在「启用全文索引」关闭时生效：均衡按来源轮流取样，或只保留最新条目。',
     type: 'select',
     defaultValue: 'balanced',
     options: [
@@ -545,6 +672,57 @@ export function getAiSearchMaxItems(): number {
 export function getAiSearchCoarseStrategy(): 'balanced' | 'recent' {
   const raw = getRuntimeEnv('AI_SEARCH_COARSE_STRATEGY', 'balanced').trim();
   return raw === 'recent' ? 'recent' : 'balanced';
+}
+
+/** AI 搜索范围：所有在架，或按天数。 */
+export function getAiSearchScope(): 'active' | 'days' {
+  const raw = getRuntimeEnv('AI_SEARCH_SCOPE', 'active').trim();
+  return raw === 'days' ? 'days' : 'active';
+}
+
+export function getAiSearchRecallLimit(): number {
+  return getRuntimeEnvNumber('AI_SEARCH_RECALL_LIMIT', 60, 20, 200);
+}
+
+export function getAiSearchRerankLimit(): number {
+  return getRuntimeEnvNumber('AI_SEARCH_RERANK_LIMIT', 20, 5, 30);
+}
+
+export function getAiSearchRerankEnabled(): boolean {
+  return getRuntimeBool('AI_SEARCH_RERANK_ENABLED', true);
+}
+
+export function getAiSearchUseSummary(): boolean {
+  return getRuntimeBool('AI_SEARCH_USE_SUMMARY', true);
+}
+
+export function getAiSearchFtsEnabled(): boolean {
+  return getRuntimeBool('AI_SEARCH_FTS_ENABLED', true);
+}
+
+export function getAiSearchSynonymEnabled(): boolean {
+  return getRuntimeBool('AI_SEARCH_SYNONYM_ENABLED', true);
+}
+
+export function getAiSearchIndexMaxChars(): number {
+  return getRuntimeEnvNumber('AI_SEARCH_INDEX_MAX_CHARS', 400, 200, 1000);
+}
+
+/** 0 表示不限制，因此不能复用 getRuntimeEnvNumber。 */
+export function getAiSearchMaxPerSource(): number {
+  const raw = getRuntimeEnvRaw('AI_SEARCH_MAX_PER_SOURCE');
+  if (raw === null || raw.trim() === '') return 0;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.min(Math.round(value), 50);
+}
+
+export function getAiSearchModel(): string {
+  return getRuntimeEnv('AI_SEARCH_MODEL', '').trim();
+}
+
+export function getKeywordSearchMaxResults(): number {
+  return getRuntimeEnvNumber('KEYWORD_SEARCH_MAX_RESULTS', 100, 20, 500);
 }
 
 const DEFAULT_SITE: SiteSettings = {

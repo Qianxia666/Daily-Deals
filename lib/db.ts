@@ -10,9 +10,23 @@ import type {
   Category,
   DealItem,
   DealsResponse,
+  SearchIndexStatus,
   SourceKind,
   SourceStatus,
 } from './types';
+import {
+  deleteDealIndexesForExpired,
+  deleteDealIndexesForRetention,
+  deleteDealIndexesForSource,
+  ensureSearchIndex,
+  indexDealById,
+  readSearchIndexStatus,
+  rebuildSearchIndex,
+  searchDealsByFts,
+  searchDealsByLike,
+  type SearchCandidate,
+  type SearchScopeOptions,
+} from './search-index';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS deals (
@@ -209,6 +223,16 @@ const globalForDb = globalThis as typeof globalThis & {
   __dailyDealsDb?: Database.Database;
 };
 
+function readSearchIndexMaxChars(db: Database.Database): number {
+  const row = db
+    .prepare("SELECT value FROM settings WHERE key = 'env:AI_SEARCH_INDEX_MAX_CHARS'")
+    .get() as { value: string } | undefined;
+  const raw = row?.value ?? process.env.AI_SEARCH_INDEX_MAX_CHARS ?? '';
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return 400;
+  return Math.min(Math.max(Math.round(value), 200), 1000);
+}
+
 function getDb(): Database.Database {
   if (globalForDb.__dailyDealsDb) return globalForDb.__dailyDealsDb;
 
@@ -224,6 +248,7 @@ function getDb(): Database.Database {
   db.exec(SCHEMA);
   migrate(db);
   ensureSources(db);
+  ensureSearchIndex(db, readSearchIndexMaxChars(db));
 
   globalForDb.__dailyDealsDb = db;
   return db;
@@ -384,6 +409,7 @@ export function deleteSource(id: string): boolean {
   if (!getSource(id)) return false;
 
   const remove = db.transaction(() => {
+    deleteDealIndexesForSource(db, id);
     db.prepare('DELETE FROM deals WHERE source = ?').run(id);
     db.prepare('DELETE FROM source_status WHERE source = ?').run(id);
     db.prepare('DELETE FROM source_settings WHERE source = ?').run(id);
@@ -413,6 +439,7 @@ export function resetNewFlags(sourceIds?: string[]): void {
 export function upsertDeals(deals: RawDeal[]): number {
   const db = getDb();
   const now = new Date().toISOString();
+  const searchMaxChars = readSearchIndexMaxChars(db);
 
   const findExisting = db.prepare(
     `SELECT id, title, description, ai_title, ai_summary, ai_value, ai_action, ai_model, ai_at
@@ -471,6 +498,7 @@ export function upsertDeals(deals: RawDeal[]): number {
           contentChanged ? null : existing.ai_at,
           item.link,
         );
+        indexDealById(db, existing.id, searchMaxChars);
         continue;
       }
 
@@ -486,6 +514,9 @@ export function upsertDeals(deals: RawDeal[]): number {
         now,
       );
       inserted += result.changes;
+      if (result.changes > 0) {
+        indexDealById(db, Number(result.lastInsertRowid), searchMaxChars);
+      }
     }
 
     return inserted;
@@ -509,6 +540,35 @@ export function getAiSearchEnabled(): boolean {
   return raw.trim() !== 'false';
 }
 
+export function searchDealsForQuery(
+  match: string,
+  options: SearchScopeOptions,
+): SearchCandidate[] | null {
+  return searchDealsByFts(getDb(), match, options);
+}
+
+export function searchDealsForQueryLike(
+  query: string,
+  options: SearchScopeOptions,
+): SearchCandidate[] {
+  return searchDealsByLike(getDb(), query, options);
+}
+
+export function getSearchIndexStatus(): SearchIndexStatus {
+  return readSearchIndexStatus(getDb());
+}
+
+export function rebuildSearchIndexNow(): SearchIndexStatus {
+  const db = getDb();
+  rebuildSearchIndex(db, readSearchIndexMaxChars(db));
+  return readSearchIndexStatus(db);
+}
+
+export function warmSearchIndex(): void {
+  const db = getDb();
+  ensureSearchIndex(db, readSearchIndexMaxChars(db));
+}
+
 /** 清理已过期条目与超过保留天数的条目。 */
 export function pruneDeals(): number {
   const now = new Date().toISOString();
@@ -516,7 +576,11 @@ export function pruneDeals(): number {
     Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
   ).toISOString();
 
-  const result = getDb()
+  const db = getDb();
+  deleteDealIndexesForExpired(db, now);
+  deleteDealIndexesForRetention(db, cutoff);
+
+  const result = db
     .prepare(
       `DELETE FROM deals
        WHERE (expires_at IS NOT NULL AND expires_at <= ?)
@@ -581,6 +645,16 @@ export function saveFetchRun(
   });
 
   save();
+}
+
+export function getVisibleSourceIds(): string[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      'SELECT id FROM sources WHERE hidden = 0 ORDER BY sort_order ASC',
+    )
+    .all() as { id: string }[];
+  return rows.map((row) => row.id);
 }
 
 export function getLastFetchedAt(): string | null {
@@ -837,6 +911,7 @@ export function getAdminData(): AdminBaseData {
     fetchedAt: lastRun?.fetched_at ?? null,
     announcement: getAnnouncement(),
     sources,
+    searchIndex: readSearchIndexStatus(db),
   };
 }
 
@@ -878,22 +953,22 @@ export function saveAiEnrichment(
   enrichment: AiEnrichment,
   model: string,
 ): void {
-  getDb()
-    .prepare(
-      `UPDATE deals
-       SET ai_title = ?, ai_summary = ?, ai_value = ?, ai_action = ?,
-           ai_model = ?, ai_at = ?, ai_attempts = 0
-       WHERE id = ?`,
-    )
-    .run(
-      enrichment.title,
-      enrichment.summary,
-      enrichment.value,
-      enrichment.action,
-      model,
-      new Date().toISOString(),
-      id,
-    );
+  const db = getDb();
+  db.prepare(
+    `UPDATE deals
+     SET ai_title = ?, ai_summary = ?, ai_value = ?, ai_action = ?,
+         ai_model = ?, ai_at = ?, ai_attempts = 0
+     WHERE id = ?`,
+  ).run(
+    enrichment.title,
+    enrichment.summary,
+    enrichment.value,
+    enrichment.action,
+    model,
+    new Date().toISOString(),
+    id,
+  );
+  indexDealById(db, id, readSearchIndexMaxChars(db));
 }
 
 /** 使用 SQLite 在线备份生成快照，并只保留最近若干份。 */

@@ -15,7 +15,7 @@
 
 - **多来源聚合**：内置 11 个真实来源，支持 RSS、Epic 官方接口与 HTML 列表解析。
 - **AI 精简**：批量改写标题、生成一句话摘要、提取优惠力度与操作方式，每批默认 20 条。
-- **双搜索模式**：AI 搜索只基于标题筛选并返回命中 id；普通搜索匹配标题、摘要、描述、来源与分类。
+- **双搜索模式**：AI 搜索先用 SQLite FTS5 全文索引召回候选，再由模型精排并返回命中 id；普通搜索匹配标题、摘要、描述、来源与分类。
 - **后台可配置**：来源增删、排序、隐藏、单源刷新间隔、首页公告、站点文案与全部运行时变量。
 - **响应式卡片流**：移动端单列、桌面端双列、超宽屏三列，滚动触底自动加载下一批。
 - **本地状态**：收藏、已领与筛选条件只保存在当前浏览器，不上传服务端，不影响其他用户。
@@ -98,8 +98,13 @@ docker compose logs -f app
 | `LLM_API_KEY` | 空 | AI 接口密钥，留空关闭 AI |
 | `LLM_MODEL` | 空 | 模型名称，留空关闭 AI |
 | `AI_SEARCH_ENABLED` | `true` | 是否允许前台使用 AI 搜索 |
-| `AI_SEARCH_DAYS` | `3` | AI 搜索时间范围（天） |
+| `AI_SEARCH_SCOPE` | `active` | AI 搜索范围：`active` 所有在架优惠，`days` 按天数 |
+| `AI_SEARCH_DAYS` | `3` | AI 搜索按天数模式的时间范围（天） |
+| `AI_SEARCH_RECALL_LIMIT` | `60` | 全文索引召回候选条数 |
+| `AI_SEARCH_RERANK_LIMIT` | `20` | AI 精排最多返回条数 |
+| `AI_SEARCH_FTS_ENABLED` | `true` | 是否启用 FTS5 全文索引 |
 | `KEYWORD_SEARCH_DAYS` | `30` | 普通搜索时间范围（天） |
+| `KEYWORD_SEARCH_MAX_RESULTS` | `100` | 普通搜索最多返回条数 |
 | `SITE_LABEL` | `Daily Deals` | 首页顶部标识与加载屏底部文字 |
 | `SITE_TITLE` | `每日优惠情报` | 首页主标题 |
 | `SITE_TAGLINE` | `AI 精简 · 定时自动聚合 · 只收录真实来源` | 首页副标题 |
@@ -128,8 +133,14 @@ docker compose logs -f app
 | `AI_SUMMARY_MAX_ATTEMPTS` | `3` | 单条摘要失败多少次后放弃 |
 | `LLM_CONCURRENCY` | `3` | AI 并发请求数 |
 | `LLM_TIMEOUT_MS` | `120000` | 单次批量摘要请求超时（毫秒） |
-| `AI_SEARCH_MAX_ITEMS` | `500` | AI 搜索最多提交的标题条数 |
-| `AI_SEARCH_COARSE_STRATEGY` | `balanced` | 超过上限时的粗筛策略：`balanced` 按来源均衡，`recent` 只取最新 |
+| `AI_SEARCH_RERANK_ENABLED` | `true` | 是否调用 AI 精排；关闭后直接返回索引排序结果 |
+| `AI_SEARCH_USE_SUMMARY` | `true` | AI 精排时是否参考摘要 |
+| `AI_SEARCH_SYNONYM_ENABLED` | `true` | 是否启用同义词扩展（白嫖→免费、云服务器→VPS 等） |
+| `AI_SEARCH_INDEX_MAX_CHARS` | `400` | 每条优惠进入索引时截取的最大字符数，修改后需重建索引 |
+| `AI_SEARCH_MAX_PER_SOURCE` | `0` | 每个来源最多进入多少条候选，`0` 表示不限制 |
+| `AI_SEARCH_MODEL` | 空 | AI 搜索专用模型，留空沿用 `LLM_MODEL` |
+| `AI_SEARCH_MAX_ITEMS` | `500` | 仅旧回退逻辑使用：最多提交的标题条数 |
+| `AI_SEARCH_COARSE_STRATEGY` | `balanced` | 仅旧回退逻辑使用：`balanced` 按来源均衡，`recent` 只取最新 |
 | `AI_SEARCH_CACHE_ENABLED` | `true` | 是否缓存 AI 搜索结果 |
 | `AI_SEARCH_CACHE_MINUTES` | `5` | 搜索缓存时间（分钟） |
 | `RATE_LIMIT_ENABLED` | `true` | 是否启用搜索与后台登录限流 |
@@ -161,11 +172,18 @@ docker compose logs -f app
 
 ### 搜索
 
-- **AI 搜索**：默认最近 3 天，只把标题交给模型筛选，返回命中 id 与一句理由；模型不可用或已关闭时自动退化为关键词搜索。
-- **普通搜索**：默认最近 30 天，匹配标题、摘要、描述、来源与分类。
-- AI 搜索默认最多提交 500 条标题，超出后按「按来源均衡」或「只取最新」粗筛；结果默认缓存 5 分钟。
+搜索不再把全量数据或大批标题直接交给模型，流程为：
 
-两种模式都只筛选已入库内容，不会虚构优惠。时间范围可在后台分别设置，且不会超过数据保留天数。
+1. **查询预处理**：按空格与标点切分，展开同义词（白嫖→免费/限免、云服务器→VPS/主机等）。
+2. **全文召回**：SQLite FTS5 全文索引按 BM25 召回 Top 120；中文按二元词（bigram）建索引，单字查询自动走 `LIKE` 兜底。
+3. **本地二次排序**：叠加新鲜度，并按来源配额裁剪，默认取前 60 条候选。
+4. **AI 精排**：只把候选的标题与摘要交给模型，最多返回 20 条命中 id；模型不可用时回退为索引排序结果。
+
+- **AI 搜索**：默认搜索所有在架优惠，也可在后台切换为按天数；结果默认缓存 5 分钟。
+- **普通搜索**：默认最近 30 天，匹配标题、摘要、描述、来源与分类，最多返回 100 条。
+- FTS5 不可用、无命中或关闭全文索引时，会自动回退到 `LIKE` 扫描与旧粗筛逻辑。
+
+索引会在启动时自动校验并补建，抓取、摘要更新与清理时同步维护；后台「搜索索引」区域可查看索引状态并手动重建。两种模式都只筛选已入库内容，不会虚构优惠。
 
 ## 管理后台
 
@@ -176,6 +194,7 @@ docker compose logs -f app
 - 新增 / 删除自定义 RSS 或 Epic 来源
 - 为单个来源设置独立刷新间隔
 - 编辑首页公告，并单独保存
+- 查看搜索索引状态、索引条数与最近重建时间，并可手动重建
 - 修改站点文案与全部运行时变量，保存后立即生效
 
 内置来源不能删除，只能隐藏或修改地址；删除自定义来源会同时删除其已入库条目。
@@ -261,6 +280,8 @@ app/                 Next.js App Router 页面与 API
 components/          卡片流、筛选、加载动画与 UI 组件
 lib/fetchers/        各来源抓取与解析
 lib/db.ts            SQLite schema、去重与查询
+lib/search-text.ts   中文二元分词、同义词与 FTS 查询构造
+lib/search-index.ts  FTS5 索引维护、召回与状态
 lib/llm.ts           AI 摘要与搜索
 lib/scheduler.ts     定时抓取调度
 data/                数据库与备份（不提交）

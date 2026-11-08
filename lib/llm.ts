@@ -31,6 +31,7 @@ interface AiConfig {
   apiKey: string;
   endpoint: string;
   model: string;
+  searchModel: string;
   maxItems: number;
   batchSize: number;
   retrySize: number;
@@ -84,6 +85,7 @@ function readConfig(): AiConfig | null {
     apiKey,
     endpoint: chatEndpoint(baseUrl),
     model,
+    searchModel: getRuntimeEnv('AI_SEARCH_MODEL', '').trim() || model,
     maxItems,
     batchSize,
     retrySize,
@@ -393,6 +395,10 @@ export async function enrichPendingDeals(): Promise<void> {
 export interface AiSearchDeal {
   id: number;
   title: string;
+  summary?: string;
+  category?: string;
+  source?: string;
+  expiresAt?: string | null;
 }
 
 export interface AiSearchSelection {
@@ -400,22 +406,25 @@ export interface AiSearchSelection {
   reason: string;
 }
 
-const SEARCH_SYSTEM_PROMPT = `你是中文优惠信息检索助手。用户会给出搜索需求，下面是从优惠站点实时抓取到的条目列表，每条只包含 id 和标题。请只根据标题判断是否相关，并按相关度排序。
+function buildSearchPrompt(limit: number): string {
+  return `你是中文优惠信息检索助手。用户会给出搜索需求，下面是从全文索引召回的真实条目，每项包含 id、标题、摘要、分类、来源和到期时间。请结合标题与摘要判断相关度，并按相关度排序。
 
 硬性规则：
-1. 只能依据标题判断，不要假设标题之外的信息。
+1. 只能使用列表中出现的信息，不要假设列表之外的内容。
 2. 只能返回列表中出现过的 id，严禁编造 id。
 3. 与需求无关的条目不要返回；宁可少返回，也不要凑数。
-4. 最多返回 30 条。
+4. 最多返回 ${limit} 条。
 5. reason 用一句不超过 40 字的中文说明筛选依据，不要包含链接。
 6. 只输出 JSON 对象，不要输出 Markdown 或解释。
 
 输出格式：
 {"ids":[1,2,3],"reason":""}`;
+}
 
 function parseSearchSelection(
   content: string,
   validIds: Set<number>,
+  limit: number,
 ): AiSearchSelection | null {
   let text = content.trim();
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -442,7 +451,7 @@ function parseSearchSelection(
       continue;
     }
     ids.push(id);
-    if (ids.length >= 30) break;
+    if (ids.length >= limit) break;
   }
 
   const reason = cleanText(raw.reason, 80)
@@ -456,23 +465,28 @@ async function callSearchModel(
   config: AiConfig,
   query: string,
   deals: AiSearchDeal[],
+  limit: number,
 ): Promise<string | null> {
   const items = deals.map((deal) => ({
     id: deal.id,
     title: deal.title.slice(0, 90),
+    summary: (deal.summary ?? '').slice(0, 120),
+    category: deal.category ?? '',
+    source: deal.source ?? '',
+    expiresAt: deal.expiresAt ?? null,
   }));
 
   const payload = {
-    model: config.model,
+    model: config.searchModel,
     messages: [
-      { role: 'system', content: SEARCH_SYSTEM_PROMPT },
+      { role: 'system', content: buildSearchPrompt(limit) },
       {
         role: 'user',
         content: JSON.stringify({ query, items }),
       },
     ],
     temperature: 0.1,
-    max_tokens: 500,
+    max_tokens: Math.min(1200, 200 + limit * 30),
     response_format: { type: 'json_object' },
   };
 
@@ -530,6 +544,7 @@ async function callSearchModel(
 export async function searchDealsWithAi(
   query: string,
   deals: AiSearchDeal[],
+  limit = 20,
 ): Promise<AiSearchSelection | null> {
   if (getRuntimeEnv('AI_SEARCH_ENABLED', 'true').trim() === 'false') {
     return null;
@@ -538,9 +553,9 @@ export async function searchDealsWithAi(
   const config = readConfig();
   if (!config || deals.length === 0) return null;
 
-  const content = await callSearchModel(config, query, deals);
+  const content = await callSearchModel(config, query, deals, limit);
   if (content === null) return null;
 
   const validIds = new Set(deals.map((deal) => deal.id));
-  return parseSearchSelection(content, validIds);
+  return parseSearchSelection(content, validIds, limit);
 }
