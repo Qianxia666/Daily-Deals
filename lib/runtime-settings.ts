@@ -125,9 +125,9 @@ const FIELDS: RuntimeFieldDef[] = [
     key: 'LLM_BASE_URL',
     label: 'AI 接口地址',
     group: 'AI 改写与搜索',
-    description: 'OpenAI 兼容地址，需包含 /v1。',
+    description: 'OpenAI 兼容地址，需包含 /v1；留空则关闭 AI 改写。',
     type: 'text',
-    defaultValue: 'https://api.openai.com/v1',
+    defaultValue: '',
   },
   {
     key: 'LLM_API_KEY',
@@ -141,9 +141,9 @@ const FIELDS: RuntimeFieldDef[] = [
     key: 'LLM_MODEL',
     label: 'AI 模型',
     group: 'AI 改写与搜索',
-    description: '例如 Qwen/Qwen3-30B-A3B-Instruct-2507。',
+    description: '例如 Qwen/Qwen3-30B-A3B-Instruct-2507；留空则关闭 AI 改写。',
     type: 'text',
-    defaultValue: 'Qwen/Qwen3-30B-A3B-Instruct-2507',
+    defaultValue: '',
   },
   {
     key: 'LLM_MAX_ITEMS_PER_RUN',

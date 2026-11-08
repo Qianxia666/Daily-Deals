@@ -10,9 +10,6 @@ import {
   getRuntimeEnvNumber,
 } from './runtime-settings';
 
-const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
-const DEFAULT_MODEL = 'Qwen/Qwen3-30B-A3B-Instruct-2507';
-
 const SYSTEM_PROMPT = `你是中文优惠信息编辑。用户会给出 items 数组，每项包含 id、title、description，部分条目可能还有 context。请逐条改写成更简洁、更好读的标题和摘要，帮助读者快速判断是否值得参与。
 
 硬性规则：
@@ -62,11 +59,10 @@ function chatEndpoint(baseUrl: string): string {
 
 function readConfig(): AiConfig | null {
   const apiKey = getRuntimeEnv('LLM_API_KEY').trim();
-  if (!apiKey) return null;
+  const baseUrl = getRuntimeEnv('LLM_BASE_URL').trim();
+  const model = getRuntimeEnv('LLM_MODEL').trim();
+  if (!apiKey || !baseUrl || !model) return null;
 
-  const baseUrl =
-    getRuntimeEnv('LLM_BASE_URL').trim() || DEFAULT_BASE_URL;
-  const model = getRuntimeEnv('LLM_MODEL').trim() || DEFAULT_MODEL;
   const maxItems = getRuntimeEnvNumber('LLM_MAX_ITEMS_PER_RUN', 80, 1, 200);
   const batchSize = getRuntimeEnvNumber('AI_SUMMARY_BATCH_SIZE', 20, 5, 30);
   const retrySize = getRuntimeEnvNumber('AI_SUMMARY_RETRY_SIZE', 10, 1, 30);

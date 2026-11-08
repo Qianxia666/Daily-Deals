@@ -40,13 +40,13 @@ cp .env.example .env
 # 管理后台登录密码；留空则后台不可登录
 ADMIN_PASSWORD=请换成强密码
 
-# 可选：AI 相关配置，不填则只使用普通搜索与原始标题
+# 可选：AI 相关配置；三项缺一不可，否则自动关闭 AI 改写
+LLM_BASE_URL=
 LLM_API_KEY=
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
+LLM_MODEL=
 ```
 
-所有变量都有默认值，不配置 AI 也能正常抓取和浏览。
+除 AI 接口相关的三项外，其余变量都有默认值；不配置 AI 也能正常抓取和浏览。
 
 ### 3. 启动
 
@@ -92,9 +92,9 @@ docker compose logs -f app
 | `FETCH_INTERVAL_MINUTES` | `120` | 全局抓取间隔（分钟） |
 | `DATA_RETENTION_DAYS` | `30` | 数据保留天数 |
 | `LLM_ENABLED` | `true` | 是否生成 AI 标题与摘要 |
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
-| `LLM_API_KEY` | 空 | AI 接口密钥，留空即关闭 AI 改写 |
-| `LLM_MODEL` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 模型名称 |
+| `LLM_BASE_URL` | 空 | OpenAI 兼容接口地址，留空关闭 AI |
+| `LLM_API_KEY` | 空 | AI 接口密钥，留空关闭 AI |
+| `LLM_MODEL` | 空 | 模型名称，留空关闭 AI |
 | `AI_SEARCH_ENABLED` | `true` | 是否允许前台使用 AI 搜索 |
 | `AI_SEARCH_DAYS` | `3` | AI 搜索时间范围（天） |
 | `KEYWORD_SEARCH_DAYS` | `30` | 普通搜索时间范围（天） |
