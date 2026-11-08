@@ -364,6 +364,12 @@ export function AdminDashboard() {
     setError(null);
     setNotice(null);
 
+    const applyStatus = (searchIndex: AdminData['searchIndex']) => {
+      setData((previous) =>
+        previous ? { ...previous, searchIndex } : previous,
+      );
+    };
+
     try {
       const response = await fetch('/api/admin/search-index', {
         method: 'POST',
@@ -376,7 +382,6 @@ export function AdminDashboard() {
       const payload = (await response.json().catch(() => null)) as
         | {
             searchIndex?: AdminData['searchIndex'];
-            elapsedMs?: number;
             error?: string;
           }
         | null;
@@ -385,13 +390,32 @@ export function AdminDashboard() {
         throw new Error(payload?.error ?? `HTTP ${response.status}`);
       }
 
-      const searchIndex = payload?.searchIndex;
-      if (searchIndex) {
-        setData((previous) =>
-          previous ? { ...previous, searchIndex } : previous,
-        );
+      let searchIndex = payload?.searchIndex;
+      if (!searchIndex) throw new Error('未返回索引状态');
+      applyStatus(searchIndex);
+
+      // 后台异步重建，轮询进度直到结束。
+      while (searchIndex.rebuilding) {
+        await new Promise((resolve) => window.setTimeout(resolve, 800));
+        const statusResponse = await fetch('/api/admin/search-index', {
+          cache: 'no-store',
+        });
+        if (!statusResponse.ok) break;
+
+        const statusPayload = (await statusResponse.json().catch(() => null)) as
+          | { searchIndex?: AdminData['searchIndex'] }
+          | null;
+        if (!statusPayload?.searchIndex) break;
+
+        searchIndex = statusPayload.searchIndex;
+        applyStatus(searchIndex);
+      }
+
+      if (searchIndex.lastError) {
+        setError(`索引重建失败：${searchIndex.lastError}`);
+      } else {
         setNotice(
-          `索引重建完成：${searchIndex.indexed} / ${searchIndex.deals} 条，用时 ${payload?.elapsedMs ?? 0} ms`,
+          `索引重建完成：${searchIndex.indexed} / ${searchIndex.deals} 条`,
         );
         window.setTimeout(() => setNotice(null), 5000);
       }
@@ -841,11 +865,14 @@ export function AdminDashboard() {
               <RefreshCw
                 className={cn(
                   'h-4 w-4',
-                  rebuildingIndex && 'animate-spin',
+                  (rebuildingIndex || data?.searchIndex.rebuilding) &&
+                    'animate-spin',
                 )}
                 aria-hidden="true"
               />
-              {rebuildingIndex ? '重建中' : '重建索引'}
+              {rebuildingIndex || data?.searchIndex.rebuilding
+                ? '重建中'
+                : '重建索引'}
             </Button>
           </div>
 
@@ -866,9 +893,12 @@ export function AdminDashboard() {
             <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
               已索引：
               <span className="font-medium tabular-nums text-ink">
-                {data?.searchIndex.indexed ?? 0}
+                {data?.searchIndex.rebuilding
+                  ? data.searchIndex.processed
+                  : data?.searchIndex.indexed ?? 0}
               </span>{' '}
               / {data?.searchIndex.deals ?? 0} 条
+              {data?.searchIndex.rebuilding ? '（重建中）' : ''}
             </div>
             <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
               最近重建：{formatDateTime(data?.searchIndex.builtAt ?? null)}

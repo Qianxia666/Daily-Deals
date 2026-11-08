@@ -20,10 +20,12 @@ import {
   deleteDealIndexesForSource,
   ensureSearchIndex,
   indexDealById,
+  optimizeSearchIndex,
   readSearchIndexStatus,
   rebuildSearchIndex,
   searchDealsByFts,
   searchDealsByLike,
+  startSearchIndexRebuild,
   type SearchCandidate,
   type SearchScopeOptions,
 } from './search-index';
@@ -564,6 +566,13 @@ export function rebuildSearchIndexNow(): SearchIndexStatus {
   return readSearchIndexStatus(db);
 }
 
+/** 启动后台重建并立即返回当前进度，供后台轮询。 */
+export function startSearchIndexRebuildNow(): SearchIndexStatus {
+  const db = getDb();
+  startSearchIndexRebuild(db, readSearchIndexMaxChars(db));
+  return readSearchIndexStatus(db);
+}
+
 export function warmSearchIndex(): void {
   const db = getDb();
   ensureSearchIndex(db, readSearchIndexMaxChars(db));
@@ -587,6 +596,8 @@ export function pruneDeals(): number {
           OR first_seen_at < ?`,
     )
     .run(now, cutoff);
+
+  if (result.changes > 0) optimizeSearchIndex(db);
 
   return result.changes;
 }
@@ -679,6 +690,31 @@ export function listSourceStatus(): SourceStatusRecord[] {
   }));
 }
 
+function mapDealRow(
+  row: DealRow,
+  nameMap: Map<string, string>,
+): DealItem {
+  return {
+    id: row.id,
+    title: row.title,
+    link: row.link,
+    description: row.description,
+    source: row.source,
+    sourceName: nameMap.get(row.source) ?? row.source,
+    category: row.category as Category,
+    expiresAt: row.expires_at,
+    publishedAt: row.published_at,
+    firstSeenAt: row.first_seen_at,
+    isNew: row.is_new === 1,
+    claimed: row.claimed === 1,
+    favorite: row.favorite === 1,
+    aiTitle: row.ai_title,
+    aiSummary: row.ai_summary,
+    aiValue: row.ai_value,
+    aiAction: row.ai_action,
+  };
+}
+
 /** 汇总页面所需的在架条目、可见来源与统计。 */
 export function getDealsSnapshot(): DealsSnapshot {
   const db = getDb();
@@ -727,25 +763,7 @@ export function getDealsSnapshot(): DealsSnapshot {
 
   const items: DealItem[] = rows
     .filter((row) => visibleIds.has(row.source))
-    .map((row) => ({
-      id: row.id,
-      title: row.title,
-      link: row.link,
-      description: row.description,
-      source: row.source,
-      sourceName: nameMap.get(row.source) ?? row.source,
-      category: row.category as Category,
-      expiresAt: row.expires_at,
-      publishedAt: row.published_at,
-      firstSeenAt: row.first_seen_at,
-      isNew: row.is_new === 1,
-      claimed: row.claimed === 1,
-      favorite: row.favorite === 1,
-      aiTitle: row.ai_title,
-      aiSummary: row.ai_summary,
-      aiValue: row.ai_value,
-      aiAction: row.ai_action,
-    }));
+    .map((row) => mapDealRow(row, nameMap));
 
   const statusMap = new Map(statusRows.map((row) => [row.source, row]));
   const countMap = new Map(countRows.map((row) => [row.source, row.count]));
@@ -771,6 +789,259 @@ export function getDealsSnapshot(): DealsSnapshot {
     announcement: getAnnouncement(),
     aiSearchEnabled: getAiSearchEnabled(),
     items,
+  };
+}
+
+export interface DealsListQuery {
+  limit: number;
+  cursor: string | null;
+  sources: string[] | null;
+  category: Category | null;
+  onlyNew: boolean;
+  ids: number[] | null;
+}
+
+export interface DealsListResult {
+  items: DealItem[];
+  total: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+}
+
+interface DealCursor {
+  isNew: number;
+  time: string;
+  id: number;
+}
+
+function encodeDealCursor(item: DealItem): string {
+  return Buffer.from(
+    JSON.stringify([
+      item.isNew ? 1 : 0,
+      item.publishedAt ?? item.firstSeenAt,
+      item.id,
+    ]),
+  ).toString('base64url');
+}
+
+function decodeDealCursor(raw: string): DealCursor | null {
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(raw, 'base64url').toString('utf8'),
+    ) as unknown;
+    if (!Array.isArray(parsed) || parsed.length !== 3) return null;
+
+    const [isNew, time, id] = parsed;
+    if (
+      typeof isNew !== 'number' ||
+      typeof time !== 'string' ||
+      typeof id !== 'number'
+    ) {
+      return null;
+    }
+    return { isNew, time, id };
+  } catch {
+    return null;
+  }
+}
+
+/** 首页元信息，不加载条目本身。 */
+export function getDealsMeta(): Omit<DealsSnapshot, 'items'> {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const retentionCutoff = new Date(
+    Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
+  ).toISOString();
+
+  const lastRun = db
+    .prepare('SELECT fetched_at FROM fetch_runs ORDER BY id DESC LIMIT 1')
+    .get() as { fetched_at: string } | undefined;
+
+  const statusRows = db
+    .prepare('SELECT source, ok, count, error, fetched_at FROM source_status')
+    .all() as StatusRow[];
+
+  const countRows = db
+    .prepare(
+      `SELECT source, COUNT(*) AS count FROM deals
+       WHERE (expires_at IS NULL OR expires_at > ?)
+         AND first_seen_at >= ?
+       GROUP BY source`,
+    )
+    .all(now, retentionCutoff) as SourceCountRow[];
+
+  const stored = listSources();
+  const visible = stored.filter((source) => !source.hidden);
+  const statusMap = new Map(statusRows.map((row) => [row.source, row]));
+  const countMap = new Map(countRows.map((row) => [row.source, row.count]));
+
+  const sources: SourceStatus[] = visible.map((source) => {
+    const status = statusMap.get(source.id);
+    return {
+      id: source.id,
+      name: source.name,
+      ok: status ? status.ok === 1 : null,
+      count: countMap.get(source.id) ?? 0,
+      error: status?.error ?? null,
+    };
+  });
+
+  const activeCount = visible.reduce(
+    (sum, source) => sum + (countMap.get(source.id) ?? 0),
+    0,
+  );
+
+  let newCount = 0;
+  if (visible.length > 0) {
+    const placeholders = visible.map(() => '?').join(', ');
+    newCount = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM deals
+           WHERE is_new = 1
+             AND (expires_at IS NULL OR expires_at > ?)
+             AND first_seen_at >= ?
+             AND source IN (${placeholders})`,
+        )
+        .get(now, retentionCutoff, ...visible.map((s) => s.id)) as {
+        count: number;
+      }
+    ).count;
+  }
+
+  return {
+    fetchedAt: lastRun?.fetched_at ?? null,
+    sources,
+    stats: { activeCount, newCount },
+    announcement: getAnnouncement(),
+    aiSearchEnabled: getAiSearchEnabled(),
+  };
+}
+
+/**
+ * 按游标分页读取首页条目。
+ * 排序与旧版一致：新条目优先，其次发布时间倒序，最后 id 倒序。
+ */
+export function getDealsList(query: DealsListQuery): DealsListResult {
+  const empty: DealsListResult = {
+    items: [],
+    total: 0,
+    hasMore: false,
+    nextCursor: null,
+  };
+
+  const db = getDb();
+  const now = new Date().toISOString();
+  const retentionCutoff = new Date(
+    Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
+  ).toISOString();
+
+  const stored = listSources();
+  const nameMap = new Map(stored.map((source) => [source.id, source.name]));
+  const visible = stored
+    .filter((source) => !source.hidden)
+    .map((source) => source.id);
+  if (visible.length === 0) return empty;
+
+  const allowed =
+    query.sources && query.sources.length > 0
+      ? query.sources.filter((id) => visible.includes(id))
+      : visible;
+  if (allowed.length === 0) return empty;
+
+  const clauses = [
+    '(d.expires_at IS NULL OR d.expires_at > ?)',
+    'd.first_seen_at >= ?',
+    `d.source IN (${allowed.map(() => '?').join(', ')})`,
+  ];
+  const params: unknown[] = [now, retentionCutoff, ...allowed];
+
+  if (query.category) {
+    clauses.push('d.category = ?');
+    params.push(query.category);
+  }
+  if (query.onlyNew) clauses.push('d.is_new = 1');
+
+  const ids = query.ids ? query.ids.slice(0, 500) : null;
+  if (ids) {
+    if (ids.length === 0) return empty;
+    clauses.push(`d.id IN (${ids.map(() => '?').join(', ')})`);
+    params.push(...ids);
+  }
+
+  const where = clauses.join(' AND ');
+  const total = (
+    db
+      .prepare(`SELECT COUNT(*) AS count FROM deals d WHERE ${where}`)
+      .get(...params) as { count: number }
+  ).count;
+
+  if (ids) {
+    const rows = db
+      .prepare(
+        `SELECT d.*, 0 AS claimed, 0 AS favorite
+         FROM deals d
+         WHERE ${where}
+         ORDER BY d.is_new DESC,
+                  COALESCE(d.published_at, d.first_seen_at) DESC,
+                  d.id DESC
+         LIMIT ?`,
+      )
+      .all(...params, ids.length) as DealRow[];
+
+    return {
+      items: rows.map((row) => mapDealRow(row, nameMap)),
+      total: rows.length,
+      hasMore: false,
+      nextCursor: null,
+    };
+  }
+
+  const limit = Math.min(Math.max(Math.round(query.limit), 1), 120);
+  const cursor = query.cursor ? decodeDealCursor(query.cursor) : null;
+
+  let cursorSql = '';
+  const cursorParams: unknown[] = [];
+  if (cursor) {
+    cursorSql = `AND (
+      d.is_new < ?
+      OR (d.is_new = ? AND COALESCE(d.published_at, d.first_seen_at) < ?)
+      OR (d.is_new = ? AND COALESCE(d.published_at, d.first_seen_at) = ? AND d.id < ?)
+    )`;
+    cursorParams.push(
+      cursor.isNew,
+      cursor.isNew,
+      cursor.time,
+      cursor.isNew,
+      cursor.time,
+      cursor.id,
+    );
+  }
+
+  const pageRows = db
+    .prepare(
+      `SELECT d.*, 0 AS claimed, 0 AS favorite
+       FROM deals d
+       WHERE ${where} ${cursorSql}
+       ORDER BY d.is_new DESC,
+                COALESCE(d.published_at, d.first_seen_at) DESC,
+                d.id DESC
+       LIMIT ?`,
+    )
+    .all(...params, ...cursorParams, limit + 1) as DealRow[];
+
+  const hasMore = pageRows.length > limit;
+  const rows = hasMore ? pageRows.slice(0, limit) : pageRows;
+  const items = rows.map((row) => mapDealRow(row, nameMap));
+
+  return {
+    items,
+    total,
+    hasMore,
+    nextCursor:
+      hasMore && items.length > 0
+        ? encodeDealCursor(items[items.length - 1])
+        : null,
   };
 }
 

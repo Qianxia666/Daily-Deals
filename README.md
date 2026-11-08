@@ -250,11 +250,12 @@ docker compose up -d
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/health` | 健康检查 |
-| GET | `/api/deals` | 在架条目、来源状态与统计，支持 ETag |
+| GET | `/api/deals` | 在架条目、来源状态与统计；支持游标分页、筛选、`ids` 批量读取、`metaOnly` 与 ETag |
 | POST | `/api/fetch` | 管理员手动触发抓取 |
 | POST | `/api/search` | 搜索，Body：`{"query":"...","mode":"ai"\|"keyword"}` |
 | POST | `/api/admin/sources` | 新增 / 删除来源 |
 | POST | `/api/admin/settings` | 保存公告、来源配置与运行时变量 |
+| GET/POST | `/api/admin/search-index` | 查询搜索索引状态 / 后台重建索引 |
 
 ## 本地开发
 

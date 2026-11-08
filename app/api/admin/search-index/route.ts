@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { isAdmin } from '@/lib/admin';
 import {
   getSearchIndexStatus,
-  rebuildSearchIndexNow,
+  startSearchIndexRebuildNow,
 } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
@@ -26,10 +26,9 @@ export async function POST() {
   }
 
   try {
-    const started = Date.now();
-    const searchIndex = rebuildSearchIndexNow();
+    const searchIndex = startSearchIndexRebuildNow();
     return NextResponse.json(
-      { searchIndex, elapsedMs: Date.now() - started },
+      { searchIndex },
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (error) {

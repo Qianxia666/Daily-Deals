@@ -19,7 +19,7 @@ import {
 import { CATEGORY_FILTERS } from '@/lib/constants';
 import type {
   CategoryFilter,
-  DealsResponse,
+  DealsListResponse,
   SiteSettings,
   SourceId,
 } from '@/lib/types';
@@ -83,8 +83,9 @@ function parseLocalStates(raw: string): Record<number, LocalDealState> {
 }
 
 export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
-  const [data, setData] = useState<DealsResponse | null>(null);
+  const [data, setData] = useState<DealsListResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   const [searchInput, setSearchInput] = useState('');
   const [searchMode, setSearchMode] = useState<SearchMode>('ai');
@@ -99,7 +100,6 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
   );
   const [category, setCategory] = useState<CategoryFilter>('all');
   const [onlyNew, setOnlyNew] = useState(false);
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [splashPhase, setSplashPhase] = useState<
     'visible' | 'leaving' | 'hidden'
   >('visible');
@@ -107,8 +107,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
   const localStatesRef = useRef<Record<number, LocalDealState>>({});
   const splashStartedAtRef = useRef(Date.now());
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
-  const dataRef = useRef<DealsResponse | null>(null);
-  const etagRef = useRef<string | null>(null);
+  const dataRef = useRef<DealsListResponse | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
   const searchSeqRef = useRef(0);
@@ -243,45 +242,129 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
     }
   }, [filtersReady, selectedSources, category, onlyNew, searchMode]);
 
-  const load = useCallback(async (): Promise<DealsResponse | null> => {
-    try {
-      const response = await fetch('/api/deals', {
-        cache: 'no-store',
-        headers: etagRef.current
-          ? { 'If-None-Match': etagRef.current }
-          : undefined,
-      });
+  const fetchPage = useCallback(
+    async (
+      options: {
+        cursor?: string | null;
+        append?: boolean;
+        metaOnly?: boolean;
+      } = {},
+    ): Promise<DealsListResponse | null> => {
+      const params = new URLSearchParams();
+      params.set('limit', String(PAGE_SIZE));
 
-      if (response.status === 304 && dataRef.current) {
-        return dataRef.current;
+      if (selectedSources.size > 0) {
+        params.set('sources', [...selectedSources].join(','));
       }
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (category !== 'all' && category !== 'favorites') {
+        params.set('category', category);
+      }
+      if (onlyNew) params.set('onlyNew', '1');
+      if (options.metaOnly) params.set('metaOnly', '1');
+      if (options.cursor) params.set('cursor', options.cursor);
 
-      etagRef.current = response.headers.get('ETag');
-      const payload = (await response.json()) as DealsResponse;
-      const merged: DealsResponse = {
-        ...payload,
-        items: payload.items.map((item) => {
+      let ids: number[] | null = null;
+      if (aiResult) {
+        ids = aiResult.ids;
+      } else if (category === 'favorites') {
+        ids = Object.entries(localStatesRef.current)
+          .filter(([, state]) => state.favorite)
+          .map(([id]) => Number(id));
+      }
+
+      const emptyIds = Boolean(ids && ids.length === 0);
+      if (ids) {
+        if (emptyIds) {
+          params.set('metaOnly', '1');
+        } else {
+          params.set('ids', ids.slice(0, 500).join(','));
+          params.delete('cursor');
+        }
+      }
+
+      try {
+        const response = await fetch(`/api/deals?${params.toString()}`, {
+          cache: 'no-store',
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const payload = (await response.json()) as DealsListResponse;
+        const items = payload.items.map((item) => {
           const override = localStatesRef.current[item.id];
           return override ? { ...item, ...override } : item;
-        }),
-      };
+        });
 
-      setData(merged);
-      setLoadError(null);
-      return merged;
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : '网络请求失败');
-      return null;
-    }
-  }, []);
+        setData((previous) => {
+          if (!previous) return { ...payload, items };
+
+          const meta = {
+            fetchedAt: payload.fetchedAt,
+            fetching: payload.fetching,
+            sources: payload.sources,
+            stats: payload.stats,
+            announcement: payload.announcement,
+            site: payload.site,
+            aiSearchEnabled: payload.aiSearchEnabled,
+            searchWindows: payload.searchWindows,
+          };
+
+          if (options.metaOnly) {
+            return emptyIds
+              ? {
+                  ...previous,
+                  ...meta,
+                  items: [],
+                  total: 0,
+                  hasMore: false,
+                  nextCursor: null,
+                }
+              : { ...previous, ...meta };
+          }
+
+          if (options.append) {
+            const existing = new Set(previous.items.map((item) => item.id));
+            return {
+              ...previous,
+              ...meta,
+              items: [
+                ...previous.items,
+                ...items.filter((item) => !existing.has(item.id)),
+              ],
+              total: payload.total,
+              hasMore: payload.hasMore,
+              nextCursor: payload.nextCursor,
+            };
+          }
+
+          return { ...payload, items };
+        });
+
+        setLoadError(null);
+        return { ...payload, items };
+      } catch (error) {
+        setLoadError(error instanceof Error ? error.message : '网络请求失败');
+        return null;
+      }
+    },
+    [selectedSources, category, onlyNew, aiResult],
+  );
 
   useEffect(() => {
+    if (!filtersReady) return;
+    void fetchPage({});
+  }, [filtersReady, fetchPage]);
+
+  useEffect(() => {
+    if (!filtersReady) return;
+
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const tick = async () => {
-      const payload = await load();
+      const current = dataRef.current;
+      const payload = await fetchPage({
+        metaOnly: Boolean(current && current.items.length > PAGE_SIZE),
+      });
       if (stopped) return;
 
       const delay = !payload
@@ -292,13 +375,25 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       timer = setTimeout(tick, delay);
     };
 
-    void tick();
+    timer = setTimeout(tick, 20_000);
 
     return () => {
       stopped = true;
       if (timer) clearTimeout(timer);
     };
-  }, [load]);
+  }, [filtersReady, fetchPage]);
+
+  const loadMore = useCallback(async () => {
+    if (loadingMore || !data?.nextCursor || !data.hasMore) return;
+    if (aiResult || category === 'favorites') return;
+
+    setLoadingMore(true);
+    try {
+      await fetchPage({ cursor: data.nextCursor, append: true });
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [loadingMore, data, fetchPage, aiResult, category]);
 
   const toggleItemState = useCallback(
     (id: number, field: 'claimed' | 'favorite') => {
@@ -500,15 +595,10 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
     });
   }, [data, selectedSources, category, onlyNew, aiOrder]);
 
-  const hasMore = visibleCount < filteredItems.length;
-  const visibleItems = filteredItems.slice(0, visibleCount);
+  const hasMore = Boolean(data?.hasMore) && !aiOrder && category !== 'favorites';
+  const visibleItems = filteredItems;
 
-  // 筛选或搜索变化时回到第一批，避免保留上一个结果集的滚动深度。
-  useEffect(() => {
-    setVisibleCount(PAGE_SIZE);
-  }, [selectedSources, category, onlyNew, aiQuery]);
-
-  // 触底自动加载下一批；同时保留手动按钮作为兜底。
+  // 触底自动加载下一页；同时保留手动按钮作为兜底。
   useEffect(() => {
     if (!hasMore) return;
 
@@ -518,7 +608,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
-          setVisibleCount((count) => count + PAGE_SIZE);
+          void loadMore();
         }
       },
       { rootMargin: '600px 0px' },
@@ -526,10 +616,20 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
 
     observer.observe(node);
     return () => observer.disconnect();
-  }, [hasMore, visibleCount, filteredItems.length]);
+  }, [hasMore, loadMore, data?.nextCursor]);
 
-  const favoriteCount =
-    data?.items.filter((item) => item.favorite).length ?? 0;
+  const favoriteCount = data
+    ? new Set([
+        ...Object.entries(localStatesRef.current)
+          .filter(([, state]) => state.favorite)
+          .map(([id]) => Number(id)),
+        ...data.items.filter((item) => item.favorite).map((item) => item.id),
+      ]).size
+    : 0;
+  const displayTotal =
+    aiOrder || category === 'favorites'
+      ? filteredItems.length
+      : data?.total ?? 0;
   const site = data?.site ?? initialSite;
 
   let content: ReactNode;
@@ -542,7 +642,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
           title="无法加载数据"
           description={`请确认服务已启动并稍后重试。（${loadError}）`}
           action={
-            <Button variant="outline" onClick={() => void load()}>
+            <Button variant="outline" onClick={() => void fetchPage({})}>
               重试
             </Button>
           }
@@ -659,18 +759,24 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
           >
             <Button
               variant="outline"
-              onClick={() => setVisibleCount((count) => count + PAGE_SIZE)}
+              disabled={loadingMore}
+              onClick={() => void loadMore()}
             >
-              加载更多（还有 {filteredItems.length - visibleItems.length} 条）
+              {loadingMore
+                ? '加载中…'
+                : `加载更多（还有 ${Math.max(
+                    0,
+                    displayTotal - visibleItems.length,
+                  )} 条）`}
             </Button>
             <p className="text-[11px] text-slate-400">
-              已显示 {visibleItems.length} / {filteredItems.length} 条
+              已加载 {visibleItems.length} / {displayTotal} 条
             </p>
           </div>
         ) : (
-          filteredItems.length > PAGE_SIZE && (
+          visibleItems.length > PAGE_SIZE && (
             <p className="mt-4 text-center text-[11px] text-slate-400">
-              已显示全部 {filteredItems.length} 条
+              已显示全部 {visibleItems.length} 条
             </p>
           )
         )}
@@ -751,7 +857,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
           <p className="text-xs text-slate-500" aria-live="polite">
             共{' '}
             <span className="font-semibold tabular-nums text-slate-700">
-              {filteredItems.length}
+              {displayTotal}
             </span>{' '}
             条
             {aiQuery && (

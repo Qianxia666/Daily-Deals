@@ -58,7 +58,7 @@ export interface SiteSettings {
   tagline: string;
 }
 
-export interface DealsResponse {
+export interface DealsMeta {
   fetchedAt: string | null;
   fetching: boolean;
   sources: SourceStatus[];
@@ -70,7 +70,17 @@ export interface DealsResponse {
     ai: number;
     keyword: number;
   };
+}
+
+export interface DealsResponse extends DealsMeta {
   items: DealItem[];
+}
+
+export interface DealsListResponse extends DealsMeta {
+  items: DealItem[];
+  total: number;
+  hasMore: boolean;
+  nextCursor: string | null;
 }
 
 export interface AdminSource extends SourceStatus {
@@ -107,6 +117,10 @@ export interface SearchIndexStatus {
   deals: number;
   version: string | null;
   builtAt: string | null;
+  rebuilding: boolean;
+  processed: number;
+  total: number;
+  lastError: string | null;
 }
 
 export interface AdminData {

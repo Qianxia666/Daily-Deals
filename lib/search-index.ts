@@ -4,19 +4,45 @@ import type { SearchIndexStatus } from './types';
 
 type Db = Database.Database;
 
-export const SEARCH_INDEX_VERSION = '2';
+export const SEARCH_INDEX_VERSION = '3';
+
+export interface SearchRebuildProgress {
+  running: boolean;
+  processed: number;
+  total: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+}
+
+const EMPTY_PROGRESS: SearchRebuildProgress = {
+  running: false,
+  processed: 0,
+  total: 0,
+  startedAt: null,
+  finishedAt: null,
+  error: null,
+};
 
 const globalForSearch = globalThis as typeof globalThis & {
   __dailyDealsFtsAvailable?: boolean;
+  __dailyDealsSearchRebuild?: SearchRebuildProgress;
 };
 
-/** 生产环境下每个路由可能各自打包一份模块，标志位放在 globalThis 上共享。 */
+/** 生产环境下每个路由可能各自打包一份模块，状态放在 globalThis 上共享。 */
 function isFtsAvailable(): boolean {
   return globalForSearch.__dailyDealsFtsAvailable === true;
 }
 
 function setFtsAvailable(value: boolean): void {
   globalForSearch.__dailyDealsFtsAvailable = value;
+}
+
+function getProgress(): SearchRebuildProgress {
+  if (!globalForSearch.__dailyDealsSearchRebuild) {
+    globalForSearch.__dailyDealsSearchRebuild = { ...EMPTY_PROGRESS };
+  }
+  return globalForSearch.__dailyDealsSearchRebuild;
 }
 
 export interface SearchCandidate {
@@ -46,6 +72,8 @@ interface DealIndexRow {
   title: string;
   ai_title: string | null;
   ai_summary: string | null;
+  ai_value: string | null;
+  ai_action: string | null;
   description: string | null;
   source_name: string | null;
 }
@@ -77,7 +105,10 @@ function insertRow(
     [row.title, row.ai_title].filter(Boolean).join(' '),
     maxChars,
   );
-  const summary = buildSearchIndexText(row.ai_summary, maxChars);
+  const summary = buildSearchIndexText(
+    [row.ai_summary, row.ai_value, row.ai_action].filter(Boolean).join(' '),
+    maxChars,
+  );
   const description = buildSearchIndexText(
     [row.description, row.source_name].filter(Boolean).join(' '),
     maxChars,
@@ -97,7 +128,8 @@ export function indexDealById(
   try {
     const row = db
       .prepare(
-        `SELECT d.id, d.title, d.ai_title, d.ai_summary, d.description,
+        `SELECT d.id, d.title, d.ai_title, d.ai_summary, d.ai_value,
+                d.ai_action, d.description,
                 COALESCE(s.name, d.source) AS source_name
          FROM deals d
          LEFT JOIN sources s ON s.id = d.source
@@ -170,7 +202,8 @@ export function rebuildSearchIndex(db: Db, maxChars: number): number {
   db.exec('DELETE FROM deals_fts');
 
   const select = db.prepare(
-    `SELECT d.id, d.title, d.ai_title, d.ai_summary, d.description,
+    `SELECT d.id, d.title, d.ai_title, d.ai_summary, d.ai_value,
+            d.ai_action, d.description,
             COALESCE(s.name, d.source) AS source_name
      FROM deals d
      LEFT JOIN sources s ON s.id = d.source
@@ -204,6 +237,92 @@ export function rebuildSearchIndex(db: Db, maxChars: number): number {
   writeSetting(db, 'search_index_built_at', builtAt);
 
   return indexed;
+}
+
+const REBUILD_CHUNK = 2000;
+
+/**
+ * 在后台异步重建索引：每批 2000 条并让出事件循环，
+ * 避免大数据量时把请求线程卡住，同时可读取进度。
+ */
+export function startSearchIndexRebuild(
+  db: Db,
+  maxChars: number,
+): SearchRebuildProgress {
+  const progress = getProgress();
+  if (progress.running) return progress;
+
+  const total = (
+    db.prepare('SELECT COUNT(*) AS count FROM deals').get() as {
+      count: number;
+    }
+  ).count;
+
+  progress.running = true;
+  progress.processed = 0;
+  progress.total = total;
+  progress.startedAt = new Date().toISOString();
+  progress.finishedAt = null;
+  progress.error = null;
+
+  void (async () => {
+    try {
+      db.exec('DELETE FROM deals_fts');
+
+      const select = db.prepare(
+        `SELECT d.id, d.title, d.ai_title, d.ai_summary, d.ai_value,
+                d.ai_action, d.description,
+                COALESCE(s.name, d.source) AS source_name
+         FROM deals d
+         LEFT JOIN sources s ON s.id = d.source
+         WHERE d.id > ?
+         ORDER BY d.id
+         LIMIT ?`,
+      );
+
+      let cursor = 0;
+      for (;;) {
+        const rows = select.all(cursor, REBUILD_CHUNK) as DealIndexRow[];
+        if (rows.length === 0) break;
+
+        db.exec('BEGIN');
+        try {
+          for (const row of rows) insertRow(db, row, maxChars);
+          db.exec('COMMIT');
+        } catch (error) {
+          db.exec('ROLLBACK');
+          throw error;
+        }
+
+        cursor = rows[rows.length - 1].id;
+        progress.processed += rows.length;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+
+      writeSetting(db, 'search_index_version', SEARCH_INDEX_VERSION);
+      writeSetting(db, 'search_index_built_at', new Date().toISOString());
+      setFtsAvailable(true);
+    } catch (error) {
+      progress.error =
+        error instanceof Error ? error.message : String(error);
+      console.warn('[search-index] background rebuild failed', error);
+    } finally {
+      progress.running = false;
+      progress.finishedAt = new Date().toISOString();
+    }
+  })();
+
+  return progress;
+}
+
+/** 合并 FTS 段，控制索引体积与查询耗时。 */
+export function optimizeSearchIndex(db: Db): void {
+  if (!isFtsAvailable()) return;
+  try {
+    db.exec("INSERT INTO deals_fts(deals_fts) VALUES('optimize')");
+  } catch (error) {
+    console.warn('[search-index] optimize failed', error);
+  }
 }
 
 export function ensureSearchIndex(
@@ -253,6 +372,7 @@ export function ensureSearchIndex(
 }
 
 export function readSearchIndexStatus(db: Db): SearchIndexStatus {
+  const progress = getProgress();
   try {
     const indexed = (
       db.prepare('SELECT COUNT(*) AS count FROM deals_fts').get() as {
@@ -272,6 +392,10 @@ export function readSearchIndexStatus(db: Db): SearchIndexStatus {
       deals,
       version: readSetting(db, 'search_index_version'),
       builtAt: readSetting(db, 'search_index_built_at'),
+      rebuilding: progress.running,
+      processed: progress.processed,
+      total: progress.total,
+      lastError: progress.error,
     };
   } catch {
     return {
@@ -280,6 +404,10 @@ export function readSearchIndexStatus(db: Db): SearchIndexStatus {
       deals: 0,
       version: null,
       builtAt: null,
+      rebuilding: progress.running,
+      processed: progress.processed,
+      total: progress.total,
+      lastError: progress.error,
     };
   }
 }
