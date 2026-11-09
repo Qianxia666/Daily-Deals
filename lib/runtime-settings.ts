@@ -1,4 +1,10 @@
-import { getAdminData, getRuntimeEnvRaw, setSetting } from './db';
+import {
+  getAdminData,
+  getPromotedTags,
+  getRuntimeEnvRaw,
+  getSetting,
+  setSetting,
+} from './db';
 import type {
   AdminData,
   RuntimeSettingType,
@@ -21,6 +27,78 @@ interface RuntimeFieldDef {
   min?: number;
   max?: number;
 }
+
+/** 默认品类标签词表；模型只会从这里选标签。 */
+export const DEFAULT_TAG_VOCABULARY = [
+  '奶茶',
+  '咖啡',
+  '快餐',
+  '外卖',
+  '零食',
+  '生鲜',
+  '酒水',
+  '视频会员',
+  '音乐会员',
+  '网盘会员',
+  '电商会员',
+  '红包',
+  '返利',
+  '支付优惠',
+  '话费',
+  '流量卡',
+  '宽带',
+  '云服务器',
+  '域名',
+  '虚拟主机',
+  'CDN',
+  'SSL证书',
+  '游戏',
+  'Steam',
+  'Epic',
+  '手游',
+  '主机游戏',
+  '手机',
+  '笔记本',
+  '平板',
+  '键盘',
+  '鼠标',
+  '耳机',
+  '显示器',
+  '充电宝',
+  '存储',
+  '相机',
+  '数码配件',
+  'AI工具',
+  '办公软件',
+  '设计工具',
+  '开发工具',
+  '系统工具',
+  '安全软件',
+  '打车',
+  '机票',
+  '酒店',
+  '火车票',
+  '加油',
+  '电影票',
+  '快递',
+  '健身',
+  '运动户外',
+  '汽车服务',
+  '生活服务',
+  '课程',
+  '电子书',
+  '图书',
+  '办公用品',
+  '服饰',
+  '鞋包',
+  '美妆',
+  '母婴',
+  '宠物',
+  '家电',
+  '日用',
+  '虚拟权益',
+  '其他',
+];
 
 /**
  * 后台可修改的运行时配置。除容器级参数外，保存后会在下一次读取时立即生效，
@@ -112,6 +190,110 @@ const FIELDS: RuntimeFieldDef[] = [
     ],
   },
   {
+    key: 'AI_TAGS_ENABLED',
+    label: '启用品类标签',
+    group: 'AI 改写与搜索',
+    description:
+      '生成 AI 摘要时顺带为每条优惠打 1–3 个品类标签。开启后搜「奶茶」可以命中蜜雪冰城、茶百道等品牌条目。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'AI_TAG_VOCABULARY',
+    label: '品类标签词表',
+    group: 'AI 改写与搜索',
+    description:
+      '每行或用逗号分隔。模型只会从词表里选标签；新增品类后保存即可，存量数据可在「品类标签」区域一键补全。',
+    type: 'textarea',
+    defaultValue: DEFAULT_TAG_VOCABULARY.join('\n'),
+  },
+  {
+    key: 'AI_TAGS_PROPOSE_ENABLED',
+    label: '允许 AI 提议新标签',
+    group: 'AI 改写与搜索',
+    description:
+      '词表都不合适时，允许模型提出 0–3 个新品类词并进入候选池；候选不会直接影响前台标签建议。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'AI_TAGS_PROPOSE_MAX',
+    label: '每条最多提议标签数',
+    group: 'AI 改写与搜索',
+    description: '默认 2，设为 0 表示不提议新标签；提议词不会进入正式词表。',
+    type: 'number',
+    defaultValue: '2',
+    min: 0,
+    max: 3,
+  },
+  {
+    key: 'AI_TAGS_PROMOTE_THRESHOLD',
+    label: '候选自动转正阈值',
+    group: 'AI 改写与搜索',
+    description:
+      '同一提议标签被多少条优惠使用后进入可转正状态，默认 3；达到阈值的提议标签也会进入零结果标签建议。',
+    type: 'number',
+    defaultValue: '3',
+    min: 2,
+    max: 20,
+  },
+  {
+    key: 'AI_TAGS_CANDIDATE_LIMIT',
+    label: '标签候选池上限',
+    group: 'AI 改写与搜索',
+    description:
+      '候选池最多保留多少个待审核标签，默认 500；超出后先淘汰只出现过一次的。',
+    type: 'number',
+    defaultValue: '500',
+    min: 50,
+    max: 5000,
+  },
+  {
+    key: 'AI_TAGS_BRAND_EXTRACT_ENABLED',
+    label: '抽取品牌与产品实体',
+    group: 'AI 改写与搜索',
+    description:
+      '从标题与描述中抽取 brands、products 写入独立索引；抽取结果必须能在原文找到，权重低于标题。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'SEARCH_SUGGEST_TAGS',
+    label: '零结果推荐标签数',
+    group: 'AI 改写与搜索',
+    description:
+      '搜索无结果时最多推荐多少个可点击的标签，默认 6；设为 0 表示不推荐。',
+    type: 'number',
+    defaultValue: '6',
+    min: 0,
+    max: 12,
+  },
+  {
+    key: 'SEARCH_REWRITE_ON_EMPTY_RERANK',
+    label: '精排为空时再次改写',
+    group: 'AI 改写与搜索',
+    description:
+      '召回有候选但 AI 精排全部过滤时，再改写一次搜索词重新精排；默认开启。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
     key: 'AI_SEARCH_USE_SUMMARY',
     label: 'AI 精排参考摘要',
     group: 'AI 改写与搜索',
@@ -149,6 +331,41 @@ const FIELDS: RuntimeFieldDef[] = [
       { value: 'true', label: '开启' },
       { value: 'false', label: '关闭' },
     ],
+  },
+  {
+    key: 'AI_SEARCH_REWRITE_ENABLED',
+    label: '零结果时改写搜索词',
+    group: 'AI 改写与搜索',
+    description:
+      'AI 搜索没有召回任何候选时，让模型把口语改写成品类词再搜一次；只影响未命中的请求。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'AI_SEARCH_REWRITE_TIMEOUT_MS',
+    label: '改写超时（毫秒）',
+    group: 'AI 改写与搜索',
+    description:
+      '改写请求的等待上限，超时直接返回空结果，避免拖慢搜索；默认 8000。',
+    type: 'number',
+    defaultValue: '8000',
+    min: 2000,
+    max: 30000,
+  },
+  {
+    key: 'AI_SEARCH_REWRITE_PER_MINUTE',
+    label: '改写每分钟上限',
+    group: 'AI 改写与搜索',
+    description:
+      '全站每分钟最多触发多少次改写，控制额外模型成本；默认 20。',
+    type: 'number',
+    defaultValue: '20',
+    min: 1,
+    max: 200,
   },
   {
     key: 'AI_SEARCH_INDEX_MAX_CHARS',
@@ -696,12 +913,88 @@ export function getAiSearchUseSummary(): boolean {
   return getRuntimeBool('AI_SEARCH_USE_SUMMARY', true);
 }
 
+/** 是否在生成摘要时顺带产出品类标签。 */
+export function getAiTagsEnabled(): boolean {
+  return getRuntimeBool('AI_TAGS_ENABLED', true);
+}
+
+export function getAiTagsProposeEnabled(): boolean {
+  return getRuntimeBool('AI_TAGS_PROPOSE_ENABLED', true);
+}
+
+/** 允许 0，表示不提议新标签。 */
+export function getAiTagsProposeMax(): number {
+  const raw = getRuntimeEnvRaw('AI_TAGS_PROPOSE_MAX');
+  if (raw === null || raw.trim() === '') return 2;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return 2;
+  return Math.min(Math.round(value), 3);
+}
+
+export function getAiTagsPromoteThreshold(): number {
+  return getRuntimeEnvNumber('AI_TAGS_PROMOTE_THRESHOLD', 3, 2, 20);
+}
+
+export function getAiTagsCandidateLimit(): number {
+  return getRuntimeEnvNumber('AI_TAGS_CANDIDATE_LIMIT', 500, 50, 5000);
+}
+
+export function getAiTagsBrandExtractEnabled(): boolean {
+  return getRuntimeBool('AI_TAGS_BRAND_EXTRACT_ENABLED', true);
+}
+
+export function getSearchSuggestTags(): number {
+  const raw = getRuntimeEnvRaw('SEARCH_SUGGEST_TAGS');
+  if (raw === null || raw.trim() === '') return 6;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return 6;
+  return Math.min(Math.round(value), 12);
+}
+
+export function getAiSearchRewriteOnEmptyRerank(): boolean {
+  return getRuntimeBool('SEARCH_REWRITE_ON_EMPTY_RERANK', true);
+}
+
+/** 受控品类标签词表：支持换行、中英文逗号、顿号分隔。 */
+export function getAiTagVocabulary(): string[] {
+  const raw = getRuntimeEnv('AI_TAG_VOCABULARY', '').trim();
+  const source = raw || DEFAULT_TAG_VOCABULARY.join('\n');
+  const tags = source
+    .split(/[\n,，、;；]+/)
+    .map((tag) => tag.trim())
+    .filter((tag) => tag.length >= 2 && tag.length <= 12);
+
+  return [...new Set([...tags, ...getPromotedTags()])].slice(0, 200);
+}
+
 export function getAiSearchFtsEnabled(): boolean {
   return getRuntimeBool('AI_SEARCH_FTS_ENABLED', true);
 }
 
 export function getAiSearchSynonymEnabled(): boolean {
   return getRuntimeBool('AI_SEARCH_SYNONYM_ENABLED', true);
+}
+
+export function getAiSearchRewriteEnabled(): boolean {
+  return getRuntimeBool('AI_SEARCH_REWRITE_ENABLED', true);
+}
+
+export function getAiSearchRewriteTimeoutMs(): number {
+  return getRuntimeEnvNumber(
+    'AI_SEARCH_REWRITE_TIMEOUT_MS',
+    8000,
+    2000,
+    30000,
+  );
+}
+
+export function getAiSearchRewritePerMinute(): number {
+  return getRuntimeEnvNumber(
+    'AI_SEARCH_REWRITE_PER_MINUTE',
+    20,
+    1,
+    200,
+  );
 }
 
 export function getAiSearchIndexMaxChars(): number {
@@ -746,6 +1039,15 @@ export function getRuntimeAdminFields(): RuntimeSettingView[] {
     const raw = getRuntimeEnvRaw(def.key);
     const configured = raw !== null && raw.trim() !== '';
 
+    const stored = getSetting(`env:${def.key}`);
+    const envValue = process.env[def.key];
+    const source: RuntimeSettingView['source'] =
+      stored !== null && stored.trim() !== ''
+        ? 'admin'
+        : envValue !== undefined && envValue.trim() !== ''
+          ? 'env'
+          : 'default';
+
     return {
       key: def.key,
       label: def.label,
@@ -759,6 +1061,7 @@ export function getRuntimeAdminFields(): RuntimeSettingView[] {
       restartRequired: def.restartRequired,
       min: def.min,
       max: def.max,
+      source,
     };
   });
 }
@@ -773,7 +1076,14 @@ export function saveRuntimeSettings(
     if (!(def.key in values)) continue;
 
     const raw = values[def.key];
-    const value = typeof raw === 'string' ? raw.trim() : '';
+    // 兼容接口直接传数字的情况，避免被当成空值而清掉后台配置。
+    const value =
+      typeof raw === 'string'
+        ? raw.trim()
+        : typeof raw === 'number' && Number.isFinite(raw)
+          ? String(raw)
+          : null;
+    if (value === null) continue;
 
     if (def.secret && value === '') continue;
 
@@ -791,8 +1101,9 @@ export function saveRuntimeSettings(
 
     if (def.type === 'number' && value !== '') {
       const parsed = Number(value);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        return `${def.label}必须是正数`;
+      const min = def.min ?? 1;
+      if (!Number.isFinite(parsed) || parsed < min) {
+        return `${def.label}不能小于 ${min}`;
       }
     }
 

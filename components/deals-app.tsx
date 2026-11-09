@@ -6,6 +6,7 @@ import {
   LoaderCircle,
   SearchX,
   Sparkles,
+  Tag,
   WifiOff,
 } from 'lucide-react';
 import {
@@ -55,6 +56,8 @@ interface AiSearchResult {
   reason: string;
   mode: 'ai' | 'keyword';
   windowDays?: number;
+  suggestedTags?: { tag: string; count: number }[];
+  truncated?: boolean;
 }
 
 function parseLocalStates(raw: string): Record<number, LocalDealState> {
@@ -93,13 +96,13 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
   const [aiResult, setAiResult] = useState<AiSearchResult | null>(null);
   const [aiSearching, setAiSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [activeTag, setActiveTag] = useState<string | null>(null);
   const [filtersReady, setFiltersReady] = useState(false);
 
   const [selectedSources, setSelectedSources] = useState<Set<SourceId>>(
     new Set(),
   );
   const [category, setCategory] = useState<CategoryFilter>('all');
-  const [onlyNew, setOnlyNew] = useState(false);
   const [splashPhase, setSplashPhase] = useState<
     'visible' | 'leaving' | 'hidden'
   >('visible');
@@ -201,10 +204,6 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
             setCategory(record.category as CategoryFilter);
           }
 
-          if (typeof record.onlyNew === 'boolean') {
-            setOnlyNew(record.onlyNew);
-          }
-
           if (record.searchMode === 'ai' || record.searchMode === 'keyword') {
             setSearchMode(record.searchMode);
           }
@@ -233,14 +232,13 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
         JSON.stringify({
           sources: [...selectedSources],
           category,
-          onlyNew,
           searchMode,
         }),
       );
     } catch {
       // 浏览器禁用存储时静默降级为仅当前页面生效。
     }
-  }, [filtersReady, selectedSources, category, onlyNew, searchMode]);
+  }, [filtersReady, selectedSources, category, searchMode]);
 
   const fetchPage = useCallback(
     async (
@@ -259,7 +257,6 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       if (category !== 'all' && category !== 'favorites') {
         params.set('category', category);
       }
-      if (onlyNew) params.set('onlyNew', '1');
       if (options.metaOnly) params.set('metaOnly', '1');
       if (options.cursor) params.set('cursor', options.cursor);
 
@@ -346,7 +343,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
         return null;
       }
     },
-    [selectedSources, category, onlyNew, aiResult],
+    [selectedSources, category, aiResult],
   );
 
   useEffect(() => {
@@ -454,102 +451,218 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
     setAiResult(null);
   }, [aiSearchEnabled]);
 
+  /** 把当前标签同步到地址栏，支持刷新、分享与前进后退。 */
+  const syncTagToUrl = useCallback(
+    (tag: string | null, mode: 'push' | 'replace' = 'push') => {
+      if (typeof window === 'undefined') return;
+
+      const url = new URL(window.location.href);
+      if (tag) url.searchParams.set('tag', tag);
+      else url.searchParams.delete('tag');
+
+      const next = `${url.pathname}${url.search}${url.hash}`;
+      const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      if (next === current) return;
+
+      if (mode === 'replace') {
+        window.history.replaceState({ tag }, '', next);
+      } else {
+        window.history.pushState({ tag }, '', next);
+      }
+    },
+    [],
+  );
+
   const clearSearch = useCallback(() => {
     setSearchInput('');
     setAiQuery('');
     setAiResult(null);
+    setActiveTag(null);
     setSearchError(null);
-  }, []);
+    syncTagToUrl(null, 'push');
+  }, [syncTagToUrl]);
+
+  const clearTag = useCallback(
+    (options: { fromHistory?: boolean } = {}) => {
+      searchAbortRef.current?.abort();
+      setActiveTag(null);
+      setAiQuery('');
+      setAiResult(null);
+      setSearchError(null);
+      if (!options.fromHistory) syncTagToUrl(null, 'push');
+    },
+    [syncTagToUrl],
+  );
 
   const handleSearchModeChange = useCallback(
     (nextMode: SearchMode) => {
       setSearchMode(nextMode);
       setAiQuery('');
       setAiResult(null);
+      setActiveTag(null);
       setSearchError(null);
+      syncTagToUrl(null, 'push');
     },
-    [],
+    [syncTagToUrl],
   );
 
   const clearFilters = useCallback(() => {
     clearSearch();
     setSelectedSources(new Set());
     setCategory('all');
-    setOnlyNew(false);
   }, [clearSearch]);
 
-  const handleAiSearch = useCallback(async () => {
-    const query = searchInput.trim();
-    if (!query) return;
+  const handleAiSearch = useCallback(
+    async (
+      tagOverride?: string,
+      options: { fromHistory?: boolean } = {},
+    ) => {
+      const query = (tagOverride ?? searchInput).trim();
+      if (!query) return;
 
-    const seq = searchSeqRef.current + 1;
-    searchSeqRef.current = seq;
-    searchAbortRef.current?.abort();
-    const controller = new AbortController();
-    searchAbortRef.current = controller;
+      const seq = searchSeqRef.current + 1;
+      searchSeqRef.current = seq;
+      searchAbortRef.current?.abort();
+      const controller = new AbortController();
+      searchAbortRef.current = controller;
 
-    setAiSearching(true);
-    setSearchError(null);
+      setAiSearching(true);
+      setSearchError(null);
 
-    try {
-      const response = await fetch('/api/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, mode: searchMode }),
-        signal: controller.signal,
-      });
+      try {
+        const response = await fetch('/api/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query,
+            mode: searchMode,
+            tag: tagOverride,
+          }),
+          signal: controller.signal,
+        });
 
-      const payload = (await response.json().catch(() => null)) as
-        | {
-            ids?: unknown;
-            reason?: unknown;
-            mode?: unknown;
-            windowDays?: unknown;
-            error?: unknown;
-          }
-        | null;
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              ids?: unknown;
+              reason?: unknown;
+              mode?: unknown;
+              windowDays?: unknown;
+              suggestedTags?: unknown;
+              truncated?: unknown;
+              error?: unknown;
+            }
+          | null;
 
-      if (seq !== searchSeqRef.current) return;
+        if (seq !== searchSeqRef.current) return;
 
-      if (!response.ok) {
-        throw new Error(
-          typeof payload?.error === 'string'
-            ? payload.error
-            : `HTTP ${response.status}`,
+        if (!response.ok) {
+          throw new Error(
+            typeof payload?.error === 'string'
+              ? payload.error
+              : `HTTP ${response.status}`,
+          );
+        }
+
+        const ids = Array.isArray(payload?.ids)
+          ? payload.ids.filter(
+              (value): value is number => Number.isInteger(value),
+            )
+          : [];
+
+        const suggestedTags = Array.isArray(payload?.suggestedTags)
+          ? payload.suggestedTags
+              .filter(
+                (value): value is { tag: string; count: number } =>
+                  Boolean(value) &&
+                  typeof value === 'object' &&
+                  typeof (value as { tag?: unknown }).tag === 'string' &&
+                  typeof (value as { count?: unknown }).count === 'number',
+              )
+              .slice(0, 12)
+          : [];
+
+        setAiResult({
+          ids,
+          reason: typeof payload?.reason === 'string' ? payload.reason : '',
+          mode: payload?.mode === 'ai' ? 'ai' : 'keyword',
+          windowDays:
+            typeof payload?.windowDays === 'number'
+              ? payload.windowDays
+              : undefined,
+          suggestedTags,
+          truncated: payload?.truncated === true,
+        });
+
+        if (tagOverride) {
+          setActiveTag(tagOverride);
+          setAiQuery('');
+          if (!options.fromHistory) syncTagToUrl(tagOverride, 'push');
+        } else {
+          setActiveTag(null);
+          setAiQuery(query);
+          if (!options.fromHistory) syncTagToUrl(null, 'push');
+        }
+      } catch (error) {
+        if (controller.signal.aborted || seq !== searchSeqRef.current) return;
+        setSearchError(
+          error instanceof Error ? error.message : '搜索失败，请稍后重试',
         );
+      } finally {
+        if (seq === searchSeqRef.current) setAiSearching(false);
       }
+    },
+    [searchInput, searchMode, syncTagToUrl],
+  );
 
-      const ids = Array.isArray(payload?.ids)
-        ? payload.ids.filter(
-            (value): value is number => Number.isInteger(value),
-          )
-        : [];
+  /** 标签点击：同标签已有结果时不重复请求。 */
+  const handleTagClick = useCallback(
+    (tag: string) => {
+      if (aiSearching) return;
+      if (activeTag === tag && aiResult) return;
+      void handleAiSearch(tag);
+    },
+    [aiSearching, activeTag, aiResult, handleAiSearch],
+  );
 
-      setAiResult({
-        ids,
-        reason: typeof payload?.reason === 'string' ? payload.reason : '',
-        mode: payload?.mode === 'ai' ? 'ai' : 'keyword',
-        windowDays:
-          typeof payload?.windowDays === 'number'
-            ? payload.windowDays
-            : undefined,
-      });
-      setAiQuery(query);
-    } catch (error) {
-      if (controller.signal.aborted || seq !== searchSeqRef.current) return;
-      setSearchError(
-        error instanceof Error ? error.message : '搜索失败，请稍后重试',
-      );
-    } finally {
-      if (seq === searchSeqRef.current) setAiSearching(false);
-    }
-  }, [searchInput, searchMode]);
+  // 用 ref 保存最新实现，供 popstate 与首屏 URL 还原使用，避免反复重绑。
+  const handleAiSearchRef = useRef(handleAiSearch);
+  const clearTagRef = useRef(clearTag);
+  useEffect(() => {
+    handleAiSearchRef.current = handleAiSearch;
+    clearTagRef.current = clearTag;
+  }, [handleAiSearch, clearTag]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const tag =
+        new URLSearchParams(window.location.search).get('tag')?.trim() ?? '';
+      if (tag) {
+        void handleAiSearchRef.current(tag, { fromHistory: true });
+      } else {
+        clearTagRef.current({ fromHistory: true });
+      }
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  // 首次加载若地址栏带 ?tag=，直接还原标签筛选结果。
+  const initialTagAppliedRef = useRef(false);
+  useEffect(() => {
+    if (initialTagAppliedRef.current) return;
+    initialTagAppliedRef.current = true;
+
+    const tag =
+      new URLSearchParams(window.location.search).get('tag')?.trim() ?? '';
+    if (tag) void handleAiSearchRef.current(tag, { fromHistory: true });
+  }, []);
 
   const hasFilters =
     Boolean(aiQuery) ||
+    Boolean(activeTag) ||
     selectedSources.size > 0 ||
-    category !== 'all' ||
-    onlyNew;
+    category !== 'all';
 
   const aiOrder = useMemo(() => {
     if (!aiResult) return null;
@@ -573,7 +686,6 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       } else if (category !== 'all' && item.category !== category) {
         return false;
       }
-      if (onlyNew && !item.isNew) return false;
       if (aiOrder && !aiOrder.has(item.id)) return false;
       return true;
     });
@@ -593,7 +705,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       if (aTime !== bTime) return bTime - aTime;
       return b.id - a.id;
     });
-  }, [data, selectedSources, category, onlyNew, aiOrder]);
+  }, [data, selectedSources, category, aiOrder]);
 
   const hasMore = Boolean(data?.hasMore) && !aiOrder && category !== 'favorites';
   const visibleItems = filteredItems;
@@ -652,7 +764,20 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       content = null;
     }
   } else if (filteredItems.length === 0) {
-    if (aiQuery && aiResult) {
+    if (activeTag) {
+      content = (
+        <EmptyState
+          icon={<SearchX className="h-5 w-5" aria-hidden="true" />}
+          title="该标签暂无在架优惠"
+          description={`标签「${activeTag}」下暂时没有可展示的优惠，可以关闭标签筛选查看全部。`}
+          action={
+            <Button variant="outline" onClick={clearFilters}>
+              查看全部优惠
+            </Button>
+          }
+        />
+      );
+    } else if (aiQuery && aiResult) {
       content = (
         <EmptyState
           icon={<SearchX className="h-5 w-5" aria-hidden="true" />}
@@ -665,9 +790,29 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
             aiResult.reason || '换一种说法再试试，或清空筛选查看全部优惠。'
           }
           action={
-            <Button variant="outline" onClick={clearFilters}>
-              查看全部优惠
-            </Button>
+            <div className="flex flex-col items-center gap-3">
+              {(aiResult.suggestedTags?.length ?? 0) > 0 && (
+                <div className="flex flex-wrap justify-center gap-2">
+                  {aiResult.suggestedTags?.map((item) => (
+                    <Button
+                      key={item.tag}
+                      variant="secondary"
+                      size="sm"
+                      disabled={aiSearching}
+                      onClick={() => void handleAiSearch(item.tag)}
+                    >
+                      {item.tag}
+                      <span className="text-xs text-slate-500">
+                        {item.count}
+                      </span>
+                    </Button>
+                  ))}
+                </div>
+              )}
+              <Button variant="outline" onClick={clearFilters}>
+                查看全部优惠
+              </Button>
+            </div>
           }
         />
       );
@@ -748,6 +893,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
               highlight={aiQuery || undefined}
               onToggleClaim={() => toggleItemState(item.id, 'claimed')}
               onToggleFavorite={() => toggleItemState(item.id, 'favorite')}
+              onTagClick={handleTagClick}
             />
           ))}
         </div>
@@ -847,8 +993,6 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
           onClearSources={() => setSelectedSources(new Set())}
           category={category}
           onCategoryChange={setCategory}
-          onlyNew={onlyNew}
-          onOnlyNewChange={setOnlyNew}
           hasFilters={hasFilters}
           onClearFilters={clearFilters}
         />
@@ -866,16 +1010,42 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
                 · {aiResult?.mode === 'ai' ? 'AI 搜索' : '普通搜索'}「{aiQuery}」
               </span>
             )}
-            {hasFilters && !aiQuery && <span> · 已筛选</span>}
+            {activeTag && (
+              <span className="text-sky-700">
+                {' '}
+                · 标签「{activeTag}」
+              </span>
+            )}
+            {hasFilters && !aiQuery && !activeTag && <span> · 已筛选</span>}
           </p>
           <span className="hidden text-[11px] text-slate-500 sm:inline">
-            {aiQuery
-              ? aiResult?.mode === 'ai'
-                ? '按 AI 相关度排序'
-                : '按关键词匹配排序'
-              : '按新到旧排序，已领取置底'}
+            {activeTag
+              ? '按标签筛选'
+              : aiQuery
+                ? aiResult?.mode === 'ai'
+                  ? '按 AI 相关度排序'
+                  : '按关键词匹配排序'
+                : '按新到旧排序，已读置底'}
           </span>
         </div>
+
+        {activeTag && (
+          <div className="mt-3 flex items-start gap-2 rounded-xl border border-sky-100 bg-sky-50 px-3 py-2 text-[11px] leading-relaxed text-sky-800">
+            <Tag className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <p className="min-w-0 flex-1">
+              标签：<span className="font-semibold">{activeTag}</span> ·{' '}
+              {displayTotal} 条
+              {aiResult?.truncated && <span>（仅显示前 100 条）</span>}
+            </p>
+            <button
+              type="button"
+              onClick={() => clearTag()}
+              className="shrink-0 font-medium underline-offset-2 hover:underline"
+            >
+              关闭
+            </button>
+          </div>
+        )}
 
         {aiQuery && aiResult && (
           <div className="mt-3 flex items-start gap-2 rounded-xl border border-violet-100 bg-violet-50 px-3 py-2 text-[11px] leading-relaxed text-violet-800">

@@ -48,8 +48,6 @@ const STOPWORDS = new Set([
   'is',
 ]);
 
-const CHINESE = /[\u4e00-\u9fff]/;
-
 function chunkText(text: string): string[] {
   return String(text ?? '')
     .toLowerCase()
@@ -170,21 +168,4 @@ export function buildFtsQuery(
   }
 
   return groups.length > 0 ? groups.join(' AND ') : null;
-}
-
-/** 单字或纯符号查询无法命中二元索引时，交给 LIKE 兜底。 */
-export function shouldUseLikeFallback(query: string): boolean {
-  const trimmed = query.trim();
-  if (!trimmed) return true;
-  if (!CHINESE.test(trimmed)) return false;
-
-  const chineseOnly = trimmed.replace(/[^\u4e00-\u9fff]/g, '');
-  return chineseOnly.length === 1;
-}
-
-export function buildLikePattern(query: string): string {
-  const escaped = query
-    .trim()
-    .replace(/[\\%_]/g, (char) => `\\${char}`);
-  return `%${escaped}%`;
 }

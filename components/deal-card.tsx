@@ -27,6 +27,7 @@ interface DealCardProps {
   highlight?: string;
   onToggleClaim: () => void;
   onToggleFavorite: () => void;
+  onTagClick?: (tag: string) => void;
 }
 
 function escapeRegExp(value: string): string {
@@ -71,6 +72,7 @@ export function DealCard({
   highlight,
   onToggleClaim,
   onToggleFavorite,
+  onTagClick,
 }: DealCardProps) {
   const expiry = getExpiryInfo(item.expiresAt);
   const displayTitle = item.aiTitle || item.title;
@@ -210,6 +212,38 @@ export function DealCard({
         </span>
         <Badge variant="outline">{item.sourceName}</Badge>
 
+        {item.tags
+          .filter(
+            (tag) =>
+              tag !== CATEGORY_LABELS[item.category] &&
+              tag !== item.sourceName,
+          )
+          .slice(0, 3)
+          .map((tag) =>
+            onTagClick ? (
+              <button
+                key={tag}
+                type="button"
+                aria-label={`查看标签：${tag}`}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onTagClick(tag);
+                }}
+                className="inline-flex cursor-pointer items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-medium leading-5 text-sky-800 transition-colors hover:border-sky-300 hover:bg-sky-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
+              >
+                #{tag}
+              </button>
+            ) : (
+              <span
+                key={tag}
+                className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-medium leading-5 text-sky-800"
+              >
+                #{tag}
+              </span>
+            ),
+          )}
+
         {expiry && !expiry.expired && (
           <span
             className={cn(
@@ -229,7 +263,7 @@ export function DealCard({
         {item.claimed && (
           <span className="inline-flex items-center gap-1 rounded-full border border-transparent bg-slate-200 px-2 py-0.5 text-[11px] font-medium leading-5 text-slate-600">
             <Check className="h-3 w-3" aria-hidden="true" />
-            已领取
+            已读
           </span>
         )}
       </div>
@@ -247,7 +281,7 @@ export function DealCard({
         <button
           type="button"
           aria-pressed={item.claimed}
-          aria-label={item.claimed ? '取消已领取标记' : '标记为已领取'}
+          aria-label={item.claimed ? '取消已读标记' : '标记为已读'}
           onClick={onToggleClaim}
           className={cn(
             'inline-flex h-11 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-xl border px-3.5 text-sm font-medium transition-colors duration-200 disabled:opacity-60 md:h-9 md:px-3 md:text-[13px]',
@@ -257,7 +291,7 @@ export function DealCard({
           )}
         >
           <Check className="h-4 w-4" aria-hidden="true" />
-          {item.claimed ? '已领取' : '我已领取'}
+          {item.claimed ? '已读' : '标为已读'}
         </button>
       </div>
     </article>

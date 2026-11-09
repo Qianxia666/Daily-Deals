@@ -14,7 +14,6 @@ import type {
 import { cn } from '@/lib/utils';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
-import { Switch } from './ui/switch';
 
 export type SearchMode = 'ai' | 'keyword';
 
@@ -38,8 +37,6 @@ interface FilterBarProps {
   onClearSources: () => void;
   category: CategoryFilter;
   onCategoryChange: (category: CategoryFilter) => void;
-  onlyNew: boolean;
-  onOnlyNewChange: (value: boolean) => void;
   hasFilters: boolean;
   onClearFilters: () => void;
 }
@@ -90,8 +87,6 @@ export function FilterBar({
   onClearSources,
   category,
   onCategoryChange,
-  onlyNew,
-  onOnlyNewChange,
   hasFilters,
   onClearFilters,
 }: FilterBarProps) {
@@ -281,13 +276,8 @@ export function FilterBar({
         })}
       </div>
 
-      <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2.5">
-        <Switch
-          checked={onlyNew}
-          onCheckedChange={onOnlyNewChange}
-          label="只看本轮新增"
-        />
-        {hasFilters && (
+      {hasFilters && (
+        <div className="mt-2.5 flex items-center justify-end border-t border-line pt-2.5">
           <button
             type="button"
             onClick={onClearFilters}
@@ -295,8 +285,8 @@ export function FilterBar({
           >
             清空筛选
           </button>
-        )}
-      </div>
+        </div>
+      )}
     </section>
   );
 }

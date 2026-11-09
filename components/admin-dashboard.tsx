@@ -89,8 +89,14 @@ export function AdminDashboard() {
   const [savingAnnouncement, setSavingAnnouncement] = useState(false);
   const [adding, setAdding] = useState(false);
   const [rebuildingIndex, setRebuildingIndex] = useState(false);
+  const [backfillingTags, setBackfillingTags] = useState(false);
+  const [tagActionBusy, setTagActionBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [saveState, setSaveState] = useState<{
+    type: 'ok' | 'error';
+    text: string;
+  } | null>(null);
 
   const applyPayload = useCallback((payload: AdminData) => {
     setData(payload);
@@ -137,6 +143,14 @@ export function AdminDashboard() {
     return [...groups.entries()];
   }, [data]);
 
+  const pendingTagCandidates = useMemo(
+    () =>
+      (data?.tagCandidates ?? []).filter(
+        (item) => item.status === 'pending',
+      ),
+    [data],
+  );
+
   const move = (index: number, delta: number) => {
     setSources((previous) => {
       const target = index + delta;
@@ -161,6 +175,7 @@ export function AdminDashboard() {
     setSaving(true);
     setError(null);
     setNotice(null);
+    setSaveState(null);
 
     try {
       const response = await fetch('/api/admin/settings', {
@@ -193,8 +208,19 @@ export function AdminDashboard() {
       applyPayload((await response.json()) as AdminData);
       setNotice('设置已保存，运行时配置已立即生效');
       window.setTimeout(() => setNotice(null), 3000);
+      setSaveState({
+        type: 'ok',
+        text: `已保存，配置立即生效（${new Date().toLocaleTimeString('zh-CN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+        })}）`,
+      });
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : '保存失败');
+      const message =
+        saveError instanceof Error ? saveError.message : '保存失败';
+      setError(message);
+      setSaveState({ type: 'error', text: message });
     } finally {
       setSaving(false);
     }
@@ -428,6 +454,156 @@ export function AdminDashboard() {
     }
   };
 
+  const runTagAction = async (
+    action: 'promote' | 'block' | 'merge',
+    tag: string,
+  ) => {
+    if (tagActionBusy) return;
+
+    let target: string | undefined;
+    if (action === 'merge') {
+      const input = window.prompt(`把「${tag}」合并到哪个标签？`, '');
+      target = input?.trim() || undefined;
+      if (!target) return;
+      if (target === tag) {
+        setError('不能合并到自身');
+        return;
+      }
+    }
+
+    setTagActionBusy(tag);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const response = await fetch('/api/admin/tag-candidates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, tag, target }),
+      });
+
+      if (response.status === 401) {
+        window.location.reload();
+        return;
+      }
+
+      const payload = (await response.json().catch(() => null)) as
+        | {
+            tagCandidates?: AdminData['tagCandidates'];
+            tags?: AdminData['tags'];
+            error?: string;
+          }
+        | null;
+
+      if (!response.ok) {
+        throw new Error(payload?.error ?? `HTTP ${response.status}`);
+      }
+
+      setData((previous) =>
+        previous
+          ? {
+              ...previous,
+              tagCandidates:
+                payload?.tagCandidates ?? previous.tagCandidates,
+              tags: payload?.tags ?? previous.tags,
+            }
+          : previous,
+      );
+      setNotice(
+        action === 'promote'
+          ? `已转正「${tag}」`
+          : action === 'block'
+            ? `已屏蔽「${tag}」`
+            : `已把「${tag}」合并到「${target}」`,
+      );
+      window.setTimeout(() => setNotice(null), 3000);
+    } catch (actionError) {
+      setError(
+        actionError instanceof Error ? actionError.message : '操作失败',
+      );
+    } finally {
+      setTagActionBusy(null);
+    }
+  };
+
+  const backfillTags = async (force = false) => {
+    if (backfillingTags) return;
+
+    if (
+      force &&
+      !window.confirm(
+        '将重新调用 AI 为全部在架优惠打标签（约 1000 条会消耗较多接口额度），是否继续？',
+      )
+    ) {
+      return;
+    }
+
+    setBackfillingTags(true);
+    setError(null);
+    setNotice(null);
+
+    const applyStatus = (tags: AdminData['tags']) => {
+      setData((previous) => (previous ? { ...previous, tags } : previous));
+    };
+
+    try {
+      const response = await fetch('/api/admin/tags', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force }),
+      });
+      if (response.status === 401) {
+        window.location.reload();
+        return;
+      }
+
+      const payload = (await response.json().catch(() => null)) as
+        | { tags?: AdminData['tags']; error?: string }
+        | null;
+
+      if (!response.ok) {
+        throw new Error(payload?.error ?? `HTTP ${response.status}`);
+      }
+
+      let tags = payload?.tags;
+      if (!tags) throw new Error('未返回标签状态');
+      applyStatus(tags);
+
+      while (tags.running) {
+        await new Promise((resolve) => window.setTimeout(resolve, 900));
+        const statusResponse = await fetch('/api/admin/tags', {
+          cache: 'no-store',
+        });
+        if (!statusResponse.ok) break;
+
+        const statusPayload = (await statusResponse.json().catch(() => null)) as
+          | { tags?: AdminData['tags'] }
+          | null;
+        if (!statusPayload?.tags) break;
+
+        tags = statusPayload.tags;
+        applyStatus(tags);
+      }
+
+      if (tags.lastError) {
+        setError(`标签补全失败：${tags.lastError}`);
+      } else {
+        setNotice(
+          `标签补全完成：本次新增 ${tags.taggedThisRun} 条${
+            tags.failedThisRun > 0 ? `，失败 ${tags.failedThisRun} 条` : ''
+          }`,
+        );
+        window.setTimeout(() => setNotice(null), 5000);
+      }
+    } catch (tagError) {
+      setError(
+        tagError instanceof Error ? tagError.message : '标签补全失败',
+      );
+    } finally {
+      setBackfillingTags(false);
+    }
+  };
+
   const logout = async () => {
     await fetch('/api/admin/logout', { method: 'POST' });
     window.location.href = '/';
@@ -474,7 +650,7 @@ export function AdminDashboard() {
             </Button>
             <a
               href="/"
-              className="inline-flex h-9 cursor-pointer items-center rounded-lg border border-line bg-white px-3 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50"
+              className="inline-flex h-9 cursor-pointer items-center rounded-lg border border-line bg-white px-3 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
             >
               返回首页
             </a>
@@ -907,8 +1083,191 @@ export function AdminDashboard() {
         </section>
 
         <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-ink">品类标签</h2>
+              <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                新建优惠会在生成 AI 摘要时自动打上品类标签，让「奶茶」这类品类词也能命中蜜雪冰城、茶百道等品牌条目。这里用于补全历史数据。
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void backfillTags()}
+                disabled={
+                  backfillingTags ||
+                  data?.tags.running ||
+                  !data?.tags.enabled ||
+                  (data?.tags.pending ?? 0) === 0
+                }
+              >
+                <RefreshCw
+                  className={cn(
+                    'h-4 w-4',
+                    (backfillingTags || data?.tags.running) && 'animate-spin',
+                  )}
+                  aria-hidden="true"
+                />
+                {backfillingTags || data?.tags.running
+                  ? '补全中'
+                  : '补全标签'}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void backfillTags(true)}
+                disabled={
+                  backfillingTags || data?.tags.running || !data?.tags.enabled
+                }
+                title="修改词表或提议标签配置后，用此按钮让存量条目按新配置重新打标"
+              >
+                重新打标
+              </Button>
+            </div>
+          </div>
+
+          <div className="mt-3 grid gap-2 text-[11px] text-slate-600 sm:grid-cols-3">
+            <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
+              状态：
+              <span
+                className={cn(
+                  'font-medium',
+                  data?.tags.enabled ? 'text-emerald-700' : 'text-slate-500',
+                )}
+              >
+                {data?.tags.enabled ? '已开启' : '已关闭'}
+              </span>
+            </div>
+            <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
+              已标注：
+              <span className="font-medium tabular-nums text-ink">
+                {data?.tags.tagged ?? 0}
+              </span>{' '}
+              / {data?.tags.total ?? 0} 条
+            </div>
+            <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
+              待补全：
+              <span className="font-medium tabular-nums text-ink">
+                {data?.tags.pending ?? 0}
+              </span>{' '}
+              条
+            </div>
+          </div>
+
+          {data?.tags.running ? (
+            <div className="mt-3">
+              <div className="flex items-center justify-between text-[11px] text-slate-500">
+                <span>
+                  处理中：{data.tags.processed} / {data.tags.batchTotal}
+                </span>
+                <span>
+                  新增 {data.tags.taggedThisRun}，失败{' '}
+                  {data.tags.failedThisRun}
+                </span>
+              </div>
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                <div
+                  className="h-full rounded-full bg-accent transition-all"
+                  style={{
+                    width: `${
+                      data.tags.batchTotal > 0
+                        ? Math.min(
+                            100,
+                            Math.round(
+                              (data.tags.processed / data.tags.batchTotal) *
+                                100,
+                            ),
+                          )
+                        : 0
+                    }%`,
+                  }}
+                />
+              </div>
+            </div>
+          ) : null}
+
+          {data?.tags.lastError ? (
+            <p className="mt-3 text-[11px] text-red-600">
+              {data.tags.lastError}
+            </p>
+          ) : null}
+        </section>
+
+        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
           <div>
-            <h2 className="text-sm font-semibold text-ink">刷新与运行时配置</h2>
+            <h2 className="text-sm font-semibold text-ink">标签候选</h2>
+            <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+              AI 在词表外提出的新品类词会先进入候选池，立即参与搜索但不会出现在前台标签建议里。被{' '}
+              {data?.tags.promoteThreshold ?? 3} 条以上优惠使用后可一键转正；转正后并入受控词表，也可合并到已有标签或直接屏蔽。
+            </p>
+          </div>
+
+          {pendingTagCandidates.length === 0 ? (
+            <p className="mt-3 rounded-xl border border-dashed border-line bg-slate-50 px-3 py-4 text-center text-[11px] text-slate-500">
+              暂无待审核候选
+            </p>
+          ) : (
+            <div className="mt-3 space-y-2">
+              {pendingTagCandidates.map((item) => {
+                const ready =
+                  item.count >= (data?.tags.promoteThreshold ?? 3);
+                const busy = tagActionBusy === item.tag;
+
+                return (
+                  <div
+                    key={item.tag}
+                    className="flex flex-wrap items-center gap-2 rounded-xl border border-line bg-slate-50 px-3 py-2"
+                  >
+                    <span className="text-sm font-medium text-ink">
+                      {item.tag}
+                    </span>
+                    <span className="text-[11px] tabular-nums text-slate-500">
+                      {item.count} 条
+                    </span>
+                    {ready && (
+                      <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                        可转正
+                      </span>
+                    )}
+                    <div className="ml-auto flex items-center gap-1.5">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={tagActionBusy !== null}
+                        onClick={() => void runTagAction('promote', item.tag)}
+                      >
+                        转正
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={tagActionBusy !== null}
+                        onClick={() => void runTagAction('merge', item.tag)}
+                      >
+                        合并
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={tagActionBusy !== null}
+                        onClick={() => void runTagAction('block', item.tag)}
+                      >
+                        {busy ? '处理中…' : '屏蔽'}
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
+          <div>
+            <h2 className="text-sm font-semibold text-ink">
+              刷新与运行时配置
+            </h2>
             <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
               全局刷新间隔、AI 接口、代理与管理员密码都在这里设置。保存后立即生效；标注「需重建容器」的容器级参数除外。
             </p>
@@ -924,10 +1283,18 @@ export function AdminDashboard() {
                   {group}
                 </h3>
                 <div className="mt-2 grid gap-3 sm:grid-cols-2">
-                  {fields.map((field) => (
+                  {fields.map((field) => {
+                    const inactive =
+                      field.key === 'AI_SEARCH_DAYS' &&
+                      (runtimeValues.AI_SEARCH_SCOPE ?? 'active') !== 'days';
+
+                    return (
                     <label
                       key={field.key}
-                      className="min-w-0 text-[11px] text-slate-500"
+                      className={cn(
+                        'min-w-0 text-[11px] text-slate-500',
+                        field.type === 'textarea' && 'sm:col-span-2',
+                      )}
                     >
                       <span className="flex flex-wrap items-center gap-1.5">
                         {field.label}
@@ -936,6 +1303,25 @@ export function AdminDashboard() {
                             需重建容器
                           </span>
                         )}
+                        {field.key.startsWith('AI_TAGS_') && (
+                          <span className="rounded-full border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[9px] text-sky-700">
+                            需重新打标
+                          </span>
+                        )}
+                        <span
+                          className={cn(
+                            'rounded-full border px-1.5 py-0.5 text-[9px]',
+                            field.source === 'admin'
+                              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                              : 'border-line bg-slate-50 text-slate-500',
+                          )}
+                        >
+                          {field.source === 'admin'
+                            ? '后台生效'
+                            : field.source === 'env'
+                              ? '.env 生效'
+                              : '默认值'}
+                        </span>
                         {field.secret && field.configured && (
                           <span className="rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[9px] text-emerald-700">
                             已设置
@@ -960,6 +1346,19 @@ export function AdminDashboard() {
                             </option>
                           ))}
                         </select>
+                      ) : field.type === 'textarea' ? (
+                        <textarea
+                          rows={6}
+                          value={runtimeValues[field.key] ?? ''}
+                          placeholder={field.description}
+                          onChange={(event) =>
+                            setRuntimeValues((previous) => ({
+                              ...previous,
+                              [field.key]: event.target.value,
+                            }))
+                          }
+                          className="mt-1 w-full rounded-xl border border-line bg-white px-3 py-2 text-sm leading-relaxed text-ink transition-colors hover:border-slate-300 focus:border-slate-400"
+                        />
                       ) : (
                         <Input
                           type={
@@ -984,20 +1383,42 @@ export function AdminDashboard() {
                             }))
                           }
                           className="mt-1"
+                          disabled={inactive}
                         />
                       )}
 
                       <span className="mt-1 block text-[10px] leading-relaxed text-slate-400">
-                        {field.description}
+                        {inactive
+                          ? '当前「AI 搜索范围」为所有在架优惠，此项不生效；切换为按天数后才使用。'
+                          : field.description}
+                        {field.key.startsWith('AI_TAGS_') && (
+                          <span className="mt-0.5 block text-amber-600">
+                            只对之后新打标的优惠生效；要让存量数据按新配置更新，请在「品类标签」里点「重新打标」。
+                          </span>
+                        )}
                       </span>
                     </label>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             ))}
           </div>
 
-          <div className="mt-4 flex justify-end">
+          <div className="mt-4 flex flex-wrap items-center justify-end gap-3">
+            {saveState && (
+              <span
+                className={cn(
+                  'text-[11px]',
+                  saveState.type === 'ok'
+                    ? 'text-emerald-600'
+                    : 'text-red-600',
+                )}
+                role={saveState.type === 'ok' ? 'status' : 'alert'}
+              >
+                {saveState.text}
+              </span>
+            )}
             <Button onClick={save} disabled={saving}>
               {saving ? (
                 <LoaderCircle

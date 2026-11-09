@@ -13,8 +13,12 @@ import type {
   SearchIndexStatus,
   SourceKind,
   SourceStatus,
+  TagCandidate,
+  TagStatus,
+  TagSuggestion,
 } from './types';
 import {
+  buildScopeWhere,
   deleteDealIndexesForExpired,
   deleteDealIndexesForRetention,
   deleteDealIndexesForSource,
@@ -24,11 +28,12 @@ import {
   readSearchIndexStatus,
   rebuildSearchIndex,
   searchDealsByFts,
-  searchDealsByLike,
+  searchDealsByTag,
   startSearchIndexRebuild,
   type SearchCandidate,
   type SearchScopeOptions,
 } from './search-index';
+import { getTagRunProgress } from './tag-progress';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS deals (
@@ -49,7 +54,11 @@ CREATE TABLE IF NOT EXISTS deals (
   ai_action TEXT,
   ai_model TEXT,
   ai_at TEXT,
-  ai_attempts INTEGER NOT NULL DEFAULT 0
+  ai_attempts INTEGER NOT NULL DEFAULT 0,
+  tags TEXT NOT NULL DEFAULT '[]',
+  proposed_tags TEXT NOT NULL DEFAULT '[]',
+  entities TEXT NOT NULL DEFAULT '[]',
+  ai_tags_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_deals_source ON deals(source);
 CREATE INDEX IF NOT EXISTS idx_deals_expires ON deals(expires_at);
@@ -96,6 +105,14 @@ CREATE TABLE IF NOT EXISTS sources (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tag_candidates (
+  tag TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'pending',
+  merged_into TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 interface DealRow {
@@ -116,6 +133,10 @@ interface DealRow {
   ai_action: string | null;
   ai_model: string | null;
   ai_at: string | null;
+  ai_tags_at: string | null;
+  tags: string | null;
+  proposed_tags: string | null;
+  entities: string | null;
   claimed: number;
   favorite: number;
 }
@@ -130,6 +151,10 @@ interface ExistingDealRow {
   ai_action: string | null;
   ai_model: string | null;
   ai_at: string | null;
+  ai_tags_at: string | null;
+  tags: string | null;
+  proposed_tags: string | null;
+  entities: string | null;
 }
 
 export interface AiPendingDeal {
@@ -145,6 +170,18 @@ export interface AiEnrichment {
   summary: string;
   value: string;
   action: string;
+  tags: string[];
+  proposedTags: string[];
+  entities: string[];
+}
+
+export interface AiTagPendingDeal {
+  id: number;
+  title: string;
+  description: string;
+  summary: string;
+  source: string;
+  category: Category;
 }
 
 interface StatusRow {
@@ -271,6 +308,10 @@ function migrate(db: Database.Database): void {
     ['ai_model', 'TEXT'],
     ['ai_at', 'TEXT'],
     ['ai_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+    ['tags', "TEXT NOT NULL DEFAULT '[]'"],
+    ['proposed_tags', "TEXT NOT NULL DEFAULT '[]'"],
+    ['entities', "TEXT NOT NULL DEFAULT '[]'"],
+    ['ai_tags_at', 'TEXT'],
   ];
 
   for (const [name, type] of additions) {
@@ -444,7 +485,8 @@ export function upsertDeals(deals: RawDeal[]): number {
   const searchMaxChars = readSearchIndexMaxChars(db);
 
   const findExisting = db.prepare(
-    `SELECT id, title, description, ai_title, ai_summary, ai_value, ai_action, ai_model, ai_at
+    `SELECT id, title, description, ai_title, ai_summary, ai_value, ai_action,
+            ai_model, ai_at, ai_tags_at, tags, proposed_tags, entities
      FROM deals WHERE link = ?`,
   );
   const updateExisting = db.prepare(`
@@ -460,7 +502,11 @@ export function upsertDeals(deals: RawDeal[]): number {
         ai_value = ?,
         ai_action = ?,
         ai_model = ?,
-        ai_at = ?
+        ai_at = ?,
+        tags = ?,
+        proposed_tags = ?,
+        entities = ?,
+        ai_tags_at = ?
     WHERE link = ?
   `);
   const insertDeal = db.prepare(`
@@ -498,6 +544,10 @@ export function upsertDeals(deals: RawDeal[]): number {
           contentChanged ? null : existing.ai_action,
           contentChanged ? null : existing.ai_model,
           contentChanged ? null : existing.ai_at,
+          contentChanged ? '[]' : existing.tags ?? '[]',
+          contentChanged ? '[]' : existing.proposed_tags ?? '[]',
+          contentChanged ? '[]' : existing.entities ?? '[]',
+          contentChanged ? null : existing.ai_tags_at,
           item.link,
         );
         indexDealById(db, existing.id, searchMaxChars);
@@ -547,13 +597,6 @@ export function searchDealsForQuery(
   options: SearchScopeOptions,
 ): SearchCandidate[] | null {
   return searchDealsByFts(getDb(), match, options);
-}
-
-export function searchDealsForQueryLike(
-  query: string,
-  options: SearchScopeOptions,
-): SearchCandidate[] {
-  return searchDealsByLike(getDb(), query, options);
 }
 
 export function getSearchIndexStatus(): SearchIndexStatus {
@@ -690,6 +733,30 @@ export function listSourceStatus(): SourceStatusRecord[] {
   }));
 }
 
+/** 兼容 JSON 数组与逗号分隔两种历史写法。 */
+export function parseStoredTags(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item).trim())
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+  if (typeof value !== 'string' || value.trim() === '') return [];
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed)) return parseStoredTags(parsed);
+  } catch {
+    // 旧数据可能是逗号分隔，继续按分隔符解析。
+  }
+
+  return value
+    .split(/[,，、\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
 function mapDealRow(
   row: DealRow,
   nameMap: Map<string, string>,
@@ -712,6 +779,7 @@ function mapDealRow(
     aiSummary: row.ai_summary,
     aiValue: row.ai_value,
     aiAction: row.ai_action,
+    tags: parseStoredTags(row.tags),
   };
 }
 
@@ -1183,6 +1251,35 @@ export function getAdminData(): AdminBaseData {
     announcement: getAnnouncement(),
     sources,
     searchIndex: readSearchIndexStatus(db),
+    tags: getTagStatus(),
+    tagCandidates: getTagCandidates(100),
+  };
+}
+
+/** 标签开关、覆盖率与补全进度。 */
+export function getTagStatus(): TagStatus {
+  const coverage = getTagCoverage();
+  const progress = getTagRunProgress();
+  const raw = getRuntimeEnvRaw('AI_TAGS_ENABLED');
+
+  return {
+    enabled: raw === null || raw.trim() === '' || raw.trim() !== 'false',
+    ...coverage,
+    running: progress.running,
+    processed: progress.processed,
+    batchTotal: progress.batchTotal,
+    taggedThisRun: progress.tagged,
+    failedThisRun: progress.failed,
+    startedAt: progress.startedAt,
+    finishedAt: progress.finishedAt,
+    lastError: progress.error,
+    promoteThreshold: readRuntimeNumber(
+      getDb(),
+      'AI_TAGS_PROMOTE_THRESHOLD',
+      3,
+      2,
+      20,
+    ),
   };
 }
 
@@ -1225,9 +1322,11 @@ export function saveAiEnrichment(
   model: string,
 ): void {
   const db = getDb();
+  const now = new Date().toISOString();
   db.prepare(
     `UPDATE deals
      SET ai_title = ?, ai_summary = ?, ai_value = ?, ai_action = ?,
+         tags = ?, proposed_tags = ?, entities = ?, ai_tags_at = ?,
          ai_model = ?, ai_at = ?, ai_attempts = 0
      WHERE id = ?`,
   ).run(
@@ -1235,11 +1334,447 @@ export function saveAiEnrichment(
     enrichment.summary,
     enrichment.value,
     enrichment.action,
+    JSON.stringify(enrichment.tags),
+    JSON.stringify(enrichment.proposedTags),
+    JSON.stringify(enrichment.entities),
+    now,
     model,
+    now,
+    id,
+  );
+  recordCandidates(db, enrichment.proposedTags);
+  indexDealById(db, id, readSearchIndexMaxChars(db));
+}
+
+/** 只更新标签与实体，用于存量数据补全。 */
+export function saveDealTags(
+  id: number,
+  tags: string[],
+  proposedTags: string[],
+  entities: string[],
+): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE deals
+     SET tags = ?, proposed_tags = ?, entities = ?, ai_tags_at = ?
+     WHERE id = ?`,
+  ).run(
+    JSON.stringify(tags.slice(0, 2)),
+    JSON.stringify(proposedTags.slice(0, 3)),
+    JSON.stringify(entities.slice(0, 6)),
     new Date().toISOString(),
     id,
   );
+  recordCandidates(db, proposedTags);
   indexDealById(db, id, readSearchIndexMaxChars(db));
+}
+
+/** 已有摘要但尚未打过标签的在架条目。 */
+export function listDealsMissingTags(
+  limit: number,
+  force = false,
+): AiTagPendingDeal[] {
+  const now = new Date().toISOString();
+  return getDb()
+    .prepare(
+      `SELECT id, title, description, COALESCE(ai_summary, '') AS summary,
+              source, category
+       FROM deals
+       WHERE ai_summary IS NOT NULL
+         AND ai_summary <> ''
+         AND ${force ? '1 = 1' : 'ai_tags_at IS NULL'}
+         AND (expires_at IS NULL OR expires_at > ?)
+       ORDER BY is_new DESC, COALESCE(published_at, first_seen_at) DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(now, limit) as AiTagPendingDeal[];
+}
+
+/** 统计标签覆盖率，后台展示用。 */
+export function getTagCoverage(): {
+  total: number;
+  tagged: number;
+  pending: number;
+} {
+  const row = getDb()
+    .prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN tags IS NOT NULL AND tags NOT IN ('', '[]') THEN 1 ELSE 0 END) AS tagged,
+         SUM(CASE WHEN ai_summary IS NOT NULL AND ai_summary <> ''
+                   AND ai_tags_at IS NULL THEN 1 ELSE 0 END) AS pending
+       FROM deals`,
+    )
+    .get() as { total: number; tagged: number | null; pending: number | null };
+
+  return {
+    total: row.total,
+    tagged: row.tagged ?? 0,
+    pending: row.pending ?? 0,
+  };
+}
+
+/** 读取运行时数字配置，允许 0 以外的最小值兜底。 */
+function readRuntimeNumber(
+  db: Database.Database,
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const row = db
+    .prepare('SELECT value FROM settings WHERE key = ?')
+    .get(`env:${key}`) as { value: string } | undefined;
+  const raw = row?.value ?? process.env[key] ?? '';
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.min(Math.max(Math.round(value), min), max);
+}
+
+/** 已被管理员转正的提议标签，会并入受控词表。 */
+export function getPromotedTags(): string[] {
+  return readPromotedTags(getDb());
+}
+
+function readPromotedTags(db: Database.Database): string[] {
+  const row = db
+    .prepare("SELECT value FROM settings WHERE key = 'ai:promoted_tags'")
+    .get() as { value: string } | undefined;
+  if (!row) return [];
+  try {
+    const parsed = JSON.parse(row.value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => String(item).trim())
+      .filter((item) => item.length >= 2 && item.length <= 12)
+      .slice(0, 200);
+  } catch {
+    return [];
+  }
+}
+
+/** 记录 AI 提出的候选标签，超出候选池上限时优先保留被多次使用的。 */
+function recordCandidates(db: Database.Database, tags: string[]): void {
+  const entries = [...new Set(tags.map((tag) => tag.trim()).filter(Boolean))];
+  if (entries.length === 0) return;
+
+  const now = new Date().toISOString();
+  const insert = db.prepare(
+    `INSERT INTO tag_candidates (tag, status, merged_into, created_at, updated_at)
+     VALUES (?, 'pending', NULL, ?, ?)
+     ON CONFLICT(tag) DO NOTHING`,
+  );
+  for (const tag of entries) insert.run(tag, now, now);
+
+  const limit = readRuntimeNumber(db, 'AI_TAGS_CANDIDATE_LIMIT', 500, 50, 5000);
+  const pending = (
+    db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM tag_candidates WHERE status = 'pending'",
+      )
+      .get() as { count: number }
+  ).count;
+  if (pending <= limit) return;
+
+  // 先删掉只出现过一次的候选，再从最旧的开始截断到上限。
+  db.prepare(
+    `DELETE FROM tag_candidates
+     WHERE status = 'pending'
+       AND tag IN (
+         SELECT c.tag
+         FROM tag_candidates c
+         LEFT JOIN (
+           SELECT j.value AS tag, COUNT(*) AS count
+           FROM deals d, json_each(d.proposed_tags) j
+           GROUP BY j.value
+         ) t ON t.tag = c.tag
+         WHERE c.status = 'pending' AND COALESCE(t.count, 0) < 2
+       )`,
+  ).run();
+
+  db.prepare(
+    `DELETE FROM tag_candidates
+     WHERE status = 'pending'
+       AND tag IN (
+         SELECT tag FROM tag_candidates
+         WHERE status = 'pending'
+         ORDER BY updated_at DESC
+         LIMIT -1 OFFSET ?
+       )`,
+  ).run(limit);
+}
+
+/** 候选池列表，按状态与使用次数排序。 */
+export function getTagCandidates(limit = 100): TagCandidate[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT c.tag, c.status, c.merged_into, COALESCE(t.count, 0) AS count
+       FROM tag_candidates c
+       LEFT JOIN (
+         SELECT j.value AS tag, COUNT(*) AS count
+         FROM deals d, json_each(d.proposed_tags) j
+         GROUP BY j.value
+       ) t ON t.tag = c.tag
+       ORDER BY CASE c.status WHEN 'pending' THEN 0 ELSE 1 END ASC,
+                COALESCE(t.count, 0) DESC,
+                c.updated_at DESC
+       LIMIT ?`,
+    )
+    .all(limit) as {
+    tag: string;
+    status: string;
+    merged_into: string | null;
+    count: number;
+  }[];
+
+  return rows.map((row) => ({
+    tag: row.tag,
+    count: row.count,
+    status: row.status as TagCandidate['status'],
+    mergedInto: row.merged_into,
+  }));
+}
+
+/** 一键转正：加入正式词表，并把存量条目里的提议标签提升为核心标签。 */
+export function promoteTag(tag: string): void {
+  const db = getDb();
+  const promoted = readPromotedTags(db);
+  if (!promoted.includes(tag)) {
+    setSetting(
+      'ai:promoted_tags',
+      JSON.stringify([...promoted, tag].slice(0, 200)),
+    );
+  }
+
+  const now = new Date().toISOString();
+  const rows = db
+    .prepare(
+      `SELECT id, tags, proposed_tags FROM deals
+       WHERE EXISTS (SELECT 1 FROM json_each(proposed_tags) WHERE value = ?)
+       LIMIT 20000`,
+    )
+    .all(tag) as {
+    id: number;
+    tags: string | null;
+    proposed_tags: string | null;
+  }[];
+
+  const update = db.prepare(
+    'UPDATE deals SET tags = ?, proposed_tags = ? WHERE id = ?',
+  );
+  const searchMaxChars = readSearchIndexMaxChars(db);
+
+  const apply = db.transaction(() => {
+    for (const row of rows) {
+      const tags = parseStoredTags(row.tags).filter((item) => item !== tag);
+      const proposed = parseStoredTags(row.proposed_tags).filter(
+        (item) => item !== tag,
+      );
+
+      // 核心标签正常上限为 2 个；转正回填允许到 3 个，避免已满时丢词。
+      if (!tags.includes(tag) && tags.length < 3) {
+        tags.push(tag);
+        update.run(JSON.stringify(tags), JSON.stringify(proposed), row.id);
+        indexDealById(db, row.id, searchMaxChars);
+        continue;
+      }
+
+      if (!tags.includes(tag)) continue;
+      update.run(JSON.stringify(tags), JSON.stringify(proposed), row.id);
+      indexDealById(db, row.id, searchMaxChars);
+    }
+
+    db.prepare(
+      `UPDATE tag_candidates SET status = 'promoted', updated_at = ? WHERE tag = ?`,
+    ).run(now, tag);
+  });
+
+  apply();
+}
+
+/** 屏蔽候选：不再进入标签建议，也不会自动转正。 */
+export function blockTag(tag: string): void {
+  getDb()
+    .prepare(
+      `UPDATE tag_candidates SET status = 'blocked', updated_at = ? WHERE tag = ?`,
+    )
+    .run(new Date().toISOString(), tag);
+}
+
+/** 把候选合并到另一个标签，并同步改写已入库条目。 */
+export function mergeTag(from: string, to: string): void {
+  const target = to.trim();
+  if (!target || target === from) return;
+
+  const db = getDb();
+  const now = new Date().toISOString();
+  const targetIsCandidate = Boolean(
+    db.prepare('SELECT 1 FROM tag_candidates WHERE tag = ?').get(target),
+  );
+  const rows = db
+    .prepare(
+      `SELECT id, tags, proposed_tags FROM deals
+       WHERE EXISTS (SELECT 1 FROM json_each(proposed_tags) WHERE value = ?)
+       LIMIT 20000`,
+    )
+    .all(from) as {
+    id: number;
+    tags: string | null;
+    proposed_tags: string | null;
+  }[];
+
+  const update = db.prepare(
+    'UPDATE deals SET tags = ?, proposed_tags = ? WHERE id = ?',
+  );
+  const searchMaxChars = readSearchIndexMaxChars(db);
+
+  const apply = db.transaction(() => {
+    for (const row of rows) {
+      const tags = parseStoredTags(row.tags).filter((tag) => tag !== from);
+      const proposed = parseStoredTags(row.proposed_tags).filter(
+        (tag) => tag !== from,
+      );
+
+      if (targetIsCandidate) {
+        if (!proposed.includes(target) && proposed.length < 8) {
+          proposed.push(target);
+        }
+      } else if (!tags.includes(target) && tags.length < 2) {
+        tags.push(target);
+      }
+
+      update.run(JSON.stringify(tags), JSON.stringify(proposed), row.id);
+      indexDealById(db, row.id, searchMaxChars);
+    }
+
+    db.prepare(
+      `UPDATE tag_candidates
+       SET status = 'merged', merged_into = ?, updated_at = ?
+       WHERE tag = ?`,
+    ).run(target, now, from);
+
+    if (targetIsCandidate) {
+      db.prepare(
+        `INSERT OR IGNORE INTO tag_candidates
+           (tag, status, merged_into, created_at, updated_at)
+         VALUES (?, 'pending', NULL, ?, ?)`,
+      ).run(target, now, now);
+    }
+  });
+
+  apply();
+}
+
+/** 精确按标签召回，标签建议点击后使用，不再调用 AI。 */
+export function searchDealsForTag(
+  tag: string,
+  options: SearchScopeOptions,
+): SearchCandidate[] {
+  return searchDealsByTag(getDb(), tag, options);
+}
+
+/** 正式标签在搜索范围内的使用条数，供 AI 语义建议挑选候选。 */
+export function listFormalTagCounts(
+  options: SearchScopeOptions,
+): TagSuggestion[] {
+  const scope = buildScopeWhere(options);
+  return getDb()
+    .prepare(
+      `SELECT j.value AS tag, COUNT(*) AS count
+       FROM deals d
+       JOIN json_each(d.tags) j
+       WHERE 1 = 1 ${scope.sql}
+       GROUP BY j.value
+       HAVING count > 0
+       ORDER BY count DESC, j.value ASC
+       LIMIT 200`,
+    )
+    .all(...scope.params) as TagSuggestion[];
+}
+
+/**
+ * 零结果时推荐可点击的标签：
+ * 正式标签只要求被至少一条优惠使用，提议标签需达到转正阈值。
+ */
+export function getTagSuggestions(
+  keywords: string[],
+  options: SearchScopeOptions,
+  limit: number,
+): TagSuggestion[] {
+  const needles = [
+    ...new Set(
+      keywords
+        .map((keyword) => keyword.trim().toLowerCase())
+        .filter((keyword) => keyword.length >= 2),
+    ),
+  ];
+  if (needles.length === 0 || limit <= 0) return [];
+
+  const db = getDb();
+  const scope = buildScopeWhere(options);
+
+  const countTags = (column: 'tags' | 'proposed_tags') =>
+    db
+      .prepare(
+        `SELECT j.value AS tag, COUNT(*) AS count
+         FROM deals d
+         JOIN json_each(d.${column}) j
+         WHERE 1 = 1 ${scope.sql}
+         GROUP BY j.value`,
+      )
+      .all(...scope.params) as { tag: string; count: number }[];
+
+  const formal = countTags('tags');
+  const proposed = countTags('proposed_tags');
+  const threshold = readRuntimeNumber(
+    db,
+    'AI_TAGS_PROMOTE_THRESHOLD',
+    3,
+    2,
+    20,
+  );
+
+  const merged = new Map<string, number>();
+  for (const row of formal) {
+    if (row.count > 0) merged.set(row.tag, row.count);
+  }
+  for (const row of proposed) {
+    if (row.count < threshold) continue;
+    merged.set(row.tag, (merged.get(row.tag) ?? 0) + row.count);
+  }
+
+  const hidden = new Set(
+    (
+      db
+        .prepare(
+          "SELECT tag FROM tag_candidates WHERE status IN ('blocked', 'merged')",
+        )
+        .all() as { tag: string }[]
+    ).map((row) => row.tag),
+  );
+
+  const scored: { tag: string; count: number; score: number }[] = [];
+  for (const [tag, count] of merged) {
+    if (hidden.has(tag)) continue;
+    const lower = tag.toLowerCase();
+    let score = 0;
+    for (const needle of needles) {
+      if (lower === needle) {
+        score = Math.max(score, 3);
+      } else if (needle.includes(lower) || lower.includes(needle)) {
+        score = Math.max(score, 2);
+      }
+    }
+    if (score > 0) scored.push({ tag, count, score });
+  }
+
+  return scored
+    .sort(
+      (left, right) =>
+        right.score - left.score || right.count - left.count,
+    )
+    .slice(0, limit)
+    .map((row) => ({ tag: row.tag, count: row.count }));
 }
 
 /** 使用 SQLite 在线备份生成快照，并只保留最近若干份。 */

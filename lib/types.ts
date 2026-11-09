@@ -31,6 +31,7 @@ export interface DealItem {
   aiSummary: string | null;
   aiValue: string | null;
   aiAction: string | null;
+  tags: string[];
 }
 
 export interface SourceStatus {
@@ -94,7 +95,12 @@ export interface AdminSource extends SourceStatus {
   builtin: boolean;
 }
 
-export type RuntimeSettingType = 'text' | 'number' | 'password' | 'select';
+export type RuntimeSettingType =
+  | 'text'
+  | 'textarea'
+  | 'number'
+  | 'password'
+  | 'select';
 
 export interface RuntimeSettingView {
   key: string;
@@ -109,6 +115,8 @@ export interface RuntimeSettingView {
   restartRequired?: boolean;
   min?: number;
   max?: number;
+  /** 当前生效值的来源：后台保存 > .env > 代码默认值。 */
+  source?: 'admin' | 'env' | 'default';
 }
 
 export interface SearchIndexStatus {
@@ -123,11 +131,41 @@ export interface SearchIndexStatus {
   lastError: string | null;
 }
 
+export interface TagStatus {
+  enabled: boolean;
+  total: number;
+  tagged: number;
+  pending: number;
+  running: boolean;
+  processed: number;
+  batchTotal: number;
+  taggedThisRun: number;
+  failedThisRun: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  lastError: string | null;
+  promoteThreshold: number;
+}
+
+export interface TagCandidate {
+  tag: string;
+  count: number;
+  status: 'pending' | 'promoted' | 'blocked' | 'merged';
+  mergedInto: string | null;
+}
+
+export interface TagSuggestion {
+  tag: string;
+  count: number;
+}
+
 export interface AdminData {
   fetchedAt: string | null;
   announcement: Announcement;
   sources: AdminSource[];
   searchIndex: SearchIndexStatus;
+  tags: TagStatus;
+  tagCandidates: TagCandidate[];
   globalIntervalMinutes: number;
   runtimeSettings: RuntimeSettingView[];
 }

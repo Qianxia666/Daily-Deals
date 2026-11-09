@@ -19,7 +19,7 @@ export function LoadingScreen({
       role="status"
       aria-live="polite"
       className={cn(
-        'fixed inset-0 z-50 flex flex-col items-center justify-center overflow-hidden bg-[#fffdf8] transition-opacity duration-300',
+        'fixed inset-0 z-50 flex flex-col items-center justify-center overflow-hidden bg-paper transition-opacity duration-300',
         leaving && 'pointer-events-none opacity-0',
       )}
     >

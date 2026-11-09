@@ -1,10 +1,10 @@
 import type Database from 'better-sqlite3';
-import { buildSearchIndexText, buildLikePattern } from './search-text';
-import type { SearchIndexStatus } from './types';
+import { buildSearchIndexText } from './search-text';
+import type { SearchIndexStatus, TagSuggestion } from './types';
 
 type Db = Database.Database;
 
-export const SEARCH_INDEX_VERSION = '3';
+export const SEARCH_INDEX_VERSION = '5';
 
 export interface SearchRebuildProgress {
   running: boolean;
@@ -76,6 +76,29 @@ interface DealIndexRow {
   ai_action: string | null;
   description: string | null;
   source_name: string | null;
+  tags: string | null;
+  proposed_tags: string | null;
+  entities: string | null;
+}
+
+function readTags(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed
+        .map((item) => String(item).trim())
+        .filter(Boolean)
+        .slice(0, 8);
+    }
+  } catch {
+    // 兼容逗号分隔的旧数据。
+  }
+  return value
+    .split(/[,，、\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, 8);
 }
 
 function readSetting(db: Db, key: string): string | null {
@@ -109,14 +132,33 @@ function insertRow(
     [row.ai_summary, row.ai_value, row.ai_action].filter(Boolean).join(' '),
     maxChars,
   );
+  const tags = buildSearchIndexText(readTags(row.tags).join(' '), maxChars);
+  const proposed = buildSearchIndexText(
+    readTags(row.proposed_tags).join(' '),
+    maxChars,
+  );
+  const entities = buildSearchIndexText(
+    readTags(row.entities).join(' '),
+    maxChars,
+  );
   const description = buildSearchIndexText(
     [row.description, row.source_name].filter(Boolean).join(' '),
     maxChars,
   );
 
   db.prepare(
-    'INSERT INTO deals_fts (rowid, title, summary, description) VALUES (?, ?, ?, ?)',
-  ).run(row.id, title, summary, description);
+    `INSERT INTO deals_fts
+       (rowid, title, summary, tags, proposed_tags, entities, description)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    row.id,
+    title,
+    summary,
+    tags,
+    proposed,
+    entities,
+    description,
+  );
 }
 
 export function indexDealById(
@@ -129,7 +171,8 @@ export function indexDealById(
     const row = db
       .prepare(
         `SELECT d.id, d.title, d.ai_title, d.ai_summary, d.ai_value,
-                d.ai_action, d.description,
+                d.ai_action, d.description, d.tags, d.proposed_tags,
+                d.entities,
                 COALESCE(s.name, d.source) AS source_name
          FROM deals d
          LEFT JOIN sources s ON s.id = d.source
@@ -203,7 +246,8 @@ export function rebuildSearchIndex(db: Db, maxChars: number): number {
 
   const select = db.prepare(
     `SELECT d.id, d.title, d.ai_title, d.ai_summary, d.ai_value,
-            d.ai_action, d.description,
+            d.ai_action, d.description, d.tags, d.proposed_tags,
+            d.entities,
             COALESCE(s.name, d.source) AS source_name
      FROM deals d
      LEFT JOIN sources s ON s.id = d.source
@@ -271,7 +315,8 @@ export function startSearchIndexRebuild(
 
       const select = db.prepare(
         `SELECT d.id, d.title, d.ai_title, d.ai_summary, d.ai_value,
-                d.ai_action, d.description,
+                d.ai_action, d.description, d.tags, d.proposed_tags,
+                d.entities,
                 COALESCE(s.name, d.source) AS source_name
          FROM deals d
          LEFT JOIN sources s ON s.id = d.source
@@ -325,19 +370,26 @@ export function optimizeSearchIndex(db: Db): void {
   }
 }
 
+function createFtsTable(db: Db): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS deals_fts USING fts5(
+      title,
+      summary,
+      tags,
+      proposed_tags,
+      entities,
+      description,
+      tokenize = 'unicode61'
+    )
+  `);
+}
+
 export function ensureSearchIndex(
   db: Db,
   maxChars: number,
 ): boolean {
   try {
-    db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS deals_fts USING fts5(
-        title,
-        summary,
-        description,
-        tokenize = 'unicode61'
-      )
-    `);
+    createFtsTable(db);
   } catch (error) {
     console.warn(
       '[search-index] FTS5 unavailable, falling back to keyword scan',
@@ -348,7 +400,18 @@ export function ensureSearchIndex(
   }
 
   setFtsAvailable(true);
-  const version = readSetting(db, 'search_index_version');
+  let version = readSetting(db, 'search_index_version');
+  if (version !== SEARCH_INDEX_VERSION) {
+    try {
+      db.exec('DROP TABLE IF EXISTS deals_fts');
+      createFtsTable(db);
+      version = null;
+    } catch (error) {
+      console.warn('[search-index] FTS5 schema upgrade failed', error);
+      setFtsAvailable(false);
+      return false;
+    }
+  }
   const deals = (
     db.prepare('SELECT COUNT(*) AS count FROM deals').get() as {
       count: number;
@@ -412,7 +475,7 @@ export function readSearchIndexStatus(db: Db): SearchIndexStatus {
   }
 }
 
-function buildScopeWhere(
+export function buildScopeWhere(
   options: SearchScopeOptions,
   alias = 'd',
 ): { sql: string; params: unknown[] } {
@@ -506,7 +569,7 @@ export function searchDealsByFts(
     const scope = buildScopeWhere(options);
     const rows = db
       .prepare(
-        `SELECT ${CANDIDATE_COLUMNS}, bm25(deals_fts, 5.0, 3.0, 1.0) AS rank
+        `SELECT ${CANDIDATE_COLUMNS}, bm25(deals_fts, 5.0, 3.0, 4.0, 2.0, 3.0, 1.0) AS rank
          FROM deals_fts
          JOIN deals d ON d.id = deals_fts.rowid
          LEFT JOIN sources s ON s.id = d.source
@@ -524,43 +587,41 @@ export function searchDealsByFts(
   }
 }
 
-export function searchDealsByLike(
+/** 精确按标签（正式标签或提议标签）召回，不需要走分词。 */
+export function searchDealsByTag(
   db: Db,
-  query: string,
+  tag: string,
   options: SearchScopeOptions,
 ): SearchCandidate[] {
   try {
     const scope = buildScopeWhere(options);
-    const pattern = buildLikePattern(query);
     const rows = db
       .prepare(
         `SELECT ${CANDIDATE_COLUMNS}, 0 AS rank
          FROM deals d
          LEFT JOIN sources s ON s.id = d.source
          WHERE (
-           d.title LIKE ? ESCAPE '\\'
-           OR d.ai_title LIKE ? ESCAPE '\\'
-           OR d.ai_summary LIKE ? ESCAPE '\\'
-           OR d.description LIKE ? ESCAPE '\\'
-           OR s.name LIKE ? ESCAPE '\\'
+           EXISTS (SELECT 1 FROM json_each(d.tags) WHERE json_each.value = ?)
+           OR EXISTS (
+             SELECT 1 FROM json_each(d.proposed_tags)
+             WHERE json_each.value = ?
+           )
          )
          ${scope.sql}
          ORDER BY COALESCE(d.published_at, d.first_seen_at) DESC
          LIMIT ?`,
       )
       .all(
-        pattern,
-        pattern,
-        pattern,
-        pattern,
-        pattern,
+        tag,
+        tag,
         ...scope.params,
         Math.min(options.limit, 500),
       ) as RawSearchRow[];
 
     return rows.map(mapSearchRow);
   } catch (error) {
-    console.warn('[search-index] LIKE query failed', error);
+    console.warn('[search-index] tag query failed', error);
     return [];
   }
 }
+

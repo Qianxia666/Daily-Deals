@@ -2,11 +2,16 @@ import type { Metadata } from 'next';
 import { AdminDashboard } from '@/components/admin-dashboard';
 import { AdminLogin } from '@/components/admin-login';
 import { isAdmin } from '@/lib/admin';
+import { getSiteSettings } from '@/lib/runtime-settings';
 
-export const metadata: Metadata = {
-  title: '管理后台 · 每日优惠情报',
-  robots: { index: false, follow: false },
-};
+export async function generateMetadata(): Promise<Metadata> {
+  const site = getSiteSettings();
+  return {
+    title: `管理后台 · ${site.title}`,
+    description: site.tagline,
+    robots: { index: false, follow: false },
+  };
+}
 
 export const dynamic = 'force-dynamic';
 

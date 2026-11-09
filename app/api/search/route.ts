@@ -5,9 +5,11 @@ import {
   getDataRetentionDays,
   getDealsSnapshot,
   getLastFetchedAt,
+  getTagSuggestions,
   getVisibleSourceIds,
+  listFormalTagCounts,
   searchDealsForQuery,
-  searchDealsForQueryLike,
+  searchDealsForTag,
 } from '@/lib/db';
 import {
   getAiSearchCoarseStrategy,
@@ -18,6 +20,10 @@ import {
   getAiSearchRecallLimit,
   getAiSearchRerankEnabled,
   getAiSearchRerankLimit,
+  getAiSearchRewriteEnabled,
+  getAiSearchRewriteOnEmptyRerank,
+  getAiSearchRewritePerMinute,
+  getAiSearchRewriteTimeoutMs,
   getAiSearchScope,
   getAiSearchSynonymEnabled,
   getAiSearchUseSummary,
@@ -25,15 +31,18 @@ import {
   getKeywordSearchMaxResults,
   getRuntimeBool,
   getRuntimeEnvNumber,
+  getSearchSuggestTags,
 } from '@/lib/runtime-settings';
 import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
 import {
+  rewriteSearchQuery,
   searchDealsWithAi,
+  suggestTagsForQuery,
   type AiSearchDeal,
 } from '@/lib/llm';
-import type { SearchCandidate } from '@/lib/search-index';
+import type { SearchCandidate, SearchScopeOptions } from '@/lib/search-index';
 import { buildFtsQuery } from '@/lib/search-text';
-import type { Category, DealItem } from '@/lib/types';
+import type { Category, DealItem, TagSuggestion } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -41,6 +50,7 @@ export const runtime = 'nodejs';
 interface SearchBody {
   query?: unknown;
   mode?: unknown;
+  tag?: unknown;
 }
 
 type SearchMode = 'ai' | 'keyword';
@@ -51,6 +61,8 @@ interface SearchResponse {
   ids: number[];
   reason: string;
   windowDays: number;
+  suggestedTags?: TagSuggestion[];
+  truncated?: boolean;
 }
 
 interface CacheEntry {
@@ -59,6 +71,14 @@ interface CacheEntry {
 }
 
 const aiCache = new Map<string, CacheEntry>();
+const rewriteCache = new Map<
+  string,
+  { expiresAt: number; keywords: string[] }
+>();
+const tagSuggestCache = new Map<
+  string,
+  { expiresAt: number; tags: TagSuggestion[] }
+>();
 
 /** 旧回退路径：超出提交上限时按策略粗筛，避免只截取最新的一段。 */
 function coarseSelect(
@@ -228,21 +248,153 @@ function dealToSearchDeal(
   };
 }
 
+/** 零结果标签建议：只推荐有结果可点的正式标签与高热度提议标签。 */
+function buildSuggestions(
+  keywords: string[],
+  options: SearchScopeOptions,
+): TagSuggestion[] {
+  const limit = getSearchSuggestTags();
+  if (limit <= 0) return [];
+  try {
+    return getTagSuggestions(keywords, options, limit);
+  } catch (error) {
+    console.warn('[search] tag suggestion failed', error);
+    return [];
+  }
+}
+
+/**
+ * 两次召回都为空时，直接让模型从正式标签里挑相关的作为建议。
+ * 调用失败才退回字面匹配；模型明确返回空数组时不做建议。
+ */
+async function buildSemanticSuggestions(
+  query: string,
+  keywords: string[],
+  options: SearchScopeOptions,
+): Promise<TagSuggestion[]> {
+  const limit = getSearchSuggestTags();
+  if (limit <= 0) return [];
+
+  const cacheKey = `${limit}:${query.trim().toLowerCase()}`;
+  const cached = tagSuggestCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.tags;
+
+  try {
+    const counts = listFormalTagCounts(options);
+    if (counts.length === 0) return [];
+
+    if (
+      !checkRateLimit('search-tag-suggest', getAiSearchRewritePerMinute()).ok
+    ) {
+      return buildSuggestions([query, ...keywords], options);
+    }
+
+    const countByTag = new Map(counts.map((row) => [row.tag, row.count]));
+    const picked = await suggestTagsForQuery(
+      query,
+      keywords,
+      counts.map((row) => row.tag),
+      limit,
+      getAiSearchRewriteTimeoutMs(),
+    );
+
+    if (picked === null) {
+      return buildSuggestions([query, ...keywords], options);
+    }
+
+    const tags = picked
+      .map((tag) => ({ tag, count: countByTag.get(tag) ?? 0 }))
+      .filter((item) => item.count > 0);
+
+    if (tagSuggestCache.size > 500) tagSuggestCache.clear();
+    tagSuggestCache.set(cacheKey, {
+      expiresAt: Date.now() + 10 * 60_000,
+      tags,
+    });
+    return tags;
+  } catch (error) {
+    console.warn('[search] ai tag suggestion failed', error);
+    return buildSuggestions([query, ...keywords], options);
+  }
+}
+
 function emptyResponse(
   query: string,
   reason: string,
   windowDays: number,
+  suggestedTags: TagSuggestion[] = [],
 ): NextResponse {
-  return NextResponse.json(
-    {
+  const payload: SearchResponse = {
+    query,
+    mode: 'keyword',
+    ids: [],
+    reason,
+    windowDays,
+    ...(suggestedTags.length > 0 ? { suggestedTags } : {}),
+  };
+
+  return NextResponse.json(payload, {
+    headers: { 'Cache-Control': 'no-store' },
+  });
+}
+
+/**
+ * 改写搜索词并做第二次召回，复用于「首次召回为空」与「精排为空」两种情况。
+ * 缓存与全站限流都在这里处理，调用方无需关心。
+ */
+async function rewriteRecall(
+  query: string,
+  scopeOptions: SearchScopeOptions,
+  synonyms: boolean,
+): Promise<{ keywords: string[]; candidates: SearchCandidate[] | null }> {
+  const cacheKey = query.toLowerCase();
+  let keywords: string[] = [];
+
+  const cached = rewriteCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    keywords = cached.keywords;
+  } else if (
+    checkRateLimit('search-rewrite', getAiSearchRewritePerMinute()).ok
+  ) {
+    // 把站内正式标签一并交给模型，让它优先改写成真实存在的标签。
+    let vocabulary: string[] = [];
+    try {
+      vocabulary = listFormalTagCounts(scopeOptions)
+        .slice(0, 60)
+        .map((row) => row.tag)
+        .filter((tag) => tag !== '其他' && tag !== '其它');
+    } catch (error) {
+      console.warn('[search] rewrite vocabulary failed', error);
+    }
+
+    keywords = await rewriteSearchQuery(
       query,
-      mode: 'keyword',
-      ids: [],
-      reason,
-      windowDays,
-    } satisfies SearchResponse,
-    { headers: { 'Cache-Control': 'no-store' } },
-  );
+      getAiSearchRewriteTimeoutMs(),
+      vocabulary,
+    );
+    if (keywords.length > 0) {
+      if (rewriteCache.size > 500) rewriteCache.clear();
+      rewriteCache.set(cacheKey, {
+        expiresAt: Date.now() + 10 * 60_000,
+        keywords,
+      });
+    }
+  }
+
+  let candidates: SearchCandidate[] | null = null;
+  if (keywords.length > 0) {
+    const match = keywords
+      .map((keyword) => buildFtsQuery(keyword, { synonyms }))
+      .filter((value): value is string => Boolean(value))
+      .join(' OR ');
+
+    if (match) {
+      const rewritten = searchDealsForQuery(match, scopeOptions);
+      if (rewritten && rewritten.length > 0) candidates = rewritten;
+    }
+  }
+
+  return { keywords, candidates };
 }
 
 export async function POST(request: NextRequest) {
@@ -312,8 +464,50 @@ export async function POST(request: NextRequest) {
     limit: fetchLimit,
   };
 
+  // 用户点击标签后走精确标签过滤，不调用 AI，也不做关键词召回。
+  const selectedTag =
+    typeof body?.tag === 'string' ? body.tag.trim().slice(0, 20) : '';
+  if (selectedTag) {
+    const TAG_RESULT_LIMIT = 100;
+    // 多查一条用于判断是否被截断。
+    const tagCandidates = searchDealsForTag(selectedTag, {
+      ...scopeOptions,
+      limit: TAG_RESULT_LIMIT + 1,
+    });
+    const truncated = tagCandidates.length > TAG_RESULT_LIMIT;
+    const limited = truncated
+      ? tagCandidates.slice(0, TAG_RESULT_LIMIT)
+      : tagCandidates;
+    // 标签筛选与 AI 精排无关，最多展示 100 条。
+    const ids = rankCandidates(limited, 0, TAG_RESULT_LIMIT).map(
+      (row) => row.id,
+    );
+
+    if (ids.length > 0) {
+      const payload: SearchResponse = {
+        query: selectedTag,
+        mode,
+        ids,
+        reason: `已按标签「${selectedTag}」筛选`,
+        windowDays,
+        ...(truncated ? { truncated: true } : {}),
+      };
+      return NextResponse.json(payload, {
+        headers: { 'Cache-Control': 'no-store' },
+      });
+    }
+
+    // 标签模式下不再推荐其他标签，避免循环推荐。
+    return emptyResponse(
+      selectedTag,
+      `标签「${selectedTag}」下暂时没有在架优惠`,
+      windowDays,
+    );
+  }
+
   let candidates: SearchCandidate[] | null = null;
   let ftsUsed = false;
+  let rewriteKeywords: string[] = [];
 
   if (ftsEnabled) {
     const match = buildFtsQuery(query, { synonyms });
@@ -321,11 +515,23 @@ export async function POST(request: NextRequest) {
       candidates = searchDealsForQuery(match, scopeOptions);
       ftsUsed = candidates !== null;
     }
+  }
 
-    if (!candidates || candidates.length === 0) {
-      const likeCandidates = searchDealsForQueryLike(query, scopeOptions);
-      if (likeCandidates.length > 0) candidates = likeCandidates;
-    }
+  // 第一次召回为零时，把口语搜索改写成品类词再试一次；只影响未命中的请求。
+  if (
+    mode === 'ai' &&
+    ftsEnabled &&
+    (!candidates || candidates.length === 0) &&
+    query.length >= 2 &&
+    getAiSearchRewriteEnabled()
+  ) {
+    const recalled = await rewriteRecall(
+      query,
+      scopeOptions,
+      synonyms,
+    );
+    rewriteKeywords = recalled.keywords;
+    if (recalled.candidates) candidates = recalled.candidates;
   }
 
   if (mode === 'keyword') {
@@ -375,6 +581,7 @@ export async function POST(request: NextRequest) {
         ? '在架优惠中没有找到相关结果'
         : `最近 ${windowDays} 天没有找到相关优惠`,
       windowDays,
+      buildSuggestions([query], scopeOptions),
     );
   }
 
@@ -416,18 +623,32 @@ export async function POST(request: NextRequest) {
   } else {
     return emptyResponse(
       query,
-      activeOnly
-        ? '在架优惠中没有找到相关结果，试试换个说法'
-        : `最近 ${windowDays} 天没有找到相关优惠`,
+      rewriteKeywords.length > 0
+        ? activeOnly
+          ? `在架优惠中没有找到相关结果，已尝试近义改写：${rewriteKeywords.join('、')}`
+          : `最近 ${windowDays} 天没有找到相关优惠，已尝试近义改写：${rewriteKeywords.join('、')}`
+        : activeOnly
+          ? '在架优惠中没有找到相关结果，试试换个说法'
+          : `最近 ${windowDays} 天没有找到相关优惠`,
       windowDays,
+      await buildSemanticSuggestions(query, rewriteKeywords, scopeOptions),
     );
   }
 
   if (searchable.length === 0) {
-    return emptyResponse(query, '没有找到相关优惠', windowDays);
+    return emptyResponse(
+      query,
+      '没有找到相关优惠',
+      windowDays,
+      await buildSemanticSuggestions(query, rewriteKeywords, scopeOptions),
+    );
   }
 
   const cacheEnabled = getRuntimeBool('AI_SEARCH_CACHE_ENABLED', true);
+  let rewritePrefix =
+    rewriteKeywords.length > 0
+      ? `已将搜索理解为「${rewriteKeywords.join('、')}」。`
+      : '';
   const cacheKey = [
     query,
     activeOnly ? 'active' : `days:${days}`,
@@ -435,6 +656,9 @@ export async function POST(request: NextRequest) {
     rerankLimit,
     useSummary ? 'summary' : 'title',
     synonyms ? 'syn' : 'plain',
+    getAiSearchRerankEnabled() ? 'rerank' : 'plain',
+    getAiSearchMaxPerSource(),
+    getSearchSuggestTags(),
     getLastFetchedAt() ?? '',
     candidates?.length ?? 0,
   ].join('\u0000');
@@ -456,7 +680,7 @@ export async function POST(request: NextRequest) {
       query,
       mode: 'ai',
       ids,
-      reason: '已按全文索引与新鲜度排序（AI 精排已关闭）',
+      reason: `${rewritePrefix}已按全文索引与新鲜度排序（AI 精排已关闭）`,
       windowDays,
     };
     return NextResponse.json(payload, {
@@ -470,6 +694,45 @@ export async function POST(request: NextRequest) {
     rerankLimit,
   );
 
+  // 召回有候选但 AI 精排全部过滤时，再改写一次搜索词重新精排。
+  let finalSelection = selection;
+  if (
+    selection &&
+    selection.ids.length === 0 &&
+    rewriteKeywords.length === 0 &&
+    getAiSearchRewriteOnEmptyRerank()
+  ) {
+    const recalled = await rewriteRecall(
+      query,
+      scopeOptions,
+      synonyms,
+    );
+    rewriteKeywords = recalled.keywords;
+    if (recalled.candidates && recalled.candidates.length > 0) {
+      const retryRanked = rankCandidates(
+        recalled.candidates,
+        getAiSearchMaxPerSource(),
+        recallLimit,
+      );
+      const retrySearchable = retryRanked.map((row) =>
+        candidateToSearchDeal(row, useSummary),
+      );
+      if (retrySearchable.length > 0) {
+        const retried = await searchDealsWithAi(
+          query,
+          retrySearchable,
+          rerankLimit,
+        );
+        if (retried) finalSelection = retried;
+      }
+    }
+  }
+
+  rewritePrefix =
+    rewriteKeywords.length > 0
+      ? `已将搜索理解为「${rewriteKeywords.join('、')}」。`
+      : '';
+
   const fallbackIds = (
     ftsUsed ? ranked : searchable.map((item) => ({ id: item.id }))
   )
@@ -480,19 +743,26 @@ export async function POST(request: NextRequest) {
     `[search] mode=ai scope=${activeOnly ? 'active' : `${days}d`} fts=${
       ftsUsed ? 1 : 0
     } matched=${candidates?.length ?? 0} sent=${searchable.length} ai=${
-      selection ? 1 : 0
-    }`,
+      finalSelection ? 1 : 0
+    } rewrite=${rewriteKeywords.join('|') || '-'}`,
   );
 
-  if (selection) {
+  if (finalSelection) {
+    const ids = finalSelection.ids;
+    const suggestedTags =
+      ids.length === 0
+        ? await buildSemanticSuggestions(query, rewriteKeywords, scopeOptions)
+        : [];
     const payload: SearchResponse = {
       query,
       mode: 'ai',
-      ids: selection.ids,
+      ids,
       reason:
-        selection.reason ||
-        '已按全文索引召回并结合标题与摘要精排',
+        rewritePrefix +
+        (finalSelection.reason ||
+          '已按全文索引召回并结合标题与摘要精排'),
       windowDays,
+      ...(ids.length === 0 ? { suggestedTags } : {}),
     };
 
     if (cacheEnabled) {
@@ -520,7 +790,7 @@ export async function POST(request: NextRequest) {
     query,
     mode: 'keyword',
     ids: fallbackIds,
-    reason: 'AI 暂不可用，已按全文索引与摘要匹配',
+    reason: `${rewritePrefix}AI 暂不可用，已按全文索引与摘要匹配`,
     windowDays,
   };
 

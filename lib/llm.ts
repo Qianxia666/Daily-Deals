@@ -1,16 +1,60 @@
 import {
   incrementAiAttempts,
   listDealsForAi,
+  listDealsMissingTags,
   saveAiEnrichment,
+  saveDealTags,
   type AiPendingDeal,
+  type AiTagPendingDeal,
 } from './db';
 import { request } from './http';
 import {
+  getAiTagsBrandExtractEnabled,
+  getAiTagsEnabled,
+  getAiTagsProposeEnabled,
+  getAiTagsProposeMax,
+  getAiTagVocabulary,
   getRuntimeEnv,
   getRuntimeEnvNumber,
 } from './runtime-settings';
+import {
+  getTagRunProgress,
+  resetTagRunProgress,
+  updateTagRunProgress,
+  type TagRunProgress,
+} from './tag-progress';
 
-const SYSTEM_PROMPT = `你是中文优惠信息编辑。用户会给出 items 数组，每项包含 id、title、description，部分条目可能还有 context。请逐条改写成更简洁、更好读的标题和摘要，帮助读者快速判断是否值得参与。
+interface TagOptions {
+  vocabulary: string[];
+  proposeEnabled: boolean;
+  proposeMax: number;
+  brandExtractEnabled: boolean;
+}
+
+function buildSummaryPrompt(options: TagOptions): string {
+  const { vocabulary, proposeEnabled, proposeMax, brandExtractEnabled } =
+    options;
+
+  const tagRule =
+    vocabulary.length > 0
+      ? `10. tags 是 1–2 个品类标签，只能从下列词表中选，不能自造：${vocabulary.join(
+          '、',
+        )}。标签用于「搜奶茶能找到蜜雪冰城」这类品类检索，与原文是否出现该词无关。`
+      : '10. tags 返回空数组 []。';
+
+  const proposeRule =
+    proposeEnabled && proposeMax > 0
+      ? `11. proposedTags 是 0–${proposeMax} 个词表中没有的新品类词，仅当词表都不合适时才提出。要求 2–8 个汉字，必须是品类而非品牌名，不能与 tags 重复；没有合适的新词时返回 []。`
+      : '11. proposedTags 返回空数组 []。';
+
+  const entityRule = brandExtractEnabled
+    ? '12. brands 和 products 从该项的 title、description 原文中抽取品牌名与产品名，必须逐字出现在原文中，不得推测；没有则返回 []。'
+    : '12. brands 和 products 返回空数组 []。';
+
+  const format =
+    '{"items":[{"id":1,"title":"","summary":"","value":"","action":"","tags":[],"proposedTags":[],"brands":[],"products":[]}]}';
+
+  return `你是中文优惠信息编辑。用户会给出 items 数组，每项包含 id、title、description，部分条目可能还有 context。请逐条改写成更简洁、更好读的标题和摘要，帮助读者快速判断是否值得参与。
 
 硬性规则：
 1. 只能使用该项自己的 title、description 和 context 中的事实，不同条目的信息不能混用。
@@ -22,10 +66,14 @@ const SYSTEM_PROMPT = `你是中文优惠信息编辑。用户会给出 items �
 7. value 不超过 20 个字，例如"返现150元""立减20元""5折"；没有明确力度则返回 ""。
 8. action 不超过 30 个字，说清"需要做什么"；没有明确步骤则返回 ""。
 9. Epic 免费游戏是限时免费，value 必须写"限时免费"，严禁写成"永久免费"。
-10. 不要输出 Markdown，不要输出解释，只输出 JSON 对象。
+${tagRule}
+${proposeRule}
+${entityRule}
+13. 不要输出 Markdown，不要输出解释，只输出 JSON 对象。
 
 输出格式：
-{"items":[{"id":1,"title":"","summary":"","value":"","action":""}]}`;
+${format}`;
+}
 
 interface AiConfig {
   apiKey: string;
@@ -45,6 +93,9 @@ interface AiResult {
   summary: string;
   value: string;
   action: string;
+  tags: string[];
+  proposedTags: string[];
+  entities: string[];
 }
 
 const runtime = globalThis as typeof globalThis & {
@@ -111,9 +162,72 @@ function numbersAreGrounded(
   return produced.every((value) => available.has(value));
 }
 
+/** 只接受词表内的标签，最多 2 个，避免模型自造词。 */
+function normalizeTags(value: unknown, vocabulary: string[]): string[] {
+  if (!Array.isArray(value) || vocabulary.length === 0) return [];
+
+  const allowed = new Set(vocabulary);
+  const tags: string[] = [];
+  for (const entry of value) {
+    const tag = cleanText(entry, 12);
+    if (!allowed.has(tag) || tags.includes(tag)) continue;
+    tags.push(tag);
+    if (tags.length >= 2) break;
+  }
+  return tags;
+}
+
+/** 词表之外的新品类词，立即进入候选池但不会直接进入前台标签建议。 */
+function normalizeProposedTags(
+  value: unknown,
+  vocabulary: string[],
+  options: TagOptions,
+): string[] {
+  if (!options.proposeEnabled || options.proposeMax <= 0) return [];
+  if (!Array.isArray(value)) return [];
+
+  const allowed = new Set(vocabulary.map((tag) => tag.toLowerCase()));
+  const result: string[] = [];
+  for (const entry of value) {
+    const tag = cleanText(entry, 12);
+    if (tag.length < 2 || tag.length > 8) continue;
+    if (allowed.has(tag.toLowerCase())) continue;
+    if (result.some((item) => item.toLowerCase() === tag.toLowerCase())) {
+      continue;
+    }
+    result.push(tag);
+    if (result.length >= options.proposeMax) break;
+  }
+  return result;
+}
+
+/** 品牌/产品实体必须能在原文中逐字找到，否则丢弃。 */
+function normalizeEntities(
+  value: unknown,
+  sourceText: string,
+  max: number,
+): string[] {
+  if (!Array.isArray(value) || max <= 0) return [];
+
+  const source = sourceText.toLowerCase();
+  const result: string[] = [];
+  for (const entry of value) {
+    const entity = cleanText(entry, 24);
+    if (entity.length < 2) continue;
+    if (!source.includes(entity.toLowerCase())) continue;
+    if (result.some((item) => item.toLowerCase() === entity.toLowerCase())) {
+      continue;
+    }
+    result.push(entity);
+    if (result.length >= max) break;
+  }
+  return result;
+}
+
 function normalizeResult(
   raw: Record<string, unknown>,
   deal: AiPendingDeal,
+  options: TagOptions,
 ): AiResult | null {
   let summary = cleanText(raw.summary, 120);
   if (!summary) return null;
@@ -149,7 +263,30 @@ function normalizeResult(
   if (value && !valid(value)) value = '';
   if (action && !valid(action)) action = '';
 
-  return { title, summary, value, action };
+  const entities = options.brandExtractEnabled
+    ? normalizeEntities(
+        [
+          ...(Array.isArray(raw.brands) ? raw.brands : []),
+          ...(Array.isArray(raw.products) ? raw.products : []),
+        ],
+        sourceText,
+        6,
+      )
+    : [];
+
+  return {
+    title,
+    summary,
+    value,
+    action,
+    tags: normalizeTags(raw.tags, options.vocabulary),
+    proposedTags: normalizeProposedTags(
+      raw.proposedTags,
+      options.vocabulary,
+      options,
+    ),
+    entities,
+  };
 }
 
 function parseBatchContent(content: string): unknown {
@@ -184,6 +321,7 @@ function parseBatchContent(content: string): unknown {
 function parseBatchResults(
   content: string,
   deals: AiPendingDeal[],
+  options: TagOptions,
 ): Map<number, AiResult> {
   const parsed = parseBatchContent(content);
   const list = Array.isArray(parsed)
@@ -207,7 +345,7 @@ function parseBatchResults(
     const deal = byId.get(id);
     if (!deal || results.has(id)) continue;
 
-    const result = normalizeResult(raw, deal);
+    const result = normalizeResult(raw, deal, options);
     if (result) results.set(id, result);
   }
 
@@ -221,6 +359,7 @@ function sleep(ms: number): Promise<void> {
 async function callModelBatch(
   config: AiConfig,
   deals: AiPendingDeal[],
+  options: TagOptions,
 ): Promise<Map<number, AiResult>> {
   const items = deals.map((deal) => ({
     id: deal.id,
@@ -237,7 +376,7 @@ async function callModelBatch(
   const payload = {
     model: config.model,
     messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: buildSummaryPrompt(options) },
       {
         role: 'user',
         content: JSON.stringify({ items }),
@@ -281,7 +420,7 @@ async function callModelBatch(
         choices?: { message?: { content?: string } }[];
       };
       const content = data.choices?.[0]?.message?.content ?? '';
-      const results = parseBatchResults(content, deals);
+      const results = parseBatchResults(content, deals, options);
 
       if (results.size > 0) return results;
       if (attempt === 0) {
@@ -342,6 +481,14 @@ export async function enrichPendingDeals(): Promise<void> {
     const pending = listDealsForAi(config.maxItems, config.maxAttempts);
     if (pending.length === 0) return;
 
+    const tagsEnabled = getAiTagsEnabled();
+    const options: TagOptions = {
+      vocabulary: tagsEnabled ? getAiTagVocabulary() : [],
+      proposeEnabled: tagsEnabled && getAiTagsProposeEnabled(),
+      proposeMax: tagsEnabled ? getAiTagsProposeMax() : 0,
+      brandExtractEnabled: tagsEnabled && getAiTagsBrandExtractEnabled(),
+    };
+
     const batches: AiPendingDeal[][] = [];
     for (let index = 0; index < pending.length; index += config.batchSize) {
       batches.push(pending.slice(index, index + config.batchSize));
@@ -352,14 +499,18 @@ export async function enrichPendingDeals(): Promise<void> {
     let failed = 0;
 
     await runPool(batches, config.concurrency, async (batch) => {
-      const results = await callModelBatch(config, batch);
+      const results = await callModelBatch(config, batch, options);
 
       // 同一轮内只补一次：把缺失的条目压成一个小批次再请求一遍。
       const missing = batch.filter((deal) => !results.has(deal.id));
       if (missing.length > 0) {
         const retryBatch = missing.slice(0, config.retrySize);
         retried += retryBatch.length;
-        const retryResults = await callModelBatch(config, retryBatch);
+        const retryResults = await callModelBatch(
+          config,
+          retryBatch,
+          options,
+        );
         for (const [id, result] of retryResults) {
           results.set(id, result);
         }
@@ -390,6 +541,289 @@ export async function enrichPendingDeals(): Promise<void> {
   } finally {
     runtime.__dailyDealsAiRunning = false;
   }
+}
+
+const TAG_SYSTEM_PROMPT = `你是中文优惠信息分类器。用户会给出 items 数组，每项包含 id、title、summary、category、description。请为每条优惠输出品类标签、可选的新品类词，以及可抽取的品牌与产品。
+
+硬性规则：
+1. tags：1–2 个品类标签，只能选择词表中给出的标签，不得自造、不得改写；确实无法归类时选择"其他"。
+2. proposedTags：__PROPOSE_RULE__ 必须是品类而非品牌名，不能与 tags 重复。
+3. brands、products：__ENTITY_RULE__
+4. 结合标题与摘要判断真实品类，不要被无关词干扰（例如"奶茶色口红"不是奶茶）。
+5. 每个输入 id 必须返回一条，id 原样返回。
+6. 不要输出 Markdown，不要输出解释，只输出 JSON 对象。
+
+可用标签：__VOCABULARY__
+
+输出格式：
+{"items":[{"id":1,"tags":["奶茶"],"proposedTags":[],"brands":[],"products":[]}]}`;
+
+interface TagResult {
+  tags: string[];
+  proposedTags: string[];
+  entities: string[];
+}
+
+function parseTagResults(
+  content: string,
+  deals: AiTagPendingDeal[],
+  options: TagOptions,
+): Map<number, TagResult> {
+  const parsed = parseBatchContent(content);
+  const list = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === 'object' &&
+        Array.isArray((parsed as Record<string, unknown>).items)
+      ? ((parsed as Record<string, unknown>).items as unknown[])
+      : [];
+
+  const byId = new Map(deals.map((deal) => [deal.id, deal]));
+  const results = new Map<number, TagResult>();
+
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object') continue;
+    const raw = entry as Record<string, unknown>;
+    const id =
+      typeof raw.id === 'number'
+        ? raw.id
+        : Number.parseInt(String(raw.id), 10);
+    const deal = byId.get(id);
+    if (!deal || results.has(id)) continue;
+
+    const tags = normalizeTags(raw.tags, options.vocabulary);
+    const proposedTags = normalizeProposedTags(
+      raw.proposedTags,
+      options.vocabulary,
+      options,
+    );
+    const entities = options.brandExtractEnabled
+      ? normalizeEntities(
+          [
+            ...(Array.isArray(raw.brands) ? raw.brands : []),
+            ...(Array.isArray(raw.products) ? raw.products : []),
+          ],
+          `${deal.title} ${deal.description}`,
+          6,
+        )
+      : [];
+
+    if (tags.length === 0 && proposedTags.length === 0 && entities.length === 0) {
+      continue;
+    }
+    results.set(id, { tags, proposedTags, entities });
+  }
+
+  return results;
+}
+
+async function callTagModelBatch(
+  config: AiConfig,
+  deals: AiTagPendingDeal[],
+  options: TagOptions,
+): Promise<Map<number, TagResult>> {
+  const items = deals.map((deal) => ({
+    id: deal.id,
+    title: deal.title,
+    summary: deal.summary.slice(0, 160),
+    category: deal.category,
+    description: deal.description.slice(0, 500),
+  }));
+
+  const proposeRule =
+    options.proposeEnabled && options.proposeMax > 0
+      ? `0–${options.proposeMax} 个词表中没有的新品类词，仅当词表都不合适时才提出；每个 2–8 个汉字。`
+      : '返回空数组 []。';
+  const entityRule = options.brandExtractEnabled
+    ? '从该项 title、description 原文中逐字抽取品牌名与产品名，必须能在原文中找到，没有则返回 []。'
+    : '返回空数组 []。';
+
+  const payload = {
+    model: config.model,
+    messages: [
+      {
+        role: 'system',
+        content: TAG_SYSTEM_PROMPT.replace(
+          '__VOCABULARY__',
+          options.vocabulary.join('、'),
+        )
+          .replace('__PROPOSE_RULE__', proposeRule)
+          .replace('__ENTITY_RULE__', entityRule),
+      },
+      { role: 'user', content: JSON.stringify({ items }) },
+    ],
+    temperature: 0.1,
+    max_tokens: Math.min(8192, 120 + deals.length * 80),
+    response_format: { type: 'json_object' },
+  };
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await request(
+        config.endpoint,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify(payload),
+        },
+        config.timeoutMs,
+      );
+
+      const body = await response.text();
+      if (!response.ok) {
+        const retryable = response.status === 429 || response.status >= 500;
+        if (retryable && attempt === 0) {
+          await sleep(1_000);
+          continue;
+        }
+        throw new Error(`HTTP ${response.status}: ${body.slice(0, 160)}`);
+      }
+
+      const data = JSON.parse(body) as {
+        choices?: { message?: { content?: string } }[];
+      };
+      const content = data.choices?.[0]?.message?.content ?? '';
+      const results = parseTagResults(content, deals, options);
+      if (results.size > 0 || attempt === 1) return results;
+      await sleep(400);
+    } catch (error) {
+      if (attempt === 0) {
+        await sleep(1_000);
+        continue;
+      }
+      console.warn(
+        `[tags] 批量分类失败（${deals.length} 条）：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return new Map();
+    }
+  }
+
+  return new Map();
+}
+
+/**
+ * 为已有摘要的存量条目补全品类标签。
+ * force=true 时忽略 ai_tags_at，对全部在架条目重新打标（用于词表或提议配置变更后）。
+ * 异步执行，后台通过 getTagRunProgress() 查看进度。
+ */
+export function startTagBackfill(force = false): TagRunProgress {
+  const current = getTagRunProgress();
+  if (current.running) return current;
+
+  const fail = (error: string): TagRunProgress =>
+    updateTagRunProgress({
+      running: false,
+      error,
+      finishedAt: new Date().toISOString(),
+    });
+
+  if (!getAiTagsEnabled()) return fail('品类标签已在后台关闭');
+  if (getRuntimeEnv('LLM_ENABLED', 'true').trim() === 'false') {
+    return fail('AI 摘要已关闭，无法生成标签');
+  }
+
+  const config = readConfig();
+  if (!config) return fail('未配置 AI 接口，无法生成标签');
+
+  const options: TagOptions = {
+    vocabulary: getAiTagVocabulary(),
+    proposeEnabled: getAiTagsProposeEnabled(),
+    proposeMax: getAiTagsProposeMax(),
+    brandExtractEnabled: getAiTagsBrandExtractEnabled(),
+  };
+  if (options.vocabulary.length === 0) return fail('品类标签词表为空');
+
+  const pending = listDealsMissingTags(20_000, force);
+  if (pending.length === 0) {
+    resetTagRunProgress(0);
+    return updateTagRunProgress({
+      running: false,
+      finishedAt: new Date().toISOString(),
+    });
+  }
+
+  resetTagRunProgress(pending.length);
+
+  void (async () => {
+    let tagged = 0;
+    let failed = 0;
+
+    try {
+      const batches: AiTagPendingDeal[][] = [];
+      for (let index = 0; index < pending.length; index += config.batchSize) {
+        batches.push(pending.slice(index, index + config.batchSize));
+      }
+
+      await runPool(batches, config.concurrency, async (batch) => {
+        const results = await callTagModelBatch(config, batch, options);
+
+        const missing = batch.filter((deal) => !results.has(deal.id));
+        if (missing.length > 0) {
+          const retry = missing.slice(0, config.retrySize);
+          const retryResults = await callTagModelBatch(
+            config,
+            retry,
+            options,
+          );
+          for (const [id, result] of retryResults) results.set(id, result);
+        }
+
+        let batchTagged = 0;
+        let batchFailed = 0;
+        for (const deal of batch) {
+          const result = results.get(deal.id);
+          if (result) {
+            saveDealTags(
+              deal.id,
+              result.tags,
+              result.proposedTags,
+              result.entities,
+            );
+            batchTagged += 1;
+          } else {
+            batchFailed += 1;
+          }
+        }
+
+        tagged += batchTagged;
+        failed += batchFailed;
+        const progress = getTagRunProgress();
+        updateTagRunProgress({
+          processed: progress.processed + batch.length,
+          tagged,
+          failed,
+        });
+      });
+
+      updateTagRunProgress({
+        running: false,
+        finishedAt: new Date().toISOString(),
+        processed: pending.length,
+        tagged,
+        failed,
+        error: null,
+      });
+      console.log(
+        `[tags] done=${tagged} failed=${failed} total=${pending.length} model=${config.model}`,
+      );
+    } catch (error) {
+      updateTagRunProgress({
+        running: false,
+        finishedAt: new Date().toISOString(),
+        tagged,
+        failed,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      console.error('[tags] 补全失败：', error);
+    }
+  })();
+
+  return getTagRunProgress();
 }
 
 export interface AiSearchDeal {
@@ -558,4 +992,265 @@ export async function searchDealsWithAi(
 
   const validIds = new Set(deals.map((deal) => deal.id));
   return parseSearchSelection(content, validIds, limit);
+}
+
+const REWRITE_SYSTEM_PROMPT = `你是中文优惠搜索的查询改写助手。用户第一次搜索没有召回任何结果，请把 query 改写成 3–5 个更适合站内全文检索的关键词或品类词，用于第二次召回。
+
+规则：
+1. 保留原文中的品牌、型号、品类等实体词。
+2. 去掉"想、求、有没有、便宜、好价、推荐、怎么"等语气词。
+3. 把口语意图转成具体品类，例如"想喝点甜的"→"奶茶、咖啡、甜品、饮料"。
+4. 不要加入原文没有的具体品牌、型号或价格。
+5. 关键词不能重复，每个不超过 12 个字。
+6. 只输出 JSON 对象：{"keywords":["..."]}`;
+
+function normalizeKeywords(value: unknown): string[] {
+  const list = Array.isArray(value) ? value : [];
+  const keywords: string[] = [];
+
+  for (const entry of list) {
+    if (typeof entry !== 'string') continue;
+    for (const part of entry.split(/[,，、;；]+/)) {
+      const cleaned = part
+        .replace(/\s+/g, ' ')
+        .replace(/^[\s:：]+|[\s:：]+$/g, '')
+        .trim()
+        .slice(0, 20);
+      if (!cleaned || keywords.includes(cleaned)) continue;
+      keywords.push(cleaned);
+      if (keywords.length >= 5) break;
+    }
+    if (keywords.length >= 5) break;
+  }
+
+  return keywords;
+}
+
+function parseRewriteKeywords(content: string): string[] {
+  let text = content.trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) text = fenced[1].trim();
+
+  try {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    const parsed =
+      start >= 0 && end > start
+        ? JSON.parse(text.slice(start, end + 1))
+        : JSON.parse(text);
+    const record =
+      parsed && typeof parsed === 'object'
+        ? (parsed as Record<string, unknown>)
+        : {};
+    return normalizeKeywords(record.keywords ?? record.items ?? parsed);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 只在第一次召回为零时调用，把口语搜索改写成更容易命中的关键词。
+ * 传入站内正式标签词表后，会优先复用这些真实存在的标签，提升二次召回命中率。
+ * 超时或失败都返回空数组，不影响主搜索。
+ */
+export async function rewriteSearchQuery(
+  query: string,
+  timeoutMs: number,
+  vocabulary: string[] = [],
+): Promise<string[]> {
+  if (getRuntimeEnv('AI_SEARCH_ENABLED', 'true').trim() === 'false') {
+    return [];
+  }
+
+  const config = readConfig();
+  if (!config) return [];
+
+  const tags = vocabulary
+    .map((tag) => tag.trim())
+    .filter(Boolean)
+    .slice(0, 60);
+  const systemPrompt =
+    tags.length > 0
+      ? `${REWRITE_SYSTEM_PROMPT}
+
+站内已有标签（优先复用，必须原样输出，不要改写文字）：
+${tags.join('、')}
+
+如果其中有与搜索意图相关的标签，请优先输出这些标签原文；不足 3 个时再按上述规则补充通用品类词。`
+      : REWRITE_SYSTEM_PROMPT;
+
+  const payload = {
+    model: config.searchModel,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: JSON.stringify({ query }) },
+    ],
+    temperature: 0.2,
+    max_tokens: 200,
+    response_format: { type: 'json_object' },
+  };
+
+  try {
+    const response = await request(
+      config.endpoint,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(payload),
+      },
+      timeoutMs,
+    );
+
+    if (!response.ok) return [];
+    const body = await response.text();
+    const data = JSON.parse(body) as {
+      choices?: { message?: { content?: string } }[];
+    };
+    const content = data.choices?.[0]?.message?.content ?? '';
+    return parseRewriteKeywords(content);
+  } catch (error) {
+    console.warn(
+      `[rewrite] 查询改写失败：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return [];
+  }
+}
+
+function buildTagSuggestPrompt(limit: number): string {
+  return `你是中文优惠网站的品类匹配助手。用户搜索两次都没有结果，请从给定的品类标签中挑出最符合搜索意图的标签，作为可点击的建议。
+规则：
+1. 只能从给定标签中原样挑选，禁止编造、改写或翻译标签。
+2. 只有当标签本身就是用户想找的品类时才选择；不要因为"游戏""虚拟权益""其他"这类宽泛标签沾边就推荐，凑数视为错误。
+3. 如果搜索词指向现实中不存在对应品类的场景（例如虚构道具、科幻设定、无意义词语），必须返回空数组。
+4. 按相关度从高到低排序，最多返回 ${limit} 个；语义不相关的不要返回。
+5. 为每个标签给出 0–1 的 confidence，低于 0.75 的不要返回。
+6. 只输出 JSON 对象：{"tags":[{"tag":"标签原文","confidence":0.9}]}`;
+}
+
+/** 严格按词表校验模型挑选的标签，词表外或置信度不足的一律丢弃。 */
+function parseTagPicks(content: string, vocabulary: string[]): string[] {
+  let text = content.trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) text = fenced[1].trim();
+
+  try {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    const parsed =
+      start >= 0 && end > start
+        ? JSON.parse(text.slice(start, end + 1))
+        : JSON.parse(text);
+    const record =
+      parsed && typeof parsed === 'object'
+        ? (parsed as Record<string, unknown>)
+        : {};
+    const list = Array.isArray(record.tags)
+      ? record.tags
+      : Array.isArray(record.items)
+        ? record.items
+        : [];
+    const canonical = new Map(
+      vocabulary.map((tag) => [tag.toLowerCase(), tag]),
+    );
+
+    const picked: string[] = [];
+    for (const entry of list) {
+      const rawTag =
+        typeof entry === 'string'
+          ? entry
+          : entry && typeof entry === 'object'
+            ? (entry as Record<string, unknown>).tag
+            : null;
+      if (typeof rawTag !== 'string') continue;
+
+      const confidence =
+        entry && typeof entry === 'object'
+          ? Number((entry as Record<string, unknown>).confidence ?? 1)
+          : 1;
+      if (!Number.isFinite(confidence) || confidence < 0.75) continue;
+
+      const tag = canonical.get(rawTag.trim().toLowerCase());
+      if (!tag || picked.includes(tag)) continue;
+      picked.push(tag);
+    }
+
+    return picked;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 两次召回都为空时，让模型只从正式标签里挑相关的作为建议。
+ * 返回 null 表示调用失败（调用方退回字面匹配），空数组表示模型明确认为无相关标签。
+ */
+export async function suggestTagsForQuery(
+  query: string,
+  keywords: string[],
+  vocabulary: string[],
+  limit: number,
+  timeoutMs: number,
+): Promise<string[] | null> {
+  if (limit <= 0 || vocabulary.length === 0) return [];
+  if (getRuntimeEnv('AI_SEARCH_ENABLED', 'true').trim() === 'false') {
+    return null;
+  }
+
+  const config = readConfig();
+  if (!config) return null;
+
+  const payload = {
+    model: config.searchModel,
+    messages: [
+      { role: 'system', content: buildTagSuggestPrompt(limit) },
+      {
+        role: 'user',
+        content: JSON.stringify({
+          query,
+          keywords: keywords.slice(0, 5),
+          tags: vocabulary.slice(0, 200),
+        }),
+      },
+    ],
+    temperature: 0.1,
+    max_tokens: 300,
+    response_format: { type: 'json_object' },
+  };
+
+  try {
+    const response = await request(
+      config.endpoint,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(payload),
+      },
+      timeoutMs,
+    );
+
+    if (!response.ok) return null;
+    const body = await response.text();
+    const data = JSON.parse(body) as {
+      choices?: { message?: { content?: string } }[];
+    };
+    const content = data.choices?.[0]?.message?.content ?? '';
+    return parseTagPicks(content, vocabulary).slice(0, limit);
+  } catch (error) {
+    console.warn(
+      `[suggest] 标签建议失败：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return null;
+  }
 }
