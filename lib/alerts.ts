@@ -1,26 +1,30 @@
-import { createHmac } from 'node:crypto';
-import { request } from './http';
+import { sendNotification, CHANNEL_LABELS } from './notify';
 import {
-  getRuntimeEnv,
-  getRuntimeEnvNumber,
+  getNotifyConfig,
   getRuntimeBool,
+  getRuntimeEnvNumber,
+  type NotifyKind,
 } from './runtime-settings';
 
 const cooldowns = new Map<string, number>();
+const KINDS: NotifyKind[] = ['wecom', 'feishu', 'dingtalk', 'bark'];
 
 /**
- * 通过飞书自定义机器人推送告警。
- * 同一 key 在冷却时间内只发送一次；未配置 Webhook 时直接跳过。
+ * 后台告警：向所有已启用并配置好的通知渠道推送。
+ * 同一 key 在冷却时间内只发送一次；没有任何渠道配置时直接跳过。
  */
-export async function sendFeishuAlert(
+export async function sendAdminAlert(
   key: string,
   title: string,
   lines: string[],
 ): Promise<void> {
   if (!getRuntimeBool('ALERTS_ENABLED', true)) return;
 
-  const webhook = getRuntimeEnv('FEISHU_WEBHOOK_URL').trim();
-  if (!webhook) return;
+  const targets = KINDS.map((kind) => ({ kind, config: getNotifyConfig(kind) }))
+    .filter(
+      ({ config }) => config.enabled && Boolean(config.webhook || config.key),
+    );
+  if (targets.length === 0) return;
 
   const cooldownMs =
     getRuntimeEnvNumber('ALERT_COOLDOWN_MINUTES', 60, 5, 1440) * 60_000;
@@ -28,36 +32,25 @@ export async function sendFeishuAlert(
   if (now - (cooldowns.get(key) ?? 0) < cooldownMs) return;
   cooldowns.set(key, now);
 
-  const payload: Record<string, unknown> = {
-    msg_type: 'text',
-    content: { text: [title, ...lines].join('\n') },
-  };
-
-  const secret = getRuntimeEnv('FEISHU_WEBHOOK_SECRET').trim();
-  if (secret) {
-    const timestamp = String(Math.floor(now / 1000));
-    const sign = createHmac('sha256', `${timestamp}\n${secret}`)
-      .update('')
-      .digest('base64');
-    payload.timestamp = timestamp;
-    payload.sign = sign;
-  }
-
-  try {
-    await request(
-      webhook,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      },
-      10_000,
-    );
-  } catch (error) {
-    console.warn(
-      `[alert] 飞书告警发送失败：${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-  }
+  await Promise.all(
+    targets.map(async ({ kind, config }) => {
+      try {
+        await sendNotification(
+          {
+            kind,
+            webhook: config.webhook,
+            secret: config.secret,
+            key: config.key,
+          },
+          { title, lines },
+        );
+      } catch (error) {
+        console.warn(
+          `[alert] ${CHANNEL_LABELS[kind]}告警发送失败：${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }),
+  );
 }

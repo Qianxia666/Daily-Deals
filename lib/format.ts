@@ -9,6 +9,22 @@ export function formatUpdatedAt(iso: string | null): string {
   });
 }
 
+/** 原文发布时间：同年显示 MM-DD HH:mm，跨年补上年份。 */
+export function formatPublishedAt(iso: string | null): string {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const label = `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}`;
+
+  return date.getFullYear() === new Date().getFullYear()
+    ? label
+    : `${date.getFullYear()}-${label}`;
+}
+
 export interface ExpiryInfo {
   text: string;
   urgent: boolean;

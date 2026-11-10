@@ -21,6 +21,7 @@ interface RuntimeFieldDef {
   description: string;
   type: RuntimeSettingType;
   secret?: boolean;
+  hidden?: boolean;
   defaultValue?: string;
   options?: { value: string; label: string }[];
   restartRequired?: boolean;
@@ -578,6 +579,15 @@ const FIELDS: RuntimeFieldDef[] = [
     defaultValue: 'AI 精简 · 定时自动聚合 · 只收录真实来源',
   },
   {
+    key: 'SITE_URL',
+    label: '站点公开地址',
+    group: '站点显示',
+    description:
+      '用于生成推送里的详情页链接，例如 https://your.site；留空则回退到优惠原始链接。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
     key: 'DATA_RETENTION_DAYS',
     label: '数据保留天数',
     group: '抓取',
@@ -652,8 +662,8 @@ const FIELDS: RuntimeFieldDef[] = [
   {
     key: 'ALERTS_ENABLED',
     label: '启用来源失败告警',
-    group: '告警',
-    description: '来源连续抓取失败时通过飞书机器人推送提醒。',
+    group: '通知渠道',
+    description: '来源连续抓取失败时，向下方已启用的通知渠道推送提醒。',
     type: 'select',
     defaultValue: 'true',
     options: [
@@ -663,24 +673,25 @@ const FIELDS: RuntimeFieldDef[] = [
   },
   {
     key: 'FEISHU_WEBHOOK_URL',
-    label: '飞书机器人 Webhook',
-    group: '告警',
-    description: '飞书群自定义机器人的 Webhook 地址，留空则不推送。',
+    label: '飞书机器人 Webhook（旧版）',
+    group: '通知渠道',
+    description: '旧版告警配置，后台已隐藏；仍会作为飞书渠道的兜底配置。',
     type: 'text',
+    hidden: true,
   },
   {
     key: 'FEISHU_WEBHOOK_SECRET',
-    label: '飞书机器人签名密钥',
-    group: '告警',
-    description:
-      '机器人开启「签名校验」时填写；留空表示不签名或保持当前值不变。',
+    label: '飞书机器人签名密钥（旧版）',
+    group: '通知渠道',
+    description: '旧版告警配置，后台已隐藏；仍会作为飞书渠道的兜底配置。',
     type: 'password',
     secret: true,
+    hidden: true,
   },
   {
     key: 'ALERT_FAILURE_THRESHOLD',
     label: '连续失败告警阈值',
-    group: '告警',
+    group: '通知渠道',
     description: '同一来源连续失败多少轮后推送告警，默认 3 轮。',
     type: 'number',
     defaultValue: '3',
@@ -690,12 +701,244 @@ const FIELDS: RuntimeFieldDef[] = [
   {
     key: 'ALERT_COOLDOWN_MINUTES',
     label: '告警冷却时间（分钟）',
-    group: '告警',
+    group: '通知渠道',
     description: '同一来源两次告警之间的最小间隔，默认 60 分钟。',
     type: 'number',
     defaultValue: '60',
     min: 5,
     max: 1440,
+  },
+  {
+    key: 'REGISTRATION_OPEN',
+    label: '开放用户注册',
+    group: '用户与订阅',
+    description:
+      '关闭后前台只能登录已有账号，注册接口会直接拒绝；后台账号不受影响。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开放注册' },
+      { value: 'false', label: '仅管理员可建号' },
+    ],
+  },
+  {
+    key: 'REGISTRATION_INVITE_REQUIRED',
+    label: '注册必须使用邀请码',
+    group: '用户与订阅',
+    description:
+      '开启后注册必须填写下方「邀请码管理」中生成的有效邀请码；关闭则无需邀请码。',
+    type: 'select',
+    defaultValue: 'false',
+    options: [
+      { value: 'true', label: '需要邀请码' },
+      { value: 'false', label: '不需要' },
+    ],
+  },
+  {
+    key: 'REGISTRATION_INVITE_CODE',
+    label: '旧版注册邀请码（兼容）',
+    group: '用户与订阅',
+    description:
+      '仅用于兼容旧配置：填写后，该固定码仍可无限次注册。新邀请码请在下方「邀请码管理」生成。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
+    key: 'AI_SEARCH_DAILY_LIMIT',
+    label: 'AI 搜索每日次数',
+    group: '用户与订阅',
+    description:
+      '每个登录用户每天可用的 AI 搜索次数，默认 50；填 0 表示不限制。',
+    type: 'number',
+    defaultValue: '50',
+    min: 0,
+    max: 1000,
+  },
+  {
+    key: 'ACCOUNT_MAX_SUBSCRIPTIONS',
+    label: '每人订阅关键词上限',
+    group: '用户与订阅',
+    description: '每个用户最多可创建多少个关键词订阅，默认 20。',
+    type: 'number',
+    defaultValue: '20',
+    min: 1,
+    max: 200,
+  },
+  {
+    key: 'ACCOUNT_MAX_CHANNELS_PER_KIND',
+    label: '每种渠道数量上限',
+    group: '用户与订阅',
+    description: '每个用户每种推送渠道最多绑定几个机器人，默认 2。',
+    type: 'number',
+    defaultValue: '2',
+    min: 1,
+    max: 10,
+  },
+  {
+    key: 'ACCOUNT_DAILY_PUSH_LIMIT',
+    label: '每人每日推送上限',
+    group: '用户与订阅',
+    description:
+      '每个用户每天最多收到多少条订阅推送，默认 20；超出后不再逐条推送，改为 20:30 的合并摘要，不会顺延到次日。',
+    type: 'number',
+    defaultValue: '20',
+    min: 1,
+    max: 500,
+  },
+  {
+    key: 'DIGEST_OVERFLOW_ENABLED',
+    label: '启用超限合并推送',
+    group: '用户与订阅',
+    description:
+      '达到每日推送上限后，把当天剩余条目合并成一条摘要推送；关闭后剩余条目不推送。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'DIGEST_OVERFLOW_TIME',
+    label: '超限合并推送时间',
+    group: '用户与订阅',
+    description:
+      '每天什么时候发送超限合并摘要，默认 20:30，格式 HH:mm，按北京时间执行。',
+    type: 'text',
+    defaultValue: '20:30',
+  },
+  {
+    key: 'DIGEST_SITE_ENABLED',
+    label: '启用每日全站汇总',
+    group: '用户与订阅',
+    description:
+      '每天向所有有启用订阅和渠道的用户发送一次全站优惠汇总，不占用个人每日推送额度。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'DIGEST_SITE_TIME',
+    label: '全站汇总推送时间',
+    group: '用户与订阅',
+    description:
+      '每天什么时候发送全站优惠汇总，默认 21:00，格式 HH:mm，按北京时间执行。',
+    type: 'text',
+    defaultValue: '21:00',
+  },
+  {
+    key: 'DIGEST_SITE_MAX_ITEMS',
+    label: '全站汇总精选条数',
+    group: '用户与订阅',
+    description: '每日全站汇总最多列出多少条优惠，默认 8；其余通过详情页查看。',
+    type: 'number',
+    defaultValue: '8',
+    min: 1,
+    max: 8,
+  },
+  {
+    key: 'NOTIFY_WECOM_ENABLED',
+    label: '启用企业微信渠道',
+    group: '通知渠道',
+    description: '后台告警与用户订阅推送都可以使用企业微信群机器人。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'NOTIFY_WECOM_WEBHOOK',
+    label: '企业微信机器人 Webhook',
+    group: '通知渠道',
+    description:
+      '形如 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx；后台告警使用。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
+    key: 'NOTIFY_FEISHU_ENABLED',
+    label: '启用飞书渠道',
+    group: '通知渠道',
+    description: '未单独填写时，后台飞书告警沿用上方「飞书机器人 Webhook」。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'NOTIFY_FEISHU_WEBHOOK',
+    label: '飞书机器人 Webhook（通知推送）',
+    group: '通知渠道',
+    description:
+      '留空则沿用「告警」分组里的 Feishu Webhook；填写后优先使用这里。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
+    key: 'NOTIFY_FEISHU_SECRET',
+    label: '飞书签名密钥（通知推送）',
+    group: '通知渠道',
+    description:
+      '机器人开启签名校验时填写；留空则沿用告警分组的签名密钥。',
+    type: 'password',
+    secret: true,
+  },
+  {
+    key: 'NOTIFY_DINGTALK_ENABLED',
+    label: '启用钉钉渠道',
+    group: '通知渠道',
+    description: '钉钉群自定义机器人，支持加签。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'NOTIFY_DINGTALK_WEBHOOK',
+    label: '钉钉机器人 Webhook',
+    group: '通知渠道',
+    description:
+      '形如 https://oapi.dingtalk.com/robot/send?access_token=xxx；后台告警使用。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
+    key: 'NOTIFY_DINGTALK_SECRET',
+    label: '钉钉加签密钥',
+    group: '通知渠道',
+    description: '机器人安全设置选择「加签」时填写，否则留空。',
+    type: 'password',
+    secret: true,
+  },
+  {
+    key: 'NOTIFY_BARK_ENABLED',
+    label: '启用 Bark 渠道',
+    group: '通知渠道',
+    description: 'Bark iOS 推送服务，填设备 Key 或完整 https 地址。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'NOTIFY_BARK_KEY',
+    label: 'Bark 设备 Key',
+    group: '通知渠道',
+    description:
+      '例如 abcdefg123；也可填写 https://api.day.app/abcdefg123。后台告警使用。',
+    type: 'password',
+    secret: true,
   },
   {
     key: 'BACKUP_ENABLED',
@@ -1033,9 +1276,104 @@ export function getSiteSettings(): SiteSettings {
   };
 }
 
+/** 站点公开地址，用于生成推送里的详情页链接；未配置时返回空串。 */
+export function getSiteUrl(): string {
+  const raw = getRuntimeEnv('SITE_URL', '').trim();
+  return raw ? raw.replace(/\/+$/, '') : '';
+}
+
+/** 是否开放自助注册，默认开放。 */
+export function getRegistrationOpen(): boolean {
+  return getRuntimeBool('REGISTRATION_OPEN', true);
+}
+
+export function getRegistrationInviteCode(): string {
+  return getRuntimeEnv('REGISTRATION_INVITE_CODE', '').trim();
+}
+
+/** 是否强制使用邀请码注册。 */
+export function getRegistrationInviteRequired(): boolean {
+  return getRuntimeBool('REGISTRATION_INVITE_REQUIRED', false);
+}
+
+/** AI 搜索每日次数；0 表示不限制。 */
+export function getAiSearchDailyLimit(): number {
+  const raw = getRuntimeEnvRaw('AI_SEARCH_DAILY_LIMIT');
+  if (raw === null || raw.trim() === '') return 50;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return 50;
+  return Math.min(Math.round(value), 1000);
+}
+
+export interface AccountLimitsConfig {
+  subscriptions: number;
+  channelsPerKind: number;
+  dailyPush: number;
+}
+
+export function getAccountLimits(): AccountLimitsConfig {
+  return {
+    subscriptions: getRuntimeEnvNumber('ACCOUNT_MAX_SUBSCRIPTIONS', 20, 1, 200),
+    channelsPerKind: getRuntimeEnvNumber(
+      'ACCOUNT_MAX_CHANNELS_PER_KIND',
+      2,
+      1,
+      10,
+    ),
+    dailyPush: getRuntimeEnvNumber('ACCOUNT_DAILY_PUSH_LIMIT', 20, 1, 500),
+  };
+}
+
+export type NotifyKind = 'wecom' | 'feishu' | 'dingtalk' | 'bark';
+
+export interface NotifyConfig {
+  enabled: boolean;
+  webhook: string;
+  secret: string;
+  key: string;
+}
+
+/** 后台告警/测试使用的渠道配置；飞书兼容旧告警配置。 */
+export function getNotifyConfig(kind: NotifyKind): NotifyConfig {
+  if (kind === 'wecom') {
+    return {
+      enabled: getRuntimeBool('NOTIFY_WECOM_ENABLED', true),
+      webhook: getRuntimeEnv('NOTIFY_WECOM_WEBHOOK').trim(),
+      secret: '',
+      key: '',
+    };
+  }
+  if (kind === 'feishu') {
+    return {
+      enabled: getRuntimeBool('NOTIFY_FEISHU_ENABLED', true),
+      webhook:
+        getRuntimeEnv('NOTIFY_FEISHU_WEBHOOK').trim() ||
+        getRuntimeEnv('FEISHU_WEBHOOK_URL').trim(),
+      secret:
+        getRuntimeEnv('NOTIFY_FEISHU_SECRET').trim() ||
+        getRuntimeEnv('FEISHU_WEBHOOK_SECRET').trim(),
+      key: '',
+    };
+  }
+  if (kind === 'dingtalk') {
+    return {
+      enabled: getRuntimeBool('NOTIFY_DINGTALK_ENABLED', true),
+      webhook: getRuntimeEnv('NOTIFY_DINGTALK_WEBHOOK').trim(),
+      secret: getRuntimeEnv('NOTIFY_DINGTALK_SECRET').trim(),
+      key: '',
+    };
+  }
+  return {
+    enabled: getRuntimeBool('NOTIFY_BARK_ENABLED', true),
+    webhook: '',
+    secret: '',
+    key: getRuntimeEnv('NOTIFY_BARK_KEY').trim(),
+  };
+}
+
 /** 后台展示用的运行时配置列表；密钥类字段不回传明文。 */
 export function getRuntimeAdminFields(): RuntimeSettingView[] {
-  return FIELDS.map((def) => {
+  return FIELDS.filter((def) => !def.hidden).map((def) => {
     const raw = getRuntimeEnvRaw(def.key);
     const configured = raw !== null && raw.trim() !== '';
 
@@ -1108,9 +1446,13 @@ export function saveRuntimeSettings(
     }
 
     if (
-      (def.key === 'LLM_BASE_URL' ||
+      (def.key === 'SITE_URL' ||
+        def.key === 'LLM_BASE_URL' ||
         def.key === 'OUTBOUND_PROXY' ||
-        def.key === 'FEISHU_WEBHOOK_URL') &&
+        def.key === 'FEISHU_WEBHOOK_URL' ||
+        def.key === 'NOTIFY_WECOM_WEBHOOK' ||
+        def.key === 'NOTIFY_FEISHU_WEBHOOK' ||
+        def.key === 'NOTIFY_DINGTALK_WEBHOOK') &&
       value !== ''
     ) {
       try {
@@ -1121,6 +1463,13 @@ export function saveRuntimeSettings(
       } catch {
         return `${def.label}格式不正确`;
       }
+    }
+
+    if (
+      (def.key === 'DIGEST_OVERFLOW_TIME' || def.key === 'DIGEST_SITE_TIME') &&
+      !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)
+    ) {
+      return `${def.label}格式应为 HH:mm`;
     }
 
     let normalized = value;

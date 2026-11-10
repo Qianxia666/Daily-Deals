@@ -5,6 +5,7 @@ import {
   pruneDeals,
   resetNewFlags,
   saveFetchRun,
+  skipStalePendingDeliveries,
   upsertDeals,
   type SourceRunStatus,
   type StoredSource,
@@ -13,7 +14,12 @@ import { fetchSource } from './fetchers';
 import { describeFetchError } from './http';
 import { enrichPendingDeals } from './llm';
 import { runBackupIfDue } from './backup';
-import { sendFeishuAlert } from './alerts';
+import { sendAdminAlert } from './alerts';
+import {
+  deliverPending,
+  deliverPendingDigests,
+  runScheduledDigests,
+} from './delivery';
 import {
   getGlobalIntervalMinutes,
   getRuntimeEnvNumber,
@@ -129,7 +135,7 @@ export async function runFetchRound(sourceIds?: string[]): Promise<void> {
 
       if (failures === threshold) {
         const source = targets.find((item) => item.id === status.source);
-        void sendFeishuAlert(`source:${status.source}`, '【来源抓取失败】', [
+        void sendAdminAlert(`source:${status.source}`, '【来源抓取失败】', [
           `来源：${source?.name ?? status.source}`,
           `连续失败：${failures} 轮`,
           `错误：${status.error ?? '未知错误'}`,
@@ -191,6 +197,20 @@ export function startScheduler(): void {
 
   setTimeout(tick, 2_500);
   setInterval(tick, 60_000);
+
+  // 每 60 秒处理一次订阅推送、每日摘要与跨天清理。
+  const deliveryTick = async () => {
+    skipStalePendingDeliveries();
+    await runScheduledDigests();
+    await deliverPending();
+    await deliverPendingDigests();
+  };
+  setTimeout(() => {
+    void deliveryTick();
+  }, 6_000);
+  setInterval(() => {
+    void deliveryTick();
+  }, 60_000);
 
   // 每 5 分钟补一次 AI 摘要，覆盖上次进程中断或新入库的条目。
   setInterval(() => {

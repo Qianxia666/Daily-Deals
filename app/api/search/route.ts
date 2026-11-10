@@ -1,5 +1,4 @@
 import { NextResponse, type NextRequest } from 'next/server';
-import { CATEGORY_LABELS } from '@/lib/constants';
 import {
   getAiSearchEnabled,
   getDataRetentionDays,
@@ -10,7 +9,9 @@ import {
   listFormalTagCounts,
   searchDealsForQuery,
   searchDealsForTag,
+  consumeAiQuota,
 } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
 import {
   getAiSearchCoarseStrategy,
   getAiSearchDays,
@@ -27,6 +28,7 @@ import {
   getAiSearchScope,
   getAiSearchSynonymEnabled,
   getAiSearchUseSummary,
+  getAiSearchDailyLimit,
   getKeywordSearchDays,
   getKeywordSearchMaxResults,
   getRuntimeBool,
@@ -42,7 +44,7 @@ import {
 } from '@/lib/llm';
 import type { SearchCandidate, SearchScopeOptions } from '@/lib/search-index';
 import { buildFtsQuery } from '@/lib/search-text';
-import type { Category, DealItem, TagSuggestion } from '@/lib/types';
+import type { DealItem, TagSuggestion } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -152,7 +154,6 @@ function keywordMatches(
               item.aiSummary ?? '',
               item.description,
               item.sourceName,
-              CATEGORY_LABELS[item.category],
             ].join(' ')
       ).toLowerCase();
 
@@ -225,8 +226,6 @@ function candidateToSearchDeal(
     summary: useSummary
       ? row.aiSummary ?? row.description.slice(0, 120)
       : '',
-    category:
-      CATEGORY_LABELS[row.category as Category] ?? row.category,
     source: row.sourceName,
     expiresAt: row.expiresAt,
   };
@@ -242,7 +241,6 @@ function dealToSearchDeal(
     summary: useSummary
       ? item.aiSummary ?? item.description.slice(0, 120)
       : '',
-    category: CATEGORY_LABELS[item.category] ?? item.category,
     source: item.sourceName,
     expiresAt: item.expiresAt,
   };
@@ -503,6 +501,34 @@ export async function POST(request: NextRequest) {
       `标签「${selectedTag}」下暂时没有在架优惠`,
       windowDays,
     );
+  }
+
+  // AI 搜索仅对登录用户开放，并按日扣减配额；关键词搜索无需登录。
+  if (mode === 'ai') {
+    const user = await getCurrentUser();
+    if (!user) {
+      return NextResponse.json(
+        {
+          error: '登录后即可使用 AI 搜索',
+          code: 'AI_REQUIRES_LOGIN',
+        },
+        { status: 401, headers: { 'Cache-Control': 'no-store' } },
+      );
+    }
+
+    const quota = consumeAiQuota(user.id, getAiSearchDailyLimit());
+    if (!quota.ok) {
+      return NextResponse.json(
+        {
+          error:
+            quota.quota.limit > 0
+              ? `今日 AI 搜索次数已用完（每天 ${quota.quota.limit} 次），明天再来或改用普通搜索`
+              : '今日 AI 搜索次数已用完',
+          code: 'AI_QUOTA_EXCEEDED',
+        },
+        { status: 429, headers: { 'Cache-Control': 'no-store' } },
+      );
+    }
   }
 
   let candidates: SearchCandidate[] | null = null;

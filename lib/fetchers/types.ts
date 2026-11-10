@@ -1,4 +1,4 @@
-import type { Category, SourceId } from '../types';
+import type { SourceId } from '../types';
 
 export interface RawDeal {
   title: string;
@@ -6,6 +6,5 @@ export interface RawDeal {
   description: string;
   publishedAt: string | null;
   expiresAt: string | null;
-  category: Category;
   source: SourceId;
 }

@@ -128,8 +128,6 @@ export async function fetchEpicGames(
       expiresAt: offer.endDate
         ? new Date(offer.endDate).toISOString()
         : null,
-      // Epic 来源无论标题是否含关键词，一律归入「游戏」。
-      category: 'game',
       source: sourceId,
     });
   }

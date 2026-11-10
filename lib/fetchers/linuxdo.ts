@@ -1,4 +1,3 @@
-import { categorizeTitle } from '../categorize';
 import { describeFetchError, fetchText } from '../http';
 import { normalizeDate, parseRssFeed } from '../rss';
 import { getRuntimeEnv } from '../runtime-settings';
@@ -87,7 +86,6 @@ function toDeals(entries: FeedEntry[], sourceId: string): RawDeal[] {
       description: entry.description,
       publishedAt: entry.publishedAt,
       expiresAt: null,
-      category: categorizeTitle(entry.title),
       source: sourceId,
     });
   }

@@ -1,4 +1,3 @@
-import { categorizeTitle } from '../categorize';
 import { fetchText } from '../http';
 import { decodeEntities, stripHtml } from '../rss';
 import { SOURCE_TIMEOUT_MS } from '../sources';
@@ -112,7 +111,6 @@ export async function fetchXianbao(
     description: '',
     publishedAt: entry.publishedAt,
     expiresAt: null,
-    category: categorizeTitle(entry.title),
     source: sourceId,
   }));
 }

@@ -4,7 +4,7 @@ import type { SearchIndexStatus, TagSuggestion } from './types';
 
 type Db = Database.Database;
 
-export const SEARCH_INDEX_VERSION = '5';
+export const SEARCH_INDEX_VERSION = '6';
 
 export interface SearchRebuildProgress {
   running: boolean;
@@ -53,7 +53,6 @@ export interface SearchCandidate {
   description: string;
   source: string;
   sourceName: string;
-  category: string;
   expiresAt: string | null;
   publishedAt: string | null;
   firstSeenAt: string;
@@ -129,7 +128,7 @@ function insertRow(
     maxChars,
   );
   const summary = buildSearchIndexText(
-    [row.ai_summary, row.ai_value, row.ai_action].filter(Boolean).join(' '),
+    [row.ai_summary].filter(Boolean).join(' '),
     maxChars,
   );
   const tags = buildSearchIndexText(readTags(row.tags).join(' '), maxChars);
@@ -521,7 +520,6 @@ const CANDIDATE_COLUMNS = `
   d.description,
   d.source,
   COALESCE(s.name, d.source) AS source_name,
-  d.category,
   d.expires_at,
   d.published_at,
   d.first_seen_at
@@ -535,7 +533,6 @@ interface RawSearchRow {
   description: string | null;
   source: string;
   source_name: string | null;
-  category: string;
   expires_at: string | null;
   published_at: string | null;
   first_seen_at: string;
@@ -551,7 +548,6 @@ function mapSearchRow(row: RawSearchRow): SearchCandidate {
     description: row.description ?? '',
     source: row.source,
     sourceName: row.source_name ?? row.source,
-    category: row.category,
     expiresAt: row.expires_at,
     publishedAt: row.published_at,
     firstSeenAt: row.first_seen_at,

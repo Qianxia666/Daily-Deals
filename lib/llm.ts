@@ -8,6 +8,7 @@ import {
   type AiTagPendingDeal,
 } from './db';
 import { request } from './http';
+import { matchSubscriptionsForDeal } from './delivery';
 import {
   getAiTagsBrandExtractEnabled,
   getAiTagsEnabled,
@@ -37,22 +38,22 @@ function buildSummaryPrompt(options: TagOptions): string {
 
   const tagRule =
     vocabulary.length > 0
-      ? `10. tags 是 1–2 个品类标签，只能从下列词表中选，不能自造：${vocabulary.join(
+      ? `8. tags 是 1–2 个品类标签，只能从下列词表中选，不能自造：${vocabulary.join(
           '、',
         )}。标签用于「搜奶茶能找到蜜雪冰城」这类品类检索，与原文是否出现该词无关。`
-      : '10. tags 返回空数组 []。';
+      : '8. tags 返回空数组 []。';
 
   const proposeRule =
     proposeEnabled && proposeMax > 0
-      ? `11. proposedTags 是 0–${proposeMax} 个词表中没有的新品类词，仅当词表都不合适时才提出。要求 2–8 个汉字，必须是品类而非品牌名，不能与 tags 重复；没有合适的新词时返回 []。`
-      : '11. proposedTags 返回空数组 []。';
+      ? `9. proposedTags 是 0–${proposeMax} 个词表中没有的新品类词，仅当词表都不合适时才提出。要求 2–8 个汉字，必须是品类而非品牌名，不能与 tags 重复；没有合适的新词时返回 []。`
+      : '9. proposedTags 返回空数组 []。';
 
   const entityRule = brandExtractEnabled
-    ? '12. brands 和 products 从该项的 title、description 原文中抽取品牌名与产品名，必须逐字出现在原文中，不得推测；没有则返回 []。'
-    : '12. brands 和 products 返回空数组 []。';
+    ? '10. brands 和 products 从该项的 title、description 原文中抽取品牌名与产品名，必须逐字出现在原文中，不得推测；没有则返回 []。'
+    : '10. brands 和 products 返回空数组 []。';
 
   const format =
-    '{"items":[{"id":1,"title":"","summary":"","value":"","action":"","tags":[],"proposedTags":[],"brands":[],"products":[]}]}';
+    '{"items":[{"id":1,"title":"","summary":"","tags":[],"proposedTags":[],"brands":[],"products":[]}]}';
 
   return `你是中文优惠信息编辑。用户会给出 items 数组，每项包含 id、title、description，部分条目可能还有 context。请逐条改写成更简洁、更好读的标题和摘要，帮助读者快速判断是否值得参与。
 
@@ -63,13 +64,11 @@ function buildSummaryPrompt(options: TagOptions): string {
 4. 如果某项的某个字段在原文中找不到依据，该字段返回空字符串 ""。
 5. title 不超过 28 个汉字，是对原标题的简洁改写，保留核心对象和优惠动作；不要加"必看""震惊"等标题党用语，不要带来源名。
 6. summary 不超过 60 个汉字，一句话说清"是什么优惠、力度多大"。
-7. value 不超过 20 个字，例如"返现150元""立减20元""5折"；没有明确力度则返回 ""。
-8. action 不超过 30 个字，说清"需要做什么"；没有明确步骤则返回 ""。
-9. Epic 免费游戏是限时免费，value 必须写"限时免费"，严禁写成"永久免费"。
+7. Epic 免费游戏是限时免费，标题或摘要必须体现"限时"，严禁写成"永久免费"。
 ${tagRule}
 ${proposeRule}
 ${entityRule}
-13. 不要输出 Markdown，不要输出解释，只输出 JSON 对象。
+11. 不要输出 Markdown，不要输出解释，只输出 JSON 对象。
 
 输出格式：
 ${format}`;
@@ -91,8 +90,6 @@ interface AiConfig {
 interface AiResult {
   title: string;
   summary: string;
-  value: string;
-  action: string;
   tags: string[];
   proposedTags: string[];
   entities: string[];
@@ -233,15 +230,11 @@ function normalizeResult(
   if (!summary) return null;
 
   let title = cleanText(raw.title, 56);
-  let value = cleanText(raw.value, 40);
-  let action = cleanText(raw.action, 60);
 
   // Epic 免费游戏是限时免费，纠正模型可能给出的"永久免费"。
   if (deal.source === 'epic') {
     title = title.replace(/永久|终身/g, '限时');
     summary = summary.replace(/永久|终身/g, '限时');
-    value = value.replace(/永久|终身/g, '限时');
-    action = action.replace(/永久|终身/g, '限时');
   }
 
   const sourceText = `${deal.title} ${deal.description}${
@@ -257,11 +250,9 @@ function normalizeResult(
     numbersAreGrounded(deal, text) &&
     !unsupported(text);
 
-  // 摘要必须可靠；标题、力度、操作是可选字段，不合格时留空并回退原文。
+  // 摘要必须可靠；标题是可选字段，不合格时留空并回退原文。
   if (!valid(summary)) return null;
   if (title && !valid(title)) title = '';
-  if (value && !valid(value)) value = '';
-  if (action && !valid(action)) action = '';
 
   const entities = options.brandExtractEnabled
     ? normalizeEntities(
@@ -277,8 +268,6 @@ function normalizeResult(
   return {
     title,
     summary,
-    value,
-    action,
     tags: normalizeTags(raw.tags, options.vocabulary),
     proposedTags: normalizeProposedTags(
       raw.proposedTags,
@@ -524,6 +513,7 @@ export async function enrichPendingDeals(): Promise<void> {
           continue;
         }
         saveAiEnrichment(deal.id, result, config.model);
+        matchSubscriptionsForDeal(deal.id);
         done += 1;
       }
 
@@ -543,7 +533,7 @@ export async function enrichPendingDeals(): Promise<void> {
   }
 }
 
-const TAG_SYSTEM_PROMPT = `你是中文优惠信息分类器。用户会给出 items 数组，每项包含 id、title、summary、category、description。请为每条优惠输出品类标签、可选的新品类词，以及可抽取的品牌与产品。
+const TAG_SYSTEM_PROMPT = `你是中文优惠信息分类器。用户会给出 items 数组，每项包含 id、title、summary、description。请为每条优惠输出品类标签、可选的新品类词，以及可抽取的品牌与产品。
 
 硬性规则：
 1. tags：1–2 个品类标签，只能选择词表中给出的标签，不得自造、不得改写；确实无法归类时选择"其他"。
@@ -625,7 +615,6 @@ async function callTagModelBatch(
     id: deal.id,
     title: deal.title,
     summary: deal.summary.slice(0, 160),
-    category: deal.category,
     description: deal.description.slice(0, 500),
   }));
 
@@ -784,6 +773,7 @@ export function startTagBackfill(force = false): TagRunProgress {
               result.proposedTags,
               result.entities,
             );
+            matchSubscriptionsForDeal(deal.id);
             batchTagged += 1;
           } else {
             batchFailed += 1;
@@ -830,7 +820,6 @@ export interface AiSearchDeal {
   id: number;
   title: string;
   summary?: string;
-  category?: string;
   source?: string;
   expiresAt?: string | null;
 }
@@ -841,7 +830,7 @@ export interface AiSearchSelection {
 }
 
 function buildSearchPrompt(limit: number): string {
-  return `你是中文优惠信息检索助手。用户会给出搜索需求，下面是从全文索引召回的真实条目，每项包含 id、标题、摘要、分类、来源和到期时间。请结合标题与摘要判断相关度，并按相关度排序。
+  return `你是中文优惠信息检索助手。用户会给出搜索需求，下面是从全文索引召回的真实条目，每项包含 id、标题、摘要、来源和到期时间。请结合标题与摘要判断相关度，并按相关度排序。
 
 硬性规则：
 1. 只能使用列表中出现的信息，不要假设列表之外的内容。
@@ -905,7 +894,6 @@ async function callSearchModel(
     id: deal.id,
     title: deal.title.slice(0, 90),
     summary: (deal.summary ?? '').slice(0, 120),
-    category: deal.category ?? '',
     source: deal.source ?? '',
     expiresAt: deal.expiresAt ?? null,
   }));

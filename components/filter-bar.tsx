@@ -2,15 +2,11 @@ import {
   Bookmark,
   LoaderCircle,
   Search,
+  Settings2,
   Sparkles,
   X,
 } from 'lucide-react';
-import { CATEGORY_FILTERS } from '@/lib/constants';
-import type {
-  CategoryFilter,
-  SourceId,
-  SourceStatus,
-} from '@/lib/types';
+import type { SourceId, SourceStatus } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -26,17 +22,18 @@ interface FilterBarProps {
   searching: boolean;
   searchError: string | null;
   mode: SearchMode;
-  onModeChange: (mode: SearchMode) => void;
-  aiSearchEnabled: boolean;
-  aiWindowDays: number;
-  keywordWindowDays: number;
+  placeholderTag: string;
   sources: SourceStatus[];
   totalActive: number;
   selectedSources: Set<SourceId>;
   onToggleSource: (source: SourceId) => void;
   onClearSources: () => void;
-  category: CategoryFilter;
-  onCategoryChange: (category: CategoryFilter) => void;
+  favoritesOnly: boolean;
+  favoriteCount: number;
+  onToggleFavorites: () => void;
+  preferencesOnly: boolean;
+  onTogglePreferences: () => void;
+  onEditPreferences: () => void;
   hasFilters: boolean;
   onClearFilters: () => void;
 }
@@ -76,17 +73,18 @@ export function FilterBar({
   searching,
   searchError,
   mode,
-  onModeChange,
-  aiSearchEnabled,
-  aiWindowDays,
-  keywordWindowDays,
+  placeholderTag,
   sources,
   totalActive,
   selectedSources,
   onToggleSource,
   onClearSources,
-  category,
-  onCategoryChange,
+  favoritesOnly,
+  favoriteCount,
+  onToggleFavorites,
+  preferencesOnly,
+  onTogglePreferences,
+  onEditPreferences,
   hasFilters,
   onClearFilters,
 }: FilterBarProps) {
@@ -95,52 +93,6 @@ export function FilterBar({
       aria-label="搜索与筛选"
       className="rounded-2xl border border-line bg-white p-3.5 shadow-sm sm:p-4"
     >
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <div
-          role="group"
-          aria-label="搜索模式"
-          className="inline-flex rounded-xl border border-line bg-slate-50 p-0.5"
-        >
-          <button
-            type="button"
-            aria-pressed={mode === 'ai'}
-            disabled={!aiSearchEnabled}
-            title={aiSearchEnabled ? '由 AI 筛选并排序' : '管理员已关闭 AI 搜索'}
-            onClick={() => onModeChange('ai')}
-            className={cn(
-              'inline-flex h-11 cursor-pointer items-center gap-1.5 rounded-[10px] px-3 text-xs font-medium transition-colors duration-200 md:h-9',
-              mode === 'ai'
-                ? 'bg-white text-ink shadow-sm'
-                : 'text-slate-500 hover:text-slate-700',
-              !aiSearchEnabled &&
-                'cursor-not-allowed text-slate-400 hover:text-slate-400',
-            )}
-          >
-            <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-            AI 搜索
-          </button>
-          <button
-            type="button"
-            aria-pressed={mode === 'keyword'}
-            onClick={() => onModeChange('keyword')}
-            className={cn(
-              'inline-flex h-11 cursor-pointer items-center gap-1.5 rounded-[10px] px-3 text-xs font-medium transition-colors duration-200 md:h-9',
-              mode === 'keyword'
-                ? 'bg-white text-ink shadow-sm'
-                : 'text-slate-500 hover:text-slate-700',
-            )}
-          >
-            <Search className="h-3.5 w-3.5" aria-hidden="true" />
-            普通搜索
-          </button>
-        </div>
-        <span className="text-[11px] text-slate-500">
-          {mode === 'ai'
-            ? `最近 ${aiWindowDays} 天`
-            : `最近 ${keywordWindowDays} 天`}
-        </span>
-      </div>
-
       <form
         onSubmit={(event) => {
           event.preventDefault();
@@ -168,7 +120,7 @@ export function FilterBar({
             onChange={(event) => onQueryChange(event.target.value)}
             placeholder={
               mode === 'ai'
-                ? 'AI 搜索：免费云服务器、视频会员、游戏…'
+                ? `AI 搜索：${placeholderTag || '免费云服务器、视频会员、游戏…'}`
                 : '搜索标题、摘要或来源…'
             }
             aria-label={mode === 'ai' ? 'AI 搜索优惠' : '普通搜索优惠'}
@@ -207,13 +159,6 @@ export function FilterBar({
         </Button>
       </form>
 
-      <p className="mt-1.5 text-[11px] leading-relaxed text-slate-500">
-        {!aiSearchEnabled
-          ? `管理员已关闭 AI 搜索，普通搜索匹配最近 ${keywordWindowDays} 天的标题与摘要。`
-          : mode === 'ai'
-            ? `AI 只根据标题筛选最近 ${aiWindowDays} 天的优惠，只返回真实存在的条目。`
-            : `普通搜索匹配最近 ${keywordWindowDays} 天的标题、摘要与描述。`}
-      </p>
       {searchError && (
         <p className="mt-1.5 text-[11px] text-red-600">{searchError}</p>
       )}
@@ -233,6 +178,39 @@ export function FilterBar({
             {totalActive}
           </span>
         </Chip>
+        <Chip active={preferencesOnly} onClick={onTogglePreferences}>
+          <Sparkles
+            className={cn('h-3.5 w-3.5', preferencesOnly && 'fill-current')}
+            aria-hidden="true"
+          />
+          猜你喜欢
+        </Chip>
+        {preferencesOnly && (
+          <button
+            type="button"
+            aria-label="调整兴趣偏好"
+            title="调整兴趣偏好"
+            onClick={onEditPreferences}
+            className="flex h-11 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full border border-line bg-white text-slate-500 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+          >
+            <Settings2 className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        )}
+        <Chip active={favoritesOnly} onClick={onToggleFavorites}>
+          <Bookmark
+            className={cn('h-3.5 w-3.5', favoritesOnly && 'fill-current')}
+            aria-hidden="true"
+          />
+          我的收藏
+          <span
+            className={cn(
+              'tabular-nums',
+              favoritesOnly ? 'text-white/70' : 'text-slate-500',
+            )}
+          >
+            {favoriteCount}
+          </span>
+        </Chip>
         {sources.map((source) => {
           const active = selectedSources.has(source.id);
           return (
@@ -250,27 +228,6 @@ export function FilterBar({
               >
                 {source.count}
               </span>
-            </Chip>
-          );
-        })}
-      </div>
-
-      <div className="no-scrollbar -mx-1 mt-2 flex gap-2 overflow-x-auto px-1 pb-0.5 md:mx-0 md:flex-wrap md:overflow-visible md:px-0">
-        {CATEGORY_FILTERS.map((filter) => {
-          const active = category === filter.value;
-          return (
-            <Chip
-              key={filter.value}
-              active={active}
-              onClick={() => onCategoryChange(filter.value)}
-            >
-              {filter.value === 'favorites' && (
-                <Bookmark
-                  className={cn('h-3.5 w-3.5', active && 'fill-current')}
-                  aria-hidden="true"
-                />
-              )}
-              {filter.label}
             </Chip>
           );
         })}

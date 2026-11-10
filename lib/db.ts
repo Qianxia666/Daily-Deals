@@ -1,21 +1,32 @@
 import Database from 'better-sqlite3';
+import { randomBytes, randomInt } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { BUILTIN_SOURCES } from './sources';
 import type { RawDeal } from './fetchers/types';
 import type {
+  AccountUser,
   AdminBaseData,
   AdminSource,
+  AdminUser,
+  AdminUserDetail,
+  AiQuota,
   Announcement,
-  Category,
+  ChannelKind,
   DealItem,
   DealsResponse,
+  DeliveryRecord,
+  DigestItem,
+  InviteCode,
+  PublicDigest,
   SearchIndexStatus,
   SourceKind,
   SourceStatus,
   TagCandidate,
   TagStatus,
   TagSuggestion,
+  UserChannel,
+  UserSubscription,
 } from './types';
 import {
   buildScopeWhere,
@@ -42,7 +53,6 @@ CREATE TABLE IF NOT EXISTS deals (
   title TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL,
-  category TEXT NOT NULL,
   expires_at TEXT,
   published_at TEXT,
   is_new INTEGER NOT NULL DEFAULT 0,
@@ -113,6 +123,115 @@ CREATE TABLE IF NOT EXISTS tag_candidates (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  password_hash TEXT NOT NULL,
+  password_salt TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_login_at TEXT,
+  disabled INTEGER NOT NULL DEFAULT 0,
+  ai_quota_date TEXT,
+  ai_quota_used INTEGER NOT NULL DEFAULT 0,
+  invite_code TEXT
+);
+
+CREATE TABLE IF NOT EXISTS invite_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  max_uses INTEGER NOT NULL DEFAULT 1,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT,
+  disabled INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invite_codes_created ON invite_codes(created_at);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  webhook TEXT NOT NULL DEFAULT '',
+  secret TEXT NOT NULL DEFAULT '',
+  channel_key TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  keyword TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_user_keyword
+  ON subscriptions(user_id, keyword COLLATE NOCASE);
+
+CREATE TABLE IF NOT EXISTS deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  subscription_id INTEGER NOT NULL,
+  channel_id INTEGER NOT NULL,
+  deal_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  sent_at TEXT,
+  UNIQUE(subscription_id, channel_id, deal_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status, id);
+CREATE INDEX IF NOT EXISTS idx_deliveries_user ON deliveries(user_id, id);
+
+CREATE TABLE IF NOT EXISTS daily_digests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  channel_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  digest_date TEXT NOT NULL,
+  token TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL DEFAULT '',
+  lines TEXT NOT NULL DEFAULT '[]',
+  items TEXT NOT NULL DEFAULT '[]',
+  item_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  sent_at TEXT,
+  UNIQUE(user_id, channel_id, kind, digest_date),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_digests_status ON daily_digests(status, id);
+CREATE INDEX IF NOT EXISTS idx_digests_date ON daily_digests(digest_date);
+
+CREATE TABLE IF NOT EXISTS public_digests (
+  digest_date TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  stats TEXT NOT NULL DEFAULT '[]',
+  tags TEXT NOT NULL DEFAULT '[]',
+  groups TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 interface DealRow {
@@ -121,7 +240,6 @@ interface DealRow {
   title: string;
   description: string;
   source: string;
-  category: string;
   expires_at: string | null;
   published_at: string | null;
   is_new: number;
@@ -137,7 +255,6 @@ interface DealRow {
   tags: string | null;
   proposed_tags: string | null;
   entities: string | null;
-  claimed: number;
   favorite: number;
 }
 
@@ -162,14 +279,11 @@ export interface AiPendingDeal {
   title: string;
   description: string;
   source: string;
-  category: Category;
 }
 
 export interface AiEnrichment {
   title: string;
   summary: string;
-  value: string;
-  action: string;
   tags: string[];
   proposedTags: string[];
   entities: string[];
@@ -181,7 +295,6 @@ export interface AiTagPendingDeal {
   description: string;
   summary: string;
   source: string;
-  category: Category;
 }
 
 interface StatusRow {
@@ -318,6 +431,22 @@ function migrate(db: Database.Database): void {
     if (!existing.has(name)) {
       db.exec(`ALTER TABLE deals ADD COLUMN ${name} ${type}`);
     }
+  }
+
+  // 旧库的 category 字段已被标签体系取代，直接移除。
+  if (existing.has('category')) {
+    try {
+      db.exec('ALTER TABLE deals DROP COLUMN category');
+    } catch (error) {
+      console.warn('[db] 移除 category 字段失败，已忽略', error);
+    }
+  }
+
+  const userColumns = db.prepare('PRAGMA table_info(users)').all() as {
+    name: string;
+  }[];
+  if (!userColumns.some((column) => column.name === 'invite_code')) {
+    db.exec('ALTER TABLE users ADD COLUMN invite_code TEXT');
   }
 }
 
@@ -485,7 +614,7 @@ export function upsertDeals(deals: RawDeal[]): number {
   const searchMaxChars = readSearchIndexMaxChars(db);
 
   const findExisting = db.prepare(
-    `SELECT id, title, description, ai_title, ai_summary, ai_value, ai_action,
+    `SELECT id, title, description, ai_title, ai_summary,
             ai_model, ai_at, ai_tags_at, tags, proposed_tags, entities
      FROM deals WHERE link = ?`,
   );
@@ -493,14 +622,11 @@ export function upsertDeals(deals: RawDeal[]): number {
     UPDATE deals
     SET title = ?,
         description = ?,
-        category = ?,
         expires_at = COALESCE(?, expires_at),
         published_at = COALESCE(?, published_at),
         last_seen_at = ?,
         ai_title = ?,
         ai_summary = ?,
-        ai_value = ?,
-        ai_action = ?,
         ai_model = ?,
         ai_at = ?,
         tags = ?,
@@ -511,9 +637,9 @@ export function upsertDeals(deals: RawDeal[]): number {
   `);
   const insertDeal = db.prepare(`
     INSERT INTO deals (
-      link, title, description, source, category,
+      link, title, description, source,
       expires_at, published_at, is_new, first_seen_at, last_seen_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
     ON CONFLICT(link) DO NOTHING
   `);
 
@@ -534,14 +660,11 @@ export function upsertDeals(deals: RawDeal[]): number {
         updateExisting.run(
           item.title,
           nextDescription,
-          item.category,
           item.expiresAt,
           item.publishedAt,
           now,
           contentChanged ? null : existing.ai_title,
           contentChanged ? null : existing.ai_summary,
-          contentChanged ? null : existing.ai_value,
-          contentChanged ? null : existing.ai_action,
           contentChanged ? null : existing.ai_model,
           contentChanged ? null : existing.ai_at,
           contentChanged ? '[]' : existing.tags ?? '[]',
@@ -559,7 +682,6 @@ export function upsertDeals(deals: RawDeal[]): number {
         item.title,
         item.description,
         item.source,
-        item.category,
         item.expiresAt,
         item.publishedAt,
         now,
@@ -768,17 +890,13 @@ function mapDealRow(
     description: row.description,
     source: row.source,
     sourceName: nameMap.get(row.source) ?? row.source,
-    category: row.category as Category,
     expiresAt: row.expires_at,
     publishedAt: row.published_at,
     firstSeenAt: row.first_seen_at,
     isNew: row.is_new === 1,
-    claimed: row.claimed === 1,
     favorite: row.favorite === 1,
     aiTitle: row.ai_title,
     aiSummary: row.ai_summary,
-    aiValue: row.ai_value,
-    aiAction: row.ai_action,
     tags: parseStoredTags(row.tags),
   };
 }
@@ -813,13 +931,11 @@ export function getDealsSnapshot(): DealsSnapshot {
   const rows = db
     .prepare(
       `SELECT d.*,
-              0 AS claimed,
               0 AS favorite
        FROM deals d
        WHERE (d.expires_at IS NULL OR d.expires_at > ?)
          AND d.first_seen_at >= ?
-       ORDER BY d.is_new DESC,
-                COALESCE(d.published_at, d.first_seen_at) DESC,
+       ORDER BY COALESCE(d.published_at, d.first_seen_at) DESC,
                 d.id DESC`,
     )
     .all(now, retentionCutoff) as DealRow[];
@@ -864,9 +980,9 @@ export interface DealsListQuery {
   limit: number;
   cursor: string | null;
   sources: string[] | null;
-  category: Category | null;
   onlyNew: boolean;
   ids: number[] | null;
+  preferTags?: string[] | null;
 }
 
 export interface DealsListResult {
@@ -877,18 +993,13 @@ export interface DealsListResult {
 }
 
 interface DealCursor {
-  isNew: number;
   time: string;
   id: number;
 }
 
 function encodeDealCursor(item: DealItem): string {
   return Buffer.from(
-    JSON.stringify([
-      item.isNew ? 1 : 0,
-      item.publishedAt ?? item.firstSeenAt,
-      item.id,
-    ]),
+    JSON.stringify([item.publishedAt ?? item.firstSeenAt, item.id]),
   ).toString('base64url');
 }
 
@@ -897,17 +1008,15 @@ function decodeDealCursor(raw: string): DealCursor | null {
     const parsed = JSON.parse(
       Buffer.from(raw, 'base64url').toString('utf8'),
     ) as unknown;
-    if (!Array.isArray(parsed) || parsed.length !== 3) return null;
+    if (!Array.isArray(parsed)) return null;
 
-    const [isNew, time, id] = parsed;
-    if (
-      typeof isNew !== 'number' ||
-      typeof time !== 'string' ||
-      typeof id !== 'number'
-    ) {
-      return null;
-    }
-    return { isNew, time, id };
+    // 兼容旧版 [isNew, time, id] 游标，只取后两段。
+    const parts = parsed.length === 3 ? parsed.slice(1) : parsed;
+    if (parts.length !== 2) return null;
+
+    const [time, id] = parts;
+    if (typeof time !== 'string' || typeof id !== 'number') return null;
+    return { time, id };
   } catch {
     return null;
   }
@@ -986,6 +1095,43 @@ export function getDealsMeta(): Omit<DealsSnapshot, 'items'> {
   };
 }
 
+export interface PopularTag {
+  tag: string;
+  count: number;
+}
+
+/** 统计在架优惠的标签频次，用于「猜你喜欢」的品类选择。 */
+export function getPopularTags(limit = 500): PopularTag[] {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const retentionCutoff = new Date(
+    Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  const visible = listSources()
+    .filter((source) => !source.hidden)
+    .map((source) => source.id);
+  if (visible.length === 0) return [];
+
+  return db
+    .prepare(
+      `SELECT json_each.value AS tag, COUNT(*) AS count
+       FROM deals d, json_each(d.tags)
+       WHERE (d.expires_at IS NULL OR d.expires_at > ?)
+         AND d.first_seen_at >= ?
+         AND d.source IN (${visible.map(() => '?').join(', ')})
+         AND length(json_each.value) BETWEEN 2 AND 12
+       GROUP BY json_each.value
+       ORDER BY count DESC, tag ASC
+       LIMIT ?`,
+    )
+    .all(
+      now,
+      retentionCutoff,
+      ...visible,
+      Math.min(Math.max(limit, 1), 1000),
+    ) as PopularTag[];
+}
+
 /**
  * 按游标分页读取首页条目。
  * 排序与旧版一致：新条目优先，其次发布时间倒序，最后 id 倒序。
@@ -1024,11 +1170,16 @@ export function getDealsList(query: DealsListQuery): DealsListResult {
   ];
   const params: unknown[] = [now, retentionCutoff, ...allowed];
 
-  if (query.category) {
-    clauses.push('d.category = ?');
-    params.push(query.category);
-  }
   if (query.onlyNew) clauses.push('d.is_new = 1');
+  if (query.preferTags && query.preferTags.length > 0) {
+    clauses.push(
+      `EXISTS (
+        SELECT 1 FROM json_each(d.tags)
+        WHERE json_each.value IN (${query.preferTags.map(() => '?').join(', ')})
+      )`,
+    );
+    params.push(...query.preferTags);
+  }
 
   const ids = query.ids ? query.ids.slice(0, 500) : null;
   if (ids) {
@@ -1047,11 +1198,10 @@ export function getDealsList(query: DealsListQuery): DealsListResult {
   if (ids) {
     const rows = db
       .prepare(
-        `SELECT d.*, 0 AS claimed, 0 AS favorite
+        `SELECT d.*, 0 AS favorite
          FROM deals d
          WHERE ${where}
-         ORDER BY d.is_new DESC,
-                  COALESCE(d.published_at, d.first_seen_at) DESC,
+         ORDER BY COALESCE(d.published_at, d.first_seen_at) DESC,
                   d.id DESC
          LIMIT ?`,
       )
@@ -1072,27 +1222,18 @@ export function getDealsList(query: DealsListQuery): DealsListResult {
   const cursorParams: unknown[] = [];
   if (cursor) {
     cursorSql = `AND (
-      d.is_new < ?
-      OR (d.is_new = ? AND COALESCE(d.published_at, d.first_seen_at) < ?)
-      OR (d.is_new = ? AND COALESCE(d.published_at, d.first_seen_at) = ? AND d.id < ?)
+      COALESCE(d.published_at, d.first_seen_at) < ?
+      OR (COALESCE(d.published_at, d.first_seen_at) = ? AND d.id < ?)
     )`;
-    cursorParams.push(
-      cursor.isNew,
-      cursor.isNew,
-      cursor.time,
-      cursor.isNew,
-      cursor.time,
-      cursor.id,
-    );
+    cursorParams.push(cursor.time, cursor.time, cursor.id);
   }
 
   const pageRows = db
     .prepare(
-      `SELECT d.*, 0 AS claimed, 0 AS favorite
+      `SELECT d.*, 0 AS favorite
        FROM deals d
        WHERE ${where} ${cursorSql}
-       ORDER BY d.is_new DESC,
-                COALESCE(d.published_at, d.first_seen_at) DESC,
+       ORDER BY COALESCE(d.published_at, d.first_seen_at) DESC,
                 d.id DESC
        LIMIT ?`,
     )
@@ -1253,6 +1394,7 @@ export function getAdminData(): AdminBaseData {
     searchIndex: readSearchIndexStatus(db),
     tags: getTagStatus(),
     tagCandidates: getTagCandidates(100),
+    users: listAdminUsers(),
   };
 }
 
@@ -1291,7 +1433,7 @@ export function listDealsForAi(
   const now = new Date().toISOString();
   return getDb()
     .prepare(
-      `SELECT id, title, description, source, category
+      `SELECT id, title, description, source
        FROM deals
        WHERE ai_at IS NULL
          AND ai_attempts < ?
@@ -1325,15 +1467,13 @@ export function saveAiEnrichment(
   const now = new Date().toISOString();
   db.prepare(
     `UPDATE deals
-     SET ai_title = ?, ai_summary = ?, ai_value = ?, ai_action = ?,
+     SET ai_title = ?, ai_summary = ?,
          tags = ?, proposed_tags = ?, entities = ?, ai_tags_at = ?,
          ai_model = ?, ai_at = ?, ai_attempts = 0
      WHERE id = ?`,
   ).run(
     enrichment.title,
     enrichment.summary,
-    enrichment.value,
-    enrichment.action,
     JSON.stringify(enrichment.tags),
     JSON.stringify(enrichment.proposedTags),
     JSON.stringify(enrichment.entities),
@@ -1378,7 +1518,7 @@ export function listDealsMissingTags(
   return getDb()
     .prepare(
       `SELECT id, title, description, COALESCE(ai_summary, '') AS summary,
-              source, category
+              source
        FROM deals
        WHERE ai_summary IS NOT NULL
          AND ai_summary <> ''
@@ -1807,5 +1947,1586 @@ export function backupDatabase(dir: string, keep: number): string | null {
   }
 
   return file;
+}
+
+/* ------------------------------ 用户与登录 ------------------------------ */
+
+interface UserRow {
+  id: number;
+  email: string;
+  password_hash: string;
+  password_salt: string;
+  created_at: string;
+  last_login_at: string | null;
+  disabled: number;
+  ai_quota_date: string | null;
+  ai_quota_used: number;
+  invite_code: string | null;
+}
+
+function mapAccountUser(row: UserRow): AccountUser {
+  return {
+    id: row.id,
+    email: row.email,
+    createdAt: row.created_at,
+  };
+}
+
+/** 以 Asia/Shanghai 为准的日期键，用于每日配额与推送限额。 */
+export function todayKey(): string {
+  return new Date(Date.now() + 8 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+export interface StoredUserAuth {
+  user: AccountUser;
+  passwordHash: string;
+  passwordSalt: string;
+  disabled: boolean;
+}
+
+export function createUser(
+  email: string,
+  passwordHash: string,
+  passwordSalt: string,
+): AccountUser | null {
+  const db = getDb();
+  const now = new Date().toISOString();
+  try {
+    const result = db
+      .prepare(
+        `INSERT INTO users (email, password_hash, password_salt, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(email.trim().toLowerCase(), passwordHash, passwordSalt, now);
+    const row = db
+      .prepare('SELECT * FROM users WHERE id = ?')
+      .get(Number(result.lastInsertRowid)) as UserRow | undefined;
+    return row ? mapAccountUser(row) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getUserAuthByEmail(email: string): StoredUserAuth | null {
+  const row = getDb()
+    .prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE')
+    .get(email.trim().toLowerCase()) as UserRow | undefined;
+  if (!row) return null;
+  return {
+    user: mapAccountUser(row),
+    passwordHash: row.password_hash,
+    passwordSalt: row.password_salt,
+    disabled: row.disabled === 1,
+  };
+}
+
+export function getUserById(id: number): AccountUser | null {
+  const row = getDb()
+    .prepare('SELECT * FROM users WHERE id = ?')
+    .get(id) as UserRow | undefined;
+  return row ? mapAccountUser(row) : null;
+}
+
+export function markUserLogin(id: number): void {
+  getDb()
+    .prepare('UPDATE users SET last_login_at = ? WHERE id = ?')
+    .run(new Date().toISOString(), id);
+}
+
+function mapAdminUser(row: {
+  id: number;
+  email: string;
+  created_at: string;
+  last_login_at: string | null;
+  disabled: number;
+  invite_code: string | null;
+  ai_quota_date: string | null;
+  ai_quota_used: number;
+  subscription_count: number;
+  channel_count: number;
+}): AdminUser {
+  return {
+    id: row.id,
+    email: row.email,
+    createdAt: row.created_at,
+    lastLoginAt: row.last_login_at,
+    disabled: row.disabled === 1,
+    inviteCode: row.invite_code,
+    aiQuotaUsed:
+      row.ai_quota_date === todayKey() ? row.ai_quota_used : 0,
+    subscriptionCount: row.subscription_count,
+    channelCount: row.channel_count,
+  };
+}
+
+const ADMIN_USER_SELECT = `
+  SELECT u.id, u.email, u.created_at, u.last_login_at, u.disabled,
+         u.invite_code, u.ai_quota_date, u.ai_quota_used,
+         (SELECT COUNT(*) FROM subscriptions s WHERE s.user_id = u.id) AS subscription_count,
+         (SELECT COUNT(*) FROM channels c WHERE c.user_id = u.id) AS channel_count
+  FROM users u`;
+
+export function listAdminUsers(): AdminUser[] {
+  const rows = getDb()
+    .prepare(`${ADMIN_USER_SELECT} ORDER BY u.id DESC LIMIT 500`)
+    .all() as Parameters<typeof mapAdminUser>[0][];
+  return rows.map(mapAdminUser);
+}
+
+export interface AdminUserQuery {
+  query?: string;
+  status?: 'all' | 'active' | 'disabled';
+  limit: number;
+  offset: number;
+}
+
+export function searchAdminUsers(input: AdminUserQuery): {
+  users: AdminUser[];
+  total: number;
+} {
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (input.query?.trim()) {
+    conditions.push('u.email LIKE ?');
+    params.push(`%${input.query.trim()}%`);
+  }
+  if (input.status === 'active') conditions.push('u.disabled = 0');
+  if (input.status === 'disabled') conditions.push('u.disabled = 1');
+
+  const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+  const db = getDb();
+  const total = (
+    db
+      .prepare(`SELECT COUNT(*) AS count FROM users u${where}`)
+      .get(...params) as { count: number }
+  ).count;
+  const rows = db
+    .prepare(
+      `${ADMIN_USER_SELECT}${where} ORDER BY u.id DESC LIMIT ? OFFSET ?`,
+    )
+    .all(...params, input.limit, input.offset) as Parameters<
+    typeof mapAdminUser
+  >[0][];
+
+  return { users: rows.map(mapAdminUser), total };
+}
+
+export function getAdminUserDetail(
+  id: number,
+  aiQuotaLimit: number,
+): AdminUserDetail | null {
+  const row = getDb()
+    .prepare(`${ADMIN_USER_SELECT} WHERE u.id = ?`)
+    .get(id) as Parameters<typeof mapAdminUser>[0] | undefined;
+  if (!row) return null;
+
+  return {
+    user: mapAdminUser(row),
+    aiQuotaLimit,
+    subscriptions: listSubscriptions(id),
+    channels: listChannels(id),
+    deliveries: listUserDeliveries(id, 10),
+  };
+}
+
+export function updateUserEmail(id: number, email: string): boolean {
+  try {
+    return (
+      getDb()
+        .prepare('UPDATE users SET email = ? WHERE id = ?')
+        .run(email.trim().toLowerCase(), id).changes > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function updateUserPassword(
+  id: number,
+  hash: string,
+  salt: string,
+): void {
+  getDb()
+    .prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
+    .run(hash, salt, id);
+}
+
+export function deleteUserSessions(userId: number): void {
+  getDb().prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+}
+
+export function deleteUserAccount(id: number): boolean {
+  return getDb().prepare('DELETE FROM users WHERE id = ?').run(id).changes > 0;
+}
+
+/* ------------------------------ 邀请码 ------------------------------ */
+
+interface InviteCodeRow {
+  id: number;
+  code: string;
+  max_uses: number;
+  used_count: number;
+  expires_at: string | null;
+  disabled: number;
+  created_at: string;
+}
+
+function mapInviteCode(row: InviteCodeRow): InviteCode {
+  return {
+    id: row.id,
+    code: row.code,
+    maxUses: row.max_uses,
+    usedCount: row.used_count,
+    expiresAt: row.expires_at,
+    disabled: row.disabled === 1,
+    createdAt: row.created_at,
+  };
+}
+
+export function listInviteCodes(): InviteCode[] {
+  const rows = getDb()
+    .prepare('SELECT * FROM invite_codes ORDER BY id DESC LIMIT 500')
+    .all() as InviteCodeRow[];
+  return rows.map(mapInviteCode);
+}
+
+const INVITE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+function randomInviteCode(length = 8): string {
+  let code = '';
+  for (let index = 0; index < length; index += 1) {
+    code += INVITE_ALPHABET[randomInt(INVITE_ALPHABET.length)];
+  }
+  return code;
+}
+
+export function createInviteCodes(input: {
+  count: number;
+  maxUses: number;
+  expiresAt: string | null;
+  code?: string;
+}): InviteCode[] {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const created: InviteCode[] = [];
+
+  const run = db.transaction(() => {
+    for (let index = 0; index < input.count; index += 1) {
+      const code = input.code
+        ? input.code
+        : randomInviteCode();
+
+      try {
+        const result = db
+          .prepare(
+            `INSERT INTO invite_codes (code, max_uses, expires_at, created_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(code, input.maxUses, input.expiresAt, now);
+        const row = db
+          .prepare('SELECT * FROM invite_codes WHERE id = ?')
+          .get(Number(result.lastInsertRowid)) as InviteCodeRow;
+        created.push(mapInviteCode(row));
+      } catch {
+        // 自定义邀请码重复时跳过；自动生成的码冲突概率极低。
+        if (input.code) break;
+      }
+    }
+  });
+
+  run();
+  return created;
+}
+
+export function setInviteCodeDisabled(id: number, disabled: boolean): boolean {
+  return (
+    getDb()
+      .prepare('UPDATE invite_codes SET disabled = ? WHERE id = ?')
+      .run(disabled ? 1 : 0, id).changes > 0
+  );
+}
+
+export function deleteInviteCode(id: number): boolean {
+  return (
+    getDb()
+      .prepare('DELETE FROM invite_codes WHERE id = ? AND used_count = 0')
+      .run(id).changes > 0
+  );
+}
+
+export type CreateUserResult =
+  | { user: AccountUser }
+  | {
+      error:
+        | 'EMAIL_EXISTS'
+        | 'INVITE_INVALID'
+        | 'INVITE_DISABLED'
+        | 'INVITE_EXPIRED'
+        | 'INVITE_EXHAUSTED';
+    };
+
+export interface RegisterInvite {
+  code: string;
+  consume: boolean;
+}
+
+/** 创建用户并在同一事务内校验/扣减邀请码，避免并发超用。 */
+export function createUserWithInvite(
+  email: string,
+  passwordHash: string,
+  passwordSalt: string,
+  invite: RegisterInvite | null,
+): CreateUserResult {
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  const run = db.transaction((): CreateUserResult => {
+    const existing = db
+      .prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE')
+      .get(email) as { id: number } | undefined;
+    if (existing) return { error: 'EMAIL_EXISTS' };
+
+    if (invite?.consume) {
+      const row = db
+        .prepare('SELECT * FROM invite_codes WHERE code = ? COLLATE NOCASE')
+        .get(invite.code) as InviteCodeRow | undefined;
+      if (!row) return { error: 'INVITE_INVALID' };
+      if (row.disabled === 1) return { error: 'INVITE_DISABLED' };
+      if (row.expires_at && Date.parse(row.expires_at) <= Date.now()) {
+        return { error: 'INVITE_EXPIRED' };
+      }
+      if (row.max_uses > 0 && row.used_count >= row.max_uses) {
+        return { error: 'INVITE_EXHAUSTED' };
+      }
+      db.prepare(
+        'UPDATE invite_codes SET used_count = used_count + 1 WHERE id = ?',
+      ).run(row.id);
+    }
+
+    const result = db
+      .prepare(
+        `INSERT INTO users
+           (email, password_hash, password_salt, created_at, invite_code)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        email.trim().toLowerCase(),
+        passwordHash,
+        passwordSalt,
+        now,
+        invite?.code ?? null,
+      );
+    const row = db
+      .prepare('SELECT * FROM users WHERE id = ?')
+      .get(Number(result.lastInsertRowid)) as UserRow;
+    return { user: mapAccountUser(row) };
+  });
+
+  return run();
+}
+
+export function updateSubscriptionKeyword(
+  userId: number,
+  id: number,
+  keyword: string,
+): boolean {
+  try {
+    return (
+      getDb()
+        .prepare(
+          'UPDATE subscriptions SET keyword = ?, updated_at = ? WHERE id = ? AND user_id = ?',
+        )
+        .run(keyword.trim(), new Date().toISOString(), id, userId).changes > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function setUserDisabled(id: number, disabled: boolean): void {
+  getDb()
+    .prepare('UPDATE users SET disabled = ? WHERE id = ?')
+    .run(disabled ? 1 : 0, id);
+}
+
+/* ------------------------------ 会话 ------------------------------ */
+
+export function createUserSession(
+  tokenHash: string,
+  userId: number,
+  expiresAt: string,
+): void {
+  getDb()
+    .prepare(
+      `INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(tokenHash, userId, new Date().toISOString(), expiresAt);
+}
+
+export function getUserBySession(tokenHash: string): AccountUser | null {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const row = db
+    .prepare(
+      `SELECT u.* FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.token_hash = ? AND s.expires_at > ? AND u.disabled = 0`,
+    )
+    .get(tokenHash, now) as UserRow | undefined;
+  return row ? mapAccountUser(row) : null;
+}
+
+export function deleteUserSession(tokenHash: string): void {
+  getDb().prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+}
+
+export function pruneExpiredSessions(): void {
+  getDb()
+    .prepare('DELETE FROM sessions WHERE expires_at <= ?')
+    .run(new Date().toISOString());
+}
+
+/* ------------------------------ AI 搜索每日配额 ------------------------------ */
+
+export function getAiQuota(userId: number, limit: number): AiQuota {
+  const row = getDb()
+    .prepare('SELECT ai_quota_date, ai_quota_used FROM users WHERE id = ?')
+    .get(userId) as
+    | { ai_quota_date: string | null; ai_quota_used: number }
+    | undefined;
+  const date = todayKey();
+  const used =
+    row && row.ai_quota_date === date ? row.ai_quota_used : 0;
+  return { limit, used, date };
+}
+
+/** 扣减一次 AI 搜索次数；limit 为 0 表示不限制。 */
+export function consumeAiQuota(
+  userId: number,
+  limit: number,
+): { ok: boolean; quota: AiQuota } {
+  const db = getDb();
+  const date = todayKey();
+
+  const run = db.transaction(() => {
+    const row = db
+      .prepare('SELECT ai_quota_date, ai_quota_used FROM users WHERE id = ?')
+      .get(userId) as
+      | { ai_quota_date: string | null; ai_quota_used: number }
+      | undefined;
+    if (!row) return { ok: false, quota: { limit, used: 0, date } };
+
+    let used = row.ai_quota_date === date ? row.ai_quota_used : 0;
+    if (limit > 0 && used >= limit) {
+      return { ok: false, quota: { limit, used, date } };
+    }
+
+    used += 1;
+    db.prepare(
+      'UPDATE users SET ai_quota_date = ?, ai_quota_used = ? WHERE id = ?',
+    ).run(date, used, userId);
+    return { ok: true, quota: { limit, used, date } };
+  });
+
+  return run();
+}
+
+/* ------------------------------ 订阅关键词 ------------------------------ */
+
+interface SubscriptionRow {
+  id: number;
+  keyword: string;
+  enabled: number;
+  created_at: string;
+}
+
+export function listSubscriptions(userId: number): UserSubscription[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT id, keyword, enabled, created_at FROM subscriptions
+       WHERE user_id = ? ORDER BY id DESC`,
+    )
+    .all(userId) as SubscriptionRow[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    keyword: row.keyword,
+    enabled: row.enabled === 1,
+    createdAt: row.created_at,
+  }));
+}
+
+export function countSubscriptions(userId: number): number {
+  return (
+    getDb()
+      .prepare('SELECT COUNT(*) AS count FROM subscriptions WHERE user_id = ?')
+      .get(userId) as { count: number }
+  ).count;
+}
+
+/** 新增订阅；重复关键词返回 null。 */
+export function addSubscription(
+  userId: number,
+  keyword: string,
+): UserSubscription | null {
+  const db = getDb();
+  const now = new Date().toISOString();
+  try {
+    const result = db
+      .prepare(
+        `INSERT INTO subscriptions (user_id, keyword, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(userId, keyword.trim(), now, now);
+    return {
+      id: Number(result.lastInsertRowid),
+      keyword: keyword.trim(),
+      enabled: true,
+      createdAt: now,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function setSubscriptionEnabled(
+  userId: number,
+  id: number,
+  enabled: boolean,
+): boolean {
+  return (
+    getDb()
+      .prepare(
+        'UPDATE subscriptions SET enabled = ?, updated_at = ? WHERE id = ? AND user_id = ?',
+      )
+      .run(enabled ? 1 : 0, new Date().toISOString(), id, userId).changes > 0
+  );
+}
+
+export function deleteSubscription(userId: number, id: number): boolean {
+  return (
+    getDb()
+      .prepare('DELETE FROM subscriptions WHERE id = ? AND user_id = ?')
+      .run(id, userId).changes > 0
+  );
+}
+
+/* ------------------------------ 推送渠道 ------------------------------ */
+
+interface ChannelRow {
+  id: number;
+  user_id: number;
+  kind: string;
+  name: string;
+  webhook: string;
+  secret: string;
+  channel_key: string;
+  enabled: number;
+  created_at: string;
+}
+
+function mapChannel(row: ChannelRow): UserChannel {
+  return {
+    id: row.id,
+    kind: row.kind as ChannelKind,
+    name: row.name,
+    webhook: row.webhook,
+    key: '',
+    enabled: row.enabled === 1,
+    configured:
+      row.kind === 'bark'
+        ? Boolean(row.channel_key || row.webhook)
+        : Boolean(row.webhook),
+    createdAt: row.created_at,
+  };
+}
+
+const CHANNEL_COLUMNS =
+  'id, user_id, kind, name, webhook, secret, channel_key, enabled, created_at';
+
+export function listChannels(userId: number): UserChannel[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT ${CHANNEL_COLUMNS} FROM channels
+       WHERE user_id = ? ORDER BY id DESC`,
+    )
+    .all(userId) as ChannelRow[];
+  return rows.map(mapChannel);
+}
+
+export function countChannelsByKind(userId: number, kind: string): number {
+  return (
+    getDb()
+      .prepare(
+        'SELECT COUNT(*) AS count FROM channels WHERE user_id = ? AND kind = ?',
+      )
+      .get(userId, kind) as { count: number }
+  ).count;
+}
+
+export interface ChannelSecretRow {
+  id: number;
+  userId: number;
+  kind: ChannelKind;
+  name: string;
+  webhook: string;
+  secret: string;
+  key: string;
+  enabled: boolean;
+}
+
+function toSecretRow(row: ChannelRow): ChannelSecretRow {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    kind: row.kind as ChannelKind,
+    name: row.name,
+    webhook: row.webhook,
+    secret: row.secret,
+    key: row.channel_key,
+    enabled: row.enabled === 1,
+  };
+}
+
+export function addChannel(
+  userId: number,
+  input: {
+    kind: ChannelKind;
+    name: string;
+    webhook: string;
+    secret: string;
+    key: string;
+  },
+): UserChannel | null {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `INSERT INTO channels
+         (user_id, kind, name, webhook, secret, channel_key, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      userId,
+      input.kind,
+      input.name,
+      input.webhook,
+      input.secret,
+      input.key,
+      now,
+      now,
+    );
+
+  const row = db
+    .prepare(`SELECT ${CHANNEL_COLUMNS} FROM channels WHERE id = ?`)
+    .get(Number(result.lastInsertRowid)) as ChannelRow;
+  return mapChannel(row);
+}
+
+/** 更新渠道；secret/key 传空字符串表示保持原值。 */
+export function updateChannel(
+  userId: number,
+  id: number,
+  patch: {
+    name?: string;
+    enabled?: boolean;
+    webhook?: string;
+    secret?: string;
+    key?: string;
+  },
+): boolean {
+  const db = getDb();
+  const current = db
+    .prepare(
+      `SELECT ${CHANNEL_COLUMNS} FROM channels WHERE id = ? AND user_id = ?`,
+    )
+    .get(id, userId) as ChannelRow | undefined;
+  if (!current) return false;
+
+  db.prepare(
+    `UPDATE channels
+     SET name = ?, enabled = ?, webhook = ?, secret = ?, channel_key = ?, updated_at = ?
+     WHERE id = ? AND user_id = ?`,
+  ).run(
+    patch.name ?? current.name,
+    patch.enabled === undefined
+      ? current.enabled
+      : patch.enabled
+        ? 1
+        : 0,
+    patch.webhook ?? current.webhook,
+    patch.secret ? patch.secret : current.secret,
+    patch.key ? patch.key : current.channel_key,
+    new Date().toISOString(),
+    id,
+    userId,
+  );
+  return true;
+}
+
+export function deleteChannel(userId: number, id: number): boolean {
+  return (
+    getDb()
+      .prepare('DELETE FROM channels WHERE id = ? AND user_id = ?')
+      .run(id, userId).changes > 0
+  );
+}
+
+export function getChannelSecret(
+  userId: number,
+  id: number,
+): ChannelSecretRow | null {
+  const row = getDb()
+    .prepare(
+      `SELECT ${CHANNEL_COLUMNS} FROM channels WHERE id = ? AND user_id = ?`,
+    )
+    .get(id, userId) as ChannelRow | undefined;
+  return row ? toSecretRow(row) : null;
+}
+
+/* ------------------------------ 关键词匹配与投递 ------------------------------ */
+
+interface MatchDealRow {
+  id: number;
+  title: string;
+  ai_title: string | null;
+  ai_summary: string | null;
+  description: string;
+  tags: string | null;
+  proposed_tags: string | null;
+  expires_at: string | null;
+  link: string;
+}
+
+export interface PendingDelivery {
+  id: number;
+  userId: number;
+  subscriptionId: number;
+  channelId: number;
+  dealId: number;
+  attempts: number;
+  channelKind: ChannelKind;
+  channelName: string;
+  webhook: string;
+  secret: string;
+  channelKey: string;
+  dealTitle: string;
+  dealLink: string;
+  keyword: string;
+  tags: string[];
+  createdAt: string;
+}
+
+export interface DealDetail {
+  id: number;
+  title: string;
+  description: string;
+  summary: string;
+  value: string;
+  action: string;
+  tags: string[];
+  source: string;
+  link: string;
+  publishedAt: string | null;
+  expiresAt: string | null;
+}
+
+export interface DigestChannelTarget {
+  userId: number;
+  channelId: number;
+  kind: ChannelKind;
+  name: string;
+  webhook: string;
+  secret: string;
+  channelKey: string;
+}
+
+export interface PendingDigest {
+  id: number;
+  userId: number;
+  channelId: number;
+  kind: 'overflow' | 'site';
+  token: string;
+  digestDate: string;
+  title: string;
+  lines: string[];
+  items: DigestItem[];
+  attempts: number;
+  channelKind: ChannelKind;
+  channelName: string;
+  webhook: string;
+  secret: string;
+  channelKey: string;
+}
+
+export interface PublicDigestDeal {
+  id: number;
+  title: string;
+  source: string;
+  tags: string[];
+  expiresAt: string | null;
+  firstSeenAt: string;
+}
+
+export interface RelatedDeal {
+  id: number;
+  title: string;
+  source: string;
+}
+
+export interface SiteDigestStats {
+  newCount: number;
+  activeCount: number;
+  topTags: string[];
+}
+
+interface DealDetailRow {
+  id: number;
+  title: string;
+  description: string;
+  ai_title: string | null;
+  ai_summary: string | null;
+  ai_value: string | null;
+  ai_action: string | null;
+  tags: string | null;
+  source: string;
+  link: string;
+  published_at: string | null;
+  expires_at: string | null;
+}
+
+export function getDealById(id: number): DealDetail | null {
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const row = getDb()
+    .prepare(
+      `SELECT id, title, description, ai_title, ai_summary, ai_value, ai_action,
+              tags, source, link, published_at, expires_at
+       FROM deals WHERE id = ?`,
+    )
+    .get(id) as DealDetailRow | undefined;
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    title: (row.ai_title || row.title).trim(),
+    description: (row.description ?? '').trim(),
+    summary: (row.ai_summary ?? '').trim(),
+    value: (row.ai_value ?? '').trim(),
+    action: (row.ai_action ?? '').trim(),
+    tags: parseStoredTags(row.tags),
+    source: row.source,
+    link: row.link,
+    publishedAt: row.published_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+/** 新优惠打完标签后，按用户关键词生成待投递记录（幂等）。 */
+export function matchDealToSubscriptions(dealId: number): number {
+  const db = getDb();
+  const deal = db
+    .prepare(
+      `SELECT id, title, ai_title, ai_summary, description, tags,
+              proposed_tags, expires_at, link
+       FROM deals WHERE id = ?`,
+    )
+    .get(dealId) as MatchDealRow | undefined;
+  if (!deal) return 0;
+  if (deal.expires_at && Date.parse(deal.expires_at) <= Date.now()) return 0;
+
+  const haystack = [
+    deal.title,
+    deal.ai_title ?? '',
+    deal.ai_summary ?? '',
+    deal.description,
+    ...parseStoredTags(deal.tags),
+    ...parseStoredTags(deal.proposed_tags),
+  ]
+    .join('\n')
+    .toLowerCase();
+  if (!haystack.trim()) return 0;
+
+  const subs = db
+    .prepare(
+      `SELECT s.id, s.user_id, s.keyword
+       FROM subscriptions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.enabled = 1 AND u.disabled = 0`,
+    )
+    .all() as { id: number; user_id: number; keyword: string }[];
+
+  const matched = subs.filter((sub) =>
+    haystack.includes(sub.keyword.trim().toLowerCase()),
+  );
+  if (matched.length === 0) return 0;
+
+  const userIds = [...new Set(matched.map((sub) => sub.user_id))];
+  const channels = db
+    .prepare(
+      `SELECT id, user_id FROM channels
+       WHERE enabled = 1 AND user_id IN (${userIds.map(() => '?').join(', ')})`,
+    )
+    .all(...userIds) as { id: number; user_id: number }[];
+
+  const byUser = new Map<number, number[]>();
+  for (const channel of channels) {
+    const list = byUser.get(channel.user_id) ?? [];
+    list.push(channel.id);
+    byUser.set(channel.user_id, list);
+  }
+
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO deliveries
+       (user_id, subscription_id, channel_id, deal_id, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  const now = new Date().toISOString();
+  let created = 0;
+
+  const write = db.transaction(() => {
+    for (const sub of matched) {
+      for (const channelId of byUser.get(sub.user_id) ?? []) {
+        created += insert.run(
+          sub.user_id,
+          sub.id,
+          channelId,
+          deal.id,
+          now,
+        ).changes;
+      }
+    }
+  });
+  write();
+
+  return created;
+}
+
+export function listPendingDeliveries(limit = 50): PendingDelivery[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT d.id, d.user_id, d.subscription_id, d.channel_id, d.deal_id,
+              d.attempts, d.created_at, c.kind, c.name AS channel_name,
+              c.webhook, c.secret, c.channel_key, s.keyword,
+              COALESCE(NULLIF(TRIM(deals.ai_title), ''), deals.title) AS deal_title,
+              deals.link AS deal_link, deals.tags
+       FROM deliveries d
+       JOIN subscriptions s ON s.id = d.subscription_id AND s.enabled = 1
+       JOIN channels c ON c.id = d.channel_id AND c.enabled = 1
+       JOIN users u ON u.id = d.user_id AND u.disabled = 0
+       JOIN deals ON deals.id = d.deal_id
+       WHERE d.status = 'pending' AND d.attempts < 3
+         AND (deals.expires_at IS NULL OR deals.expires_at > ?)
+       ORDER BY d.id ASC
+       LIMIT ?`,
+    )
+    .all(new Date().toISOString(), limit) as {
+    id: number;
+    user_id: number;
+    subscription_id: number;
+    channel_id: number;
+    deal_id: number;
+    attempts: number;
+    created_at: string;
+    kind: string;
+    channel_name: string;
+    webhook: string;
+    secret: string;
+    channel_key: string;
+    keyword: string;
+    deal_title: string;
+    deal_link: string;
+    tags: string | null;
+  }[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    userId: row.user_id,
+    subscriptionId: row.subscription_id,
+    channelId: row.channel_id,
+    dealId: row.deal_id,
+    attempts: row.attempts,
+    channelKind: row.kind as ChannelKind,
+    channelName: row.channel_name,
+    webhook: row.webhook,
+    secret: row.secret,
+    channelKey: row.channel_key,
+    dealTitle: row.deal_title,
+    dealLink: row.deal_link,
+    keyword: row.keyword,
+    tags: parseStoredTags(row.tags),
+    createdAt: row.created_at,
+  }));
+}
+
+export function countUserPushesToday(userId: number): number {
+  return (
+    getDb()
+      .prepare(
+        `SELECT COUNT(*) AS count FROM deliveries
+         WHERE user_id = ? AND status = 'sent' AND sent_at >= ?`,
+      )
+      .get(
+        userId,
+        new Date(`${todayKey()}T00:00:00+08:00`).toISOString(),
+      ) as { count: number }
+  ).count;
+}
+
+export function markDeliverySent(id: number): void {
+  getDb()
+    .prepare(
+      "UPDATE deliveries SET status = 'sent', sent_at = ?, error = NULL WHERE id = ?",
+    )
+    .run(new Date().toISOString(), id);
+}
+
+export function markDeliveryFailed(id: number, error: string): void {
+  getDb()
+    .prepare(
+      `UPDATE deliveries
+       SET attempts = attempts + 1,
+           status = CASE WHEN attempts + 1 >= 3 THEN 'failed' ELSE 'pending' END,
+           error = ?
+       WHERE id = ?`,
+    )
+    .run(error.slice(0, 300), id);
+}
+
+export function listUserDeliveries(
+  userId: number,
+  limit = 50,
+): DeliveryRecord[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT d.id, d.deal_id, d.status, d.error, d.created_at, d.sent_at,
+              s.keyword, c.name AS channel_name, c.kind,
+              COALESCE(NULLIF(TRIM(deals.ai_title), ''), deals.title) AS title,
+              deals.link
+       FROM deliveries d
+       JOIN subscriptions s ON s.id = d.subscription_id
+       JOIN channels c ON c.id = d.channel_id
+       JOIN deals ON deals.id = d.deal_id
+       WHERE d.user_id = ?
+       ORDER BY d.id DESC
+       LIMIT ?`,
+    )
+    .all(userId, Math.min(Math.max(limit, 1), 100)) as {
+    id: number;
+    deal_id: number;
+    status: string;
+    error: string | null;
+    created_at: string;
+    sent_at: string | null;
+    keyword: string;
+    channel_name: string;
+    kind: string;
+    title: string;
+    link: string;
+  }[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    dealId: row.deal_id,
+    title: row.title,
+    link: row.link,
+    keyword: row.keyword,
+    channelName: row.channel_name,
+    channelKind: row.kind as ChannelKind,
+    status: row.status as DeliveryRecord['status'],
+    error: row.error,
+    createdAt: row.created_at,
+    sentAt: row.sent_at,
+  }));
+}
+
+/* ------------------------------ 每日汇总 ------------------------------ */
+
+export interface SiteDigestDeal {
+  id: number;
+  title: string;
+  link: string;
+  tags: string[];
+}
+
+function visibleSourceIds(): string[] {
+  return listSources()
+    .filter((source) => !source.hidden)
+    .map((source) => source.id);
+}
+
+function todayStartIso(): string {
+  return new Date(`${todayKey()}T00:00:00+08:00`).toISOString();
+}
+
+/** 有启用订阅且至少绑定一个启用渠道的用户渠道列表。 */
+export function listDigestRecipients(): DigestChannelTarget[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT c.user_id, c.id AS channel_id, c.kind, c.name,
+              c.webhook, c.secret, c.channel_key
+       FROM channels c
+       JOIN users u ON u.id = c.user_id AND u.disabled = 0
+       WHERE c.enabled = 1
+         AND EXISTS (
+           SELECT 1 FROM subscriptions s
+           WHERE s.user_id = u.id AND s.enabled = 1
+         )
+       ORDER BY c.user_id ASC, c.id ASC`,
+    )
+    .all() as {
+    user_id: number;
+    channel_id: number;
+    kind: string;
+    name: string;
+    webhook: string;
+    secret: string;
+    channel_key: string;
+  }[];
+
+  return rows.map((row) => ({
+    userId: row.user_id,
+    channelId: row.channel_id,
+    kind: row.kind as ChannelKind,
+    name: row.name,
+    webhook: row.webhook,
+    secret: row.secret,
+    channelKey: row.channel_key,
+  }));
+}
+
+export function insertDailyDigest(input: {
+  userId: number;
+  channelId: number;
+  kind: 'overflow' | 'site';
+  date: string;
+  title: string;
+  lines: string[];
+  items: DigestItem[];
+}): boolean {
+  const token = randomBytes(12).toString('hex');
+  const result = getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO daily_digests
+         (user_id, channel_id, kind, digest_date, token, title, lines, items,
+          item_count, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.userId,
+      input.channelId,
+      input.kind,
+      input.date,
+      token,
+      input.title,
+      JSON.stringify(input.lines),
+      JSON.stringify(input.items),
+      input.items.length,
+      new Date().toISOString(),
+    );
+  return result.changes > 0;
+}
+
+function parseDigestLines(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (line): line is string => typeof line === 'string' && Boolean(line.trim()),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function parseDigestItems(value: string): DigestItem[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => {
+        if (!item || typeof item !== 'object') return null;
+        const record = item as Record<string, unknown>;
+        const dealId = Number(record.dealId);
+        const title = typeof record.title === 'string' ? record.title : '';
+        const url = typeof record.url === 'string' ? record.url : '';
+        if (!Number.isInteger(dealId) || dealId <= 0 || !title || !url) {
+          return null;
+        }
+        return { dealId, title, url };
+      })
+      .filter((item): item is DigestItem => Boolean(item));
+  } catch {
+    return [];
+  }
+}
+
+export function listPendingDigests(limit = 30): PendingDigest[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT g.id, g.user_id, g.channel_id, g.kind, g.token, g.digest_date,
+              g.title, g.lines, g.items, g.attempts,
+              c.kind AS channel_kind, c.name AS channel_name,
+              c.webhook, c.secret, c.channel_key
+       FROM daily_digests g
+       JOIN channels c ON c.id = g.channel_id AND c.enabled = 1
+       JOIN users u ON u.id = g.user_id AND u.disabled = 0
+       WHERE g.status = 'pending' AND g.attempts < 3
+       ORDER BY g.id ASC
+       LIMIT ?`,
+    )
+    .all(Math.min(Math.max(limit, 1), 200)) as {
+    id: number;
+    user_id: number;
+    channel_id: number;
+    kind: string;
+    token: string;
+    digest_date: string;
+    title: string;
+    lines: string;
+    items: string;
+    attempts: number;
+    channel_kind: string;
+    channel_name: string;
+    webhook: string;
+    secret: string;
+    channel_key: string;
+  }[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    userId: row.user_id,
+    channelId: row.channel_id,
+    kind: row.kind === 'site' ? 'site' : 'overflow',
+    token: row.token,
+    digestDate: row.digest_date,
+    title: row.title,
+    lines: parseDigestLines(row.lines),
+    items: parseDigestItems(row.items),
+    attempts: row.attempts,
+    channelKind: row.channel_kind as ChannelKind,
+    channelName: row.channel_name,
+    webhook: row.webhook,
+    secret: row.secret,
+    channelKey: row.channel_key,
+  }));
+}
+
+export function markDigestSent(id: number): void {
+  getDb()
+    .prepare(
+      "UPDATE daily_digests SET status = 'sent', sent_at = ?, error = NULL WHERE id = ?",
+    )
+    .run(new Date().toISOString(), id);
+}
+
+export function markDigestFailed(id: number, error: string): void {
+  getDb()
+    .prepare(
+      `UPDATE daily_digests
+       SET attempts = attempts + 1,
+           status = CASE WHEN attempts + 1 >= 3 THEN 'failed' ELSE 'pending' END,
+           error = ?
+       WHERE id = ?`,
+    )
+    .run(error.slice(0, 300), id);
+}
+
+export function markDeliveriesDigested(
+  userId: number,
+  channelId: number,
+  dealIds: number[],
+): void {
+  if (dealIds.length === 0) return;
+  getDb()
+    .prepare(
+      `UPDATE deliveries SET status = 'digested'
+       WHERE user_id = ? AND channel_id = ? AND status = 'pending'
+         AND deal_id IN (${dealIds.map(() => '?').join(', ')})`,
+    )
+    .run(userId, channelId, ...dealIds);
+}
+
+export function markDeliveriesSkipped(
+  userId: number,
+  channelId: number,
+  dealIds: number[],
+): void {
+  if (dealIds.length === 0) return;
+  getDb()
+    .prepare(
+      `UPDATE deliveries SET status = 'skipped'
+       WHERE user_id = ? AND channel_id = ? AND status = 'pending'
+         AND deal_id IN (${dealIds.map(() => '?').join(', ')})`,
+    )
+    .run(userId, channelId, ...dealIds);
+}
+
+export function skipUserPendingDeliveries(userId: number): void {
+  getDb()
+    .prepare(
+      "UPDATE deliveries SET status = 'skipped' WHERE user_id = ? AND status = 'pending'",
+    )
+    .run(userId);
+}
+
+/** 跨天或已过期的待投递条目直接跳过，避免第二天补推旧内容。 */
+export function skipStalePendingDeliveries(): number {
+  const now = new Date().toISOString();
+  return getDb()
+    .prepare(
+      `UPDATE deliveries SET status = 'skipped'
+       WHERE status = 'pending'
+         AND (
+           created_at < ?
+           OR deal_id IN (
+             SELECT id FROM deals
+             WHERE expires_at IS NOT NULL AND expires_at <= ?
+           )
+         )`,
+    )
+    .run(todayStartIso(), now).changes;
+}
+
+export function getSiteDigestStats(): SiteDigestStats {
+  const sources = visibleSourceIds();
+  if (sources.length === 0) {
+    return { newCount: 0, activeCount: 0, topTags: [] };
+  }
+
+  const placeholders = sources.map(() => '?').join(', ');
+  const db = getDb();
+  const now = new Date().toISOString();
+  const start = todayStartIso();
+
+  const activeCount = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM deals
+         WHERE (expires_at IS NULL OR expires_at > ?)
+           AND source IN (${placeholders})`,
+      )
+      .get(now, ...sources) as { count: number }
+  ).count;
+
+  const newCount = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM deals
+         WHERE first_seen_at >= ?
+           AND (expires_at IS NULL OR expires_at > ?)
+           AND source IN (${placeholders})`,
+      )
+      .get(start, now, ...sources) as { count: number }
+  ).count;
+
+  const topTags = (
+    db
+      .prepare(
+        `SELECT json_each.value AS tag, COUNT(*) AS count
+         FROM deals d, json_each(d.tags)
+         WHERE d.first_seen_at >= ?
+           AND (d.expires_at IS NULL OR d.expires_at > ?)
+           AND d.source IN (${placeholders})
+           AND length(json_each.value) BETWEEN 2 AND 12
+         GROUP BY json_each.value
+         ORDER BY count DESC, tag ASC
+         LIMIT 5`,
+      )
+      .all(start, now, ...sources) as { tag: string; count: number }[]
+  ).map((row) => row.tag);
+
+  return { newCount, activeCount, topTags };
+}
+
+export function listTodayDealsForDigest(limit = 40): SiteDigestDeal[] {
+  const sources = visibleSourceIds();
+  if (sources.length === 0) return [];
+
+  const rows = getDb()
+    .prepare(
+      `SELECT id, COALESCE(NULLIF(TRIM(ai_title), ''), title) AS title, link, tags
+       FROM deals
+       WHERE first_seen_at >= ?
+         AND (expires_at IS NULL OR expires_at > ?)
+         AND source IN (${sources.map(() => '?').join(', ')})
+       ORDER BY first_seen_at DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(
+      todayStartIso(),
+      new Date().toISOString(),
+      ...sources,
+      Math.min(Math.max(limit, 1), 200),
+    ) as { id: number; title: string; link: string; tags: string | null }[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title.trim(),
+    link: row.link,
+    tags: parseStoredTags(row.tags),
+  }));
+}
+
+export function getDigestLastRun(kind: 'overflow' | 'site'): string | null {
+  return getSetting(`digest:last:${kind}`);
+}
+
+export function setDigestLastRun(kind: 'overflow' | 'site', date: string): void {
+  setSetting(`digest:last:${kind}`, date);
+}
+
+export function pruneDailyDigests(days = 30): void {
+  const cutoff = new Date(
+    Date.now() - Math.min(Math.max(days, 1), 365) * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  getDb()
+    .prepare('DELETE FROM daily_digests WHERE created_at < ?')
+    .run(cutoff);
+}
+
+function parseJsonArray<T>(value: string): T[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function getPublicDigest(date: string): PublicDigest | null {
+  const row = getDb()
+    .prepare(
+      `SELECT digest_date, title, stats, tags, groups
+       FROM public_digests WHERE digest_date = ?`,
+    )
+    .get(date) as
+    | {
+        digest_date: string;
+        title: string;
+        stats: string;
+        tags: string;
+        groups: string;
+      }
+    | undefined;
+  if (!row) return null;
+
+  return {
+    date: row.digest_date,
+    title: row.title,
+    stats: parseJsonArray<string>(row.stats),
+    tags: parseJsonArray<{ tag: string; count: number }>(row.tags),
+    groups: parseJsonArray<{
+      tag: string;
+      count: number;
+      items: PublicDigest['groups'][number]['items'];
+    }>(row.groups),
+  };
+}
+
+export function savePublicDigest(digest: PublicDigest): void {
+  const now = new Date().toISOString();
+  getDb()
+    .prepare(
+      `INSERT INTO public_digests
+         (digest_date, title, stats, tags, groups, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(digest_date) DO UPDATE SET
+         title = excluded.title,
+         stats = excluded.stats,
+         tags = excluded.tags,
+         groups = excluded.groups,
+         updated_at = excluded.updated_at`,
+    )
+    .run(
+      digest.date,
+      digest.title,
+      JSON.stringify(digest.stats),
+      JSON.stringify(digest.tags),
+      JSON.stringify(digest.groups),
+      now,
+      now,
+    );
+}
+
+/** 读取某天（北京时间）收录的优惠，用于生成公开汇总快照。 */
+export function listDealsForPublicDigest(date: string): PublicDigestDeal[] {
+  const start = new Date(`${date}T00:00:00+08:00`);
+  if (Number.isNaN(start.getTime())) return [];
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+
+  const rows = getDb()
+    .prepare(
+      `SELECT d.id, COALESCE(NULLIF(TRIM(d.ai_title), ''), d.title) AS title,
+              d.source, d.tags, d.expires_at, d.first_seen_at
+       FROM deals d
+       JOIN sources s ON s.id = d.source AND s.enabled = 1 AND s.hidden = 0
+       WHERE d.first_seen_at >= ? AND d.first_seen_at < ?
+       ORDER BY d.first_seen_at DESC, d.id DESC
+       LIMIT 1500`,
+    )
+    .all(start.toISOString(), end.toISOString()) as {
+    id: number;
+    title: string;
+    source: string;
+    tags: string | null;
+    expires_at: string | null;
+    first_seen_at: string;
+  }[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title.trim(),
+    source: row.source,
+    tags: parseStoredTags(row.tags),
+    expiresAt: row.expires_at,
+    firstSeenAt: row.first_seen_at,
+  }));
+}
+
+export function getRelatedDeals(
+  dealId: number,
+  tags: string[],
+  limit = 3,
+): RelatedDeal[] {
+  if (tags.length === 0) return [];
+
+  const params: (string | number)[] = [
+    dealId,
+    new Date().toISOString(),
+    ...tags,
+  ];
+
+  const rows = getDb()
+    .prepare(
+      `SELECT deals.id,
+              COALESCE(NULLIF(TRIM(deals.ai_title), ''), deals.title) AS title,
+              deals.source
+       FROM deals
+       JOIN sources s ON s.id = deals.source AND s.enabled = 1 AND s.hidden = 0
+       WHERE deals.id != ?
+         AND (deals.expires_at IS NULL OR deals.expires_at > ?)
+         AND EXISTS (
+           SELECT 1 FROM json_each(deals.tags) WHERE value IN (${tags
+             .map(() => '?')
+             .join(', ')})
+         )
+       ORDER BY deals.first_seen_at DESC, deals.id DESC
+       LIMIT ?`,
+    )
+    .all(...params, Math.min(Math.max(limit, 1), 6)) as {
+    id: number;
+    title: string;
+    source: string;
+  }[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title.trim(),
+    source: row.source,
+  }));
 }
 

@@ -3,16 +3,6 @@ export type SourceId = string;
 
 export type SourceKind = 'rss' | 'epic' | 'linuxdo' | 'xianbao';
 
-export type Category =
-  | 'free'
-  | 'limited'
-  | 'discount'
-  | 'membership'
-  | 'game'
-  | 'other';
-
-export type CategoryFilter = Category | 'all' | 'favorites';
-
 export interface DealItem {
   id: number;
   title: string;
@@ -20,17 +10,13 @@ export interface DealItem {
   description: string;
   source: SourceId;
   sourceName: string;
-  category: Category;
   expiresAt: string | null;
   publishedAt: string | null;
   firstSeenAt: string;
   isNew: boolean;
-  claimed: boolean;
   favorite: boolean;
   aiTitle: string | null;
   aiSummary: string | null;
-  aiValue: string | null;
-  aiAction: string | null;
   tags: string[];
 }
 
@@ -159,6 +145,129 @@ export interface TagSuggestion {
   count: number;
 }
 
+export type ChannelKind = 'wecom' | 'feishu' | 'dingtalk' | 'bark';
+
+export interface AccountUser {
+  id: number;
+  email: string;
+  createdAt: string;
+}
+
+export interface AiQuota {
+  limit: number;
+  used: number;
+  date: string;
+}
+
+export interface UserSubscription {
+  id: number;
+  keyword: string;
+  enabled: boolean;
+  createdAt: string;
+}
+
+/** 用户自己的推送机器人配置。secret/key 不会回传给前端。 */
+export interface UserChannel {
+  id: number;
+  kind: ChannelKind;
+  name: string;
+  webhook: string;
+  key: string;
+  enabled: boolean;
+  configured: boolean;
+  createdAt: string;
+}
+
+export interface DeliveryRecord {
+  id: number;
+  dealId: number;
+  title: string;
+  link: string;
+  keyword: string;
+  channelName: string;
+  channelKind: ChannelKind;
+  status: 'pending' | 'sent' | 'failed' | 'digested' | 'skipped';
+  error: string | null;
+  createdAt: string;
+  sentAt: string | null;
+}
+
+export interface AccountLimits {
+  subscriptions: number;
+  channelsPerKind: number;
+  dailyPush: number;
+}
+
+export interface AccountData {
+  user: AccountUser;
+  aiQuota: AiQuota;
+  limits: AccountLimits;
+  subscriptions: UserSubscription[];
+  channels: UserChannel[];
+  deliveries: DeliveryRecord[];
+}
+
+export interface DigestItem {
+  dealId: number;
+  title: string;
+  url: string;
+}
+
+export interface PublicDigestItem extends DigestItem {
+  source: string;
+  tags: string[];
+  expired: boolean;
+}
+
+export interface PublicDigestTag {
+  tag: string;
+  count: number;
+}
+
+export interface PublicDigestGroup {
+  tag: string;
+  count: number;
+  items: PublicDigestItem[];
+}
+
+export interface PublicDigest {
+  date: string;
+  title: string;
+  stats: string[];
+  tags: PublicDigestTag[];
+  groups: PublicDigestGroup[];
+}
+
+export interface AdminUser {
+  id: number;
+  email: string;
+  createdAt: string;
+  lastLoginAt: string | null;
+  disabled: boolean;
+  inviteCode: string | null;
+  aiQuotaUsed: number;
+  subscriptionCount: number;
+  channelCount: number;
+}
+
+export interface InviteCode {
+  id: number;
+  code: string;
+  maxUses: number;
+  usedCount: number;
+  expiresAt: string | null;
+  disabled: boolean;
+  createdAt: string;
+}
+
+export interface AdminUserDetail {
+  user: AdminUser;
+  aiQuotaLimit: number;
+  subscriptions: UserSubscription[];
+  channels: UserChannel[];
+  deliveries: DeliveryRecord[];
+}
+
 export interface AdminData {
   fetchedAt: string | null;
   announcement: Announcement;
@@ -168,6 +277,7 @@ export interface AdminData {
   tagCandidates: TagCandidate[];
   globalIntervalMinutes: number;
   runtimeSettings: RuntimeSettingView[];
+  users: AdminUser[];
 }
 
 export type AdminBaseData = Omit<

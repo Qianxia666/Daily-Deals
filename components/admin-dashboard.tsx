@@ -19,6 +19,9 @@ import type {
   SourceKind,
 } from '@/lib/types';
 import { cn } from '@/lib/utils';
+import { AdminInviteCodes } from './admin-invite-codes';
+import { AdminUserManager } from './admin-user-manager';
+import { NotificationSettings } from './notification-settings';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Switch } from './ui/switch';
@@ -91,6 +94,12 @@ export function AdminDashboard() {
   const [rebuildingIndex, setRebuildingIndex] = useState(false);
   const [backfillingTags, setBackfillingTags] = useState(false);
   const [tagActionBusy, setTagActionBusy] = useState<string | null>(null);
+  const [notifyBusy, setNotifyBusy] = useState<string | null>(null);
+  const [notifyResult, setNotifyResult] = useState<{
+    kind: string;
+    ok: boolean;
+    text: string;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<{
@@ -601,6 +610,35 @@ export function AdminDashboard() {
       );
     } finally {
       setBackfillingTags(false);
+    }
+  };
+
+  const testNotify = async (kind: string) => {
+    if (notifyBusy) return;
+    setNotifyBusy(kind);
+    setNotifyResult(null);
+
+    try {
+      const response = await fetch('/api/admin/notify/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind }),
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { error?: string }
+        | null;
+      if (!response.ok) {
+        throw new Error(payload?.error ?? `HTTP ${response.status}`);
+      }
+      setNotifyResult({ kind, ok: true, text: '测试消息已发送' });
+    } catch (testError) {
+      setNotifyResult({
+        kind,
+        ok: false,
+        text: testError instanceof Error ? testError.message : '发送失败',
+      });
+    } finally {
+      setNotifyBusy(null);
     }
   };
 
@@ -1263,6 +1301,10 @@ export function AdminDashboard() {
           )}
         </section>
 
+        <AdminUserManager />
+
+        <AdminInviteCodes />
+
         <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
           <div>
             <h2 className="text-sm font-semibold text-ink">
@@ -1277,7 +1319,27 @@ export function AdminDashboard() {
           </div>
 
           <div className="mt-4 space-y-4">
-            {runtimeGroups.map(([group, fields]) => (
+            {runtimeGroups.map(([group, fields]) =>
+              group === '通知渠道' ? (
+                <div key={group}>
+                  <h3 className="text-xs font-semibold text-slate-700">
+                    {group}
+                  </h3>
+                  <NotificationSettings
+                    fields={fields}
+                    values={runtimeValues}
+                    onChange={(key, value) =>
+                      setRuntimeValues((previous) => ({
+                        ...previous,
+                        [key]: value,
+                      }))
+                    }
+                    onTest={(kind) => void testNotify(kind)}
+                    busy={notifyBusy}
+                    result={notifyResult}
+                  />
+                </div>
+              ) : (
               <div key={group}>
                 <h3 className="text-xs font-semibold text-slate-700">
                   {group}
@@ -1402,7 +1464,8 @@ export function AdminDashboard() {
                   })}
                 </div>
               </div>
-            ))}
+              ),
+            )}
           </div>
 
           <div className="mt-4 flex flex-wrap items-center justify-end gap-3">

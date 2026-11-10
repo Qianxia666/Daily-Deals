@@ -1,4 +1,3 @@
-import { categorizeTitle } from '../categorize';
 import { fetchText } from '../http';
 import { parseRssFeed } from '../rss';
 import type { RawDeal } from './types';
@@ -27,7 +26,6 @@ export async function fetchRssSource(
       description: item.description,
       publishedAt: item.publishedAt,
       expiresAt: null,
-      category: categorizeTitle(item.title),
       source: config.id,
     });
   }

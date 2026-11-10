@@ -17,18 +17,20 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { CATEGORY_FILTERS } from '@/lib/constants';
 import type {
-  CategoryFilter,
   DealsListResponse,
   SiteSettings,
   SourceId,
 } from '@/lib/types';
-import { DealCard } from './deal-card';
+import { useRouter } from 'next/navigation';
+import { useDealSearch, PENDING_SEARCH_KEY } from '@/lib/use-deal-search';
+import { DealMasonry } from './deal-masonry';
 import { FilterBar, type SearchMode } from './filter-bar';
+import { PreferenceDialog, type PreferenceOption } from './preference-dialog';
 import { LoadingScreen } from './loading-screen';
 import { StatsBar } from './stats-bar';
 import { Button } from './ui/button';
+import { useLocalDealStates } from './use-local-deal-states';
 
 const EMPTY_STATS = {
   activeCount: 0,
@@ -41,79 +43,65 @@ const EMPTY_ANNOUNCEMENT = {
 };
 
 const FILTERS_KEY = 'daily-deals.filters.v1';
-const LOCAL_STATES_KEY = 'daily-deals.local-states.v1';
+const PREFERENCES_KEY = 'daily-deals.preferences.v1';
+const MAX_PREFERENCES = 5;
 const PAGE_SIZE = 30;
 const SPLASH_MIN_MS = 400;
 const SPLASH_FADE_MS = 300;
 
-interface LocalDealState {
-  claimed?: boolean;
-  favorite?: boolean;
-}
-
-interface AiSearchResult {
-  ids: number[];
-  reason: string;
-  mode: 'ai' | 'keyword';
-  windowDays?: number;
-  suggestedTags?: { tag: string; count: number }[];
-  truncated?: boolean;
-}
-
-function parseLocalStates(raw: string): Record<number, LocalDealState> {
-  const parsed = JSON.parse(raw) as unknown;
-  if (!parsed || typeof parsed !== 'object') return {};
-
-  const result: Record<number, LocalDealState> = {};
-  for (const [key, value] of Object.entries(
-    parsed as Record<string, unknown>,
-  )) {
-    const id = Number(key);
-    if (!Number.isInteger(id) || !value || typeof value !== 'object') continue;
-
-    const record = value as Record<string, unknown>;
-    const entry: LocalDealState = {};
-    if (typeof record.claimed === 'boolean') entry.claimed = record.claimed;
-    if (typeof record.favorite === 'boolean') {
-      entry.favorite = record.favorite;
-    }
-    if (entry.claimed !== undefined || entry.favorite !== undefined) {
-      result[id] = entry;
-    }
-  }
-
-  return result;
-}
-
-export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
+export function DealsApp({
+  initialSite,
+  placeholderTag,
+  tagOptions,
+  currentUserEmail = null,
+}: {
+  initialSite: SiteSettings;
+  placeholderTag: string;
+  tagOptions: PreferenceOption[];
+  currentUserEmail?: string | null;
+}) {
   const [data, setData] = useState<DealsListResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  const router = useRouter();
 
   const [searchInput, setSearchInput] = useState('');
-  const [searchMode, setSearchMode] = useState<SearchMode>('ai');
   const [aiQuery, setAiQuery] = useState('');
-  const [aiResult, setAiResult] = useState<AiSearchResult | null>(null);
-  const [aiSearching, setAiSearching] = useState(false);
-  const [searchError, setSearchError] = useState<string | null>(null);
   const [activeTag, setActiveTag] = useState<string | null>(null);
-  const [filtersReady, setFiltersReady] = useState(false);
+  const [filtersLoaded, setFiltersLoaded] = useState(false);
+
+  const {
+    statesRef: localStatesRef,
+    ready: localStatesReady,
+    setFavorite,
+    favoriteIds,
+  } = useLocalDealStates();
+  const {
+    result: aiResult,
+    searching: aiSearching,
+    error: searchError,
+    search,
+    clear: clearSearchResult,
+  } = useDealSearch();
+
+  const filtersReady = filtersLoaded && localStatesReady;
 
   const [selectedSources, setSelectedSources] = useState<Set<SourceId>>(
     new Set(),
   );
-  const [category, setCategory] = useState<CategoryFilter>('all');
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  const [preferenceTags, setPreferenceTags] = useState<string[]>([]);
+  const [preferencesOnly, setPreferencesOnly] = useState(false);
+  const [preferenceDialogOpen, setPreferenceDialogOpen] = useState(false);
   const [splashPhase, setSplashPhase] = useState<
     'visible' | 'leaving' | 'hidden'
   >('visible');
 
-  const localStatesRef = useRef<Record<number, LocalDealState>>({});
   const splashStartedAtRef = useRef(Date.now());
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
   const dataRef = useRef<DealsListResponse | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
-  const searchAbortRef = useRef<AbortController | null>(null);
-  const searchSeqRef = useRef(0);
+  const hasStoredPreferencesRef = useRef(false);
 
   useEffect(() => {
     dataRef.current = data;
@@ -174,12 +162,31 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
+  // 筛选条件与兴趣偏好只保存在当前浏览器，刷新或重新访问后恢复。
   useEffect(() => {
-    return () => searchAbortRef.current?.abort();
-  }, []);
+    let restoredTags: string[] = [];
 
-  // 筛选条件与收藏/已领状态只保存在当前浏览器，刷新或重新访问后恢复。
-  useEffect(() => {
+    try {
+      const rawPreferences = localStorage.getItem(PREFERENCES_KEY);
+      if (rawPreferences !== null) {
+        hasStoredPreferencesRef.current = true;
+
+        const parsedPreferences = JSON.parse(rawPreferences) as unknown;
+        if (parsedPreferences && typeof parsedPreferences === 'object') {
+          const record = parsedPreferences as Record<string, unknown>;
+          if (Array.isArray(record.tags)) {
+            restoredTags = record.tags
+              .filter((value): value is string => typeof value === 'string')
+              .slice(0, MAX_PREFERENCES);
+          }
+        }
+      }
+    } catch {
+      // 忽略损坏的偏好缓存。
+    }
+
+    if (restoredTags.length > 0) setPreferenceTags(restoredTags);
+
     try {
       const raw = localStorage.getItem(FILTERS_KEY);
       if (raw) {
@@ -197,15 +204,16 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
             );
           }
 
-          if (
-            typeof record.category === 'string' &&
-            CATEGORY_FILTERS.some((filter) => filter.value === record.category)
-          ) {
-            setCategory(record.category as CategoryFilter);
+          if (typeof record.favoritesOnly === 'boolean') {
+            setFavoritesOnly(record.favoritesOnly);
           }
 
-          if (record.searchMode === 'ai' || record.searchMode === 'keyword') {
-            setSearchMode(record.searchMode);
+          if (
+            record.preferencesOnly === true &&
+            restoredTags.length > 0
+          ) {
+            setPreferencesOnly(true);
+            setFavoritesOnly(false);
           }
         }
       }
@@ -213,14 +221,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       // 忽略损坏的本地缓存。
     }
 
-    try {
-      const raw = localStorage.getItem(LOCAL_STATES_KEY);
-      if (raw) localStatesRef.current = parseLocalStates(raw);
-    } catch {
-      // 忽略损坏的本地缓存。
-    }
-
-    setFiltersReady(true);
+    setFiltersLoaded(true);
   }, []);
 
   useEffect(() => {
@@ -231,14 +232,23 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
         FILTERS_KEY,
         JSON.stringify({
           sources: [...selectedSources],
-          category,
-          searchMode,
+          favoritesOnly,
+          preferencesOnly,
         }),
       );
     } catch {
       // 浏览器禁用存储时静默降级为仅当前页面生效。
     }
-  }, [filtersReady, selectedSources, category, searchMode]);
+  }, [filtersReady, selectedSources, favoritesOnly, preferencesOnly]);
+
+  // 首次进入且从未选择过偏好时，等首屏加载完成后再弹窗。
+  useEffect(() => {
+    if (!filtersReady || hasStoredPreferencesRef.current) return;
+    if (splashPhase !== 'hidden') return;
+
+    const timer = window.setTimeout(() => setPreferenceDialogOpen(true), 300);
+    return () => window.clearTimeout(timer);
+  }, [filtersReady, splashPhase]);
 
   const fetchPage = useCallback(
     async (
@@ -254,8 +264,8 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       if (selectedSources.size > 0) {
         params.set('sources', [...selectedSources].join(','));
       }
-      if (category !== 'all' && category !== 'favorites') {
-        params.set('category', category);
+      if (preferencesOnly && preferenceTags.length > 0) {
+        params.set('preferTags', preferenceTags.slice(0, MAX_PREFERENCES).join(','));
       }
       if (options.metaOnly) params.set('metaOnly', '1');
       if (options.cursor) params.set('cursor', options.cursor);
@@ -263,10 +273,8 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       let ids: number[] | null = null;
       if (aiResult) {
         ids = aiResult.ids;
-      } else if (category === 'favorites') {
-        ids = Object.entries(localStatesRef.current)
-          .filter(([, state]) => state.favorite)
-          .map(([id]) => Number(id));
+      } else if (favoritesOnly) {
+        ids = favoriteIds();
       }
 
       const emptyIds = Boolean(ids && ids.length === 0);
@@ -343,7 +351,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
         return null;
       }
     },
-    [selectedSources, category, aiResult],
+    [selectedSources, favoritesOnly, aiResult, favoriteIds, preferencesOnly, preferenceTags],
   );
 
   useEffect(() => {
@@ -382,7 +390,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
 
   const loadMore = useCallback(async () => {
     if (loadingMore || !data?.nextCursor || !data.hasMore) return;
-    if (aiResult || category === 'favorites') return;
+    if (aiResult || favoritesOnly) return;
 
     setLoadingMore(true);
     try {
@@ -390,30 +398,17 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
     } finally {
       setLoadingMore(false);
     }
-  }, [loadingMore, data, fetchPage, aiResult, category]);
+  }, [loadingMore, data, fetchPage, aiResult, favoritesOnly]);
 
-  const toggleItemState = useCallback(
-    (id: number, field: 'claimed' | 'favorite') => {
+  const toggleFavorite = useCallback(
+    (id: number) => {
       if (!data) return;
 
       const item = data.items.find((candidate) => candidate.id === id);
       if (!item) return;
 
-      const nextValue = !item[field];
-      const local: LocalDealState = {
-        ...(localStatesRef.current[id] ?? {}),
-        [field]: nextValue,
-      };
-      localStatesRef.current = { ...localStatesRef.current, [id]: local };
-
-      try {
-        localStorage.setItem(
-          LOCAL_STATES_KEY,
-          JSON.stringify(localStatesRef.current),
-        );
-      } catch {
-        // 浏览器禁用存储时仅当前页面生效。
-      }
+      const nextValue = !item.favorite;
+      setFavorite(id, nextValue);
 
       setData((previous) =>
         previous
@@ -421,14 +416,14 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
               ...previous,
               items: previous.items.map((candidate) =>
                 candidate.id === id
-                  ? { ...candidate, [field]: nextValue }
+                  ? { ...candidate, favorite: nextValue }
                   : candidate,
               ),
             }
           : previous,
       );
     },
-    [data],
+    [data, setFavorite],
   );
 
   const toggleSource = useCallback((source: SourceId) => {
@@ -441,15 +436,8 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
   }, []);
 
   const aiSearchEnabled = data?.aiSearchEnabled ?? true;
-  const aiWindowDays = data?.searchWindows?.ai ?? 3;
-  const keywordWindowDays = data?.searchWindows?.keyword ?? 30;
-
-  useEffect(() => {
-    if (aiSearchEnabled) return;
-    setSearchMode('keyword');
-    setAiQuery('');
-    setAiResult(null);
-  }, [aiSearchEnabled]);
+  // AI 可用时自动用 AI 搜索，不可用时自动降级为普通搜索。
+  const searchMode: SearchMode = aiSearchEnabled ? 'ai' : 'keyword';
 
   /** 把当前标签同步到地址栏，支持刷新、分享与前进后退。 */
   const syncTagToUrl = useCallback(
@@ -476,41 +464,72 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
   const clearSearch = useCallback(() => {
     setSearchInput('');
     setAiQuery('');
-    setAiResult(null);
+    clearSearchResult();
     setActiveTag(null);
-    setSearchError(null);
     syncTagToUrl(null, 'push');
-  }, [syncTagToUrl]);
+  }, [clearSearchResult, syncTagToUrl]);
 
   const clearTag = useCallback(
     (options: { fromHistory?: boolean } = {}) => {
-      searchAbortRef.current?.abort();
       setActiveTag(null);
       setAiQuery('');
-      setAiResult(null);
-      setSearchError(null);
+      clearSearchResult();
       if (!options.fromHistory) syncTagToUrl(null, 'push');
     },
-    [syncTagToUrl],
-  );
-
-  const handleSearchModeChange = useCallback(
-    (nextMode: SearchMode) => {
-      setSearchMode(nextMode);
-      setAiQuery('');
-      setAiResult(null);
-      setActiveTag(null);
-      setSearchError(null);
-      syncTagToUrl(null, 'push');
-    },
-    [syncTagToUrl],
+    [clearSearchResult, syncTagToUrl],
   );
 
   const clearFilters = useCallback(() => {
     clearSearch();
     setSelectedSources(new Set());
-    setCategory('all');
+    setFavoritesOnly(false);
+    setPreferencesOnly(false);
   }, [clearSearch]);
+
+  /** 保存兴趣偏好；保存后自动切到「猜你喜欢」。 */
+  const savePreferences = useCallback((tags: string[]) => {
+    const unique = [...new Set(tags)].slice(0, MAX_PREFERENCES);
+
+    try {
+      localStorage.setItem(
+        PREFERENCES_KEY,
+        JSON.stringify({ tags: unique, chosenAt: new Date().toISOString() }),
+      );
+    } catch {
+      // 浏览器禁用存储时仅当前页面生效。
+    }
+
+    hasStoredPreferencesRef.current = true;
+    setPreferenceTags(unique);
+    setPreferenceDialogOpen(false);
+    setPreferencesOnly(unique.length > 0);
+    if (unique.length > 0) setFavoritesOnly(false);
+  }, []);
+
+  /** 首次弹窗点「跳过」也写入空偏好，避免每次访问重复打扰。 */
+  const cancelPreferences = useCallback(() => {
+    if (!hasStoredPreferencesRef.current) {
+      try {
+        localStorage.setItem(
+          PREFERENCES_KEY,
+          JSON.stringify({ tags: [], chosenAt: new Date().toISOString() }),
+        );
+      } catch {
+        // 忽略存储失败。
+      }
+      hasStoredPreferencesRef.current = true;
+    }
+    setPreferenceDialogOpen(false);
+  }, []);
+
+  const togglePreferences = useCallback(() => {
+    if (preferenceTags.length === 0) {
+      setPreferenceDialogOpen(true);
+      return;
+    }
+    setPreferencesOnly((value) => !value);
+    setFavoritesOnly(false);
+  }, [preferenceTags.length]);
 
   const handleAiSearch = useCallback(
     async (
@@ -520,99 +539,38 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       const query = (tagOverride ?? searchInput).trim();
       if (!query) return;
 
-      const seq = searchSeqRef.current + 1;
-      searchSeqRef.current = seq;
-      searchAbortRef.current?.abort();
-      const controller = new AbortController();
-      searchAbortRef.current = controller;
+      const next = await search(
+        query,
+        searchMode,
+        tagOverride ? query : undefined,
+      );
+      if (!next) return;
 
-      setAiSearching(true);
-      setSearchError(null);
-
-      try {
-        const response = await fetch('/api/search', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            query,
-            mode: searchMode,
-            tag: tagOverride,
-          }),
-          signal: controller.signal,
-        });
-
-        const payload = (await response.json().catch(() => null)) as
-          | {
-              ids?: unknown;
-              reason?: unknown;
-              mode?: unknown;
-              windowDays?: unknown;
-              suggestedTags?: unknown;
-              truncated?: unknown;
-              error?: unknown;
-            }
-          | null;
-
-        if (seq !== searchSeqRef.current) return;
-
-        if (!response.ok) {
-          throw new Error(
-            typeof payload?.error === 'string'
-              ? payload.error
-              : `HTTP ${response.status}`,
-          );
-        }
-
-        const ids = Array.isArray(payload?.ids)
-          ? payload.ids.filter(
-              (value): value is number => Number.isInteger(value),
-            )
-          : [];
-
-        const suggestedTags = Array.isArray(payload?.suggestedTags)
-          ? payload.suggestedTags
-              .filter(
-                (value): value is { tag: string; count: number } =>
-                  Boolean(value) &&
-                  typeof value === 'object' &&
-                  typeof (value as { tag?: unknown }).tag === 'string' &&
-                  typeof (value as { count?: unknown }).count === 'number',
-              )
-              .slice(0, 12)
-          : [];
-
-        setAiResult({
-          ids,
-          reason: typeof payload?.reason === 'string' ? payload.reason : '',
-          mode: payload?.mode === 'ai' ? 'ai' : 'keyword',
-          windowDays:
-            typeof payload?.windowDays === 'number'
-              ? payload.windowDays
-              : undefined,
-          suggestedTags,
-          truncated: payload?.truncated === true,
-        });
-
-        if (tagOverride) {
-          setActiveTag(tagOverride);
-          setAiQuery('');
-          if (!options.fromHistory) syncTagToUrl(tagOverride, 'push');
-        } else {
-          setActiveTag(null);
-          setAiQuery(query);
-          if (!options.fromHistory) syncTagToUrl(null, 'push');
-        }
-      } catch (error) {
-        if (controller.signal.aborted || seq !== searchSeqRef.current) return;
-        setSearchError(
-          error instanceof Error ? error.message : '搜索失败，请稍后重试',
-        );
-      } finally {
-        if (seq === searchSeqRef.current) setAiSearching(false);
+      if (tagOverride) {
+        setActiveTag(tagOverride);
+        setAiQuery('');
+        if (!options.fromHistory) syncTagToUrl(tagOverride, 'push');
+      } else {
+        setActiveTag(null);
+        setAiQuery(query);
+        if (!options.fromHistory) syncTagToUrl(null, 'push');
       }
     },
-    [searchInput, searchMode, syncTagToUrl],
+    [searchInput, searchMode, search, syncTagToUrl],
   );
+
+  /** 首页搜索统一跳到 /search 的结果页，与独立搜索页保持同一套流程。 */
+  const handleHomeSearch = useCallback(() => {
+    const query = searchInput.trim();
+    if (!query) return;
+
+    try {
+      sessionStorage.setItem(PENDING_SEARCH_KEY, query);
+    } catch {
+      // 浏览器禁用存储时退化为直接带参跳转。
+    }
+    router.push('/search');
+  }, [router, searchInput]);
 
   /** 标签点击：同标签已有结果时不重复请求。 */
   const handleTagClick = useCallback(
@@ -662,7 +620,8 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
     Boolean(aiQuery) ||
     Boolean(activeTag) ||
     selectedSources.size > 0 ||
-    category !== 'all';
+    favoritesOnly ||
+    preferencesOnly;
 
   const aiOrder = useMemo(() => {
     if (!aiResult) return null;
@@ -681,9 +640,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       if (selectedSources.size > 0 && !selectedSources.has(item.source)) {
         return false;
       }
-      if (category === 'favorites') {
-        if (!item.favorite) return false;
-      } else if (category !== 'all' && item.category !== category) {
+      if (favoritesOnly && !item.favorite) {
         return false;
       }
       if (aiOrder && !aiOrder.has(item.id)) return false;
@@ -697,17 +654,14 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
     }
 
     return items.sort((a, b) => {
-      if (a.claimed !== b.claimed) return a.claimed ? 1 : -1;
-      if (a.isNew !== b.isNew) return a.isNew ? -1 : 1;
-
-      const aTime = a.publishedAt ? Date.parse(a.publishedAt) : 0;
-      const bTime = b.publishedAt ? Date.parse(b.publishedAt) : 0;
+      const aTime = Date.parse(a.publishedAt ?? a.firstSeenAt) || 0;
+      const bTime = Date.parse(b.publishedAt ?? b.firstSeenAt) || 0;
       if (aTime !== bTime) return bTime - aTime;
       return b.id - a.id;
     });
-  }, [data, selectedSources, category, aiOrder]);
+  }, [data, selectedSources, favoritesOnly, aiOrder]);
 
-  const hasMore = Boolean(data?.hasMore) && !aiOrder && category !== 'favorites';
+  const hasMore = Boolean(data?.hasMore) && !aiOrder && !favoritesOnly;
   const visibleItems = filteredItems;
 
   // 触底自动加载下一页；同时保留手动按钮作为兜底。
@@ -739,9 +693,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
       ]).size
     : 0;
   const displayTotal =
-    aiOrder || category === 'favorites'
-      ? filteredItems.length
-      : data?.total ?? 0;
+    aiOrder || favoritesOnly ? filteredItems.length : data?.total ?? 0;
   const site = data?.site ?? initialSite;
 
   let content: ReactNode;
@@ -816,7 +768,28 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
           }
         />
       );
-    } else if (data.items.length === 0) {
+    } else if (preferencesOnly) {
+      content = (
+        <EmptyState
+          icon={<Sparkles className="h-5 w-5" aria-hidden="true" />}
+          title="所选品类暂时没有在架优惠"
+          description={`你关注的「${preferenceTags.join('、')}」暂时没有可展示内容，可以调整偏好或查看全部优惠。`}
+          action={
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setPreferenceDialogOpen(true)}
+              >
+                调整偏好
+              </Button>
+              <Button variant="outline" onClick={clearFilters}>
+                查看全部优惠
+              </Button>
+            </div>
+          }
+        />
+      );
+    } else if (data.items.length === 0 && !favoritesOnly) {
       if (!data.fetchedAt && data.fetching) {
         content = (
           <EmptyState
@@ -847,12 +820,12 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
           />
         );
       }
-    } else if (category === 'favorites' && favoriteCount === 0) {
+    } else if (favoritesOnly && favoriteCount === 0) {
       content = (
         <EmptyState
           icon={<Bookmark className="h-5 w-5" aria-hidden="true" />}
           title="还没有收藏的优惠"
-          description="点击卡片右上角的书签图标即可收藏，状态会保存在当前浏览器，刷新后依然保留。"
+          description="点击卡片底部的「收藏」按钮即可收藏，状态会保存在当前浏览器，刷新后依然保留。"
           action={
             <Button variant="outline" onClick={clearFilters}>
               查看全部优惠
@@ -885,18 +858,12 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
   } else {
     content = (
       <div>
-        <div className="grid grid-cols-1 items-start gap-3 md:grid-cols-2 2xl:grid-cols-3">
-          {visibleItems.map((item) => (
-            <DealCard
-              key={item.id}
-              item={item}
-              highlight={aiQuery || undefined}
-              onToggleClaim={() => toggleItemState(item.id, 'claimed')}
-              onToggleFavorite={() => toggleItemState(item.id, 'favorite')}
-              onTagClick={handleTagClick}
-            />
-          ))}
-        </div>
+        <DealMasonry
+          items={visibleItems}
+          highlight={aiQuery || undefined}
+          onToggleFavorite={toggleFavorite}
+          onTagClick={handleTagClick}
+        />
 
         {hasMore ? (
           <div
@@ -945,16 +912,24 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
               </h1>
               <p className="mt-1 text-xs text-slate-500">{site.tagline}</p>
             </div>
-            <a
-              href="https://github.com/Qianxia666/Daily-Deals"
-              target="_blank"
-              rel="noreferrer"
-              aria-label="打开 GitHub 仓库"
-              title="GitHub 仓库"
-              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-line bg-white text-slate-500 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-            >
-              <GithubIcon className="h-4 w-4" />
-            </a>
+            <div className="flex shrink-0 items-center gap-2">
+              <a
+                href={currentUserEmail ? '/account' : '/login'}
+                className="inline-flex h-9 items-center rounded-full border border-line bg-white px-3 text-xs font-medium text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              >
+                {currentUserEmail ? '我的账号' : '登录'}
+              </a>
+              <a
+                href="https://github.com/Qianxia666/Daily-Deals"
+                target="_blank"
+                rel="noreferrer"
+                aria-label="打开 GitHub 仓库"
+                title="GitHub 仓库"
+                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-line bg-white text-slate-500 transition-colors hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              >
+                <GithubIcon className="h-4 w-4" />
+              </a>
+            </div>
           </div>
 
           <StatsBar
@@ -977,22 +952,26 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
           inputRef={searchInputRef}
           query={searchInput}
           onQueryChange={setSearchInput}
-          onSearch={() => void handleAiSearch()}
+          onSearch={handleHomeSearch}
           onClearSearch={clearSearch}
           searching={aiSearching}
           searchError={searchError}
           mode={searchMode}
-          onModeChange={handleSearchModeChange}
-          aiSearchEnabled={aiSearchEnabled}
-          aiWindowDays={aiWindowDays}
-          keywordWindowDays={keywordWindowDays}
+          placeholderTag={placeholderTag}
           sources={data?.sources ?? []}
           totalActive={data?.stats.activeCount ?? 0}
           selectedSources={selectedSources}
           onToggleSource={toggleSource}
           onClearSources={() => setSelectedSources(new Set())}
-          category={category}
-          onCategoryChange={setCategory}
+          favoritesOnly={favoritesOnly}
+          favoriteCount={favoriteCount}
+          onToggleFavorites={() => {
+            setFavoritesOnly((value) => !value);
+            setPreferencesOnly(false);
+          }}
+          preferencesOnly={preferencesOnly}
+          onTogglePreferences={togglePreferences}
+          onEditPreferences={() => setPreferenceDialogOpen(true)}
           hasFilters={hasFilters}
           onClearFilters={clearFilters}
         />
@@ -1016,7 +995,12 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
                 · 标签「{activeTag}」
               </span>
             )}
-            {hasFilters && !aiQuery && !activeTag && <span> · 已筛选</span>}
+            {preferencesOnly && (
+              <span className="text-violet-700"> · 猜你喜欢</span>
+            )}
+            {hasFilters && !aiQuery && !activeTag && !preferencesOnly && (
+              <span> · 已筛选</span>
+            )}
           </p>
           <span className="hidden text-[11px] text-slate-500 sm:inline">
             {activeTag
@@ -1025,7 +1009,7 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
                 ? aiResult?.mode === 'ai'
                   ? '按 AI 相关度排序'
                   : '按关键词匹配排序'
-                : '按新到旧排序，已读置底'}
+                : '按发布时间从新到旧'}
           </span>
         </div>
 
@@ -1069,12 +1053,6 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
 
         <div className="mt-3">{content}</div>
       </main>
-
-      <footer className="mx-auto w-full max-w-6xl px-4 pb-10 pt-6 sm:px-6">
-        <p className="border-t border-line pt-4 text-[11px] leading-relaxed text-slate-500">
-          数据来自各来源公开 RSS 与 Epic 官方接口，仅聚合标题、摘要与原站链接，不存储正文。AI 只对已有条目做改写与筛选，不会生成不存在的优惠。来源状态可在管理后台查看，异常来源会在下一轮自动重试。
-        </p>
-      </footer>
       </div>
 
       {splashPhase !== 'hidden' && (
@@ -1083,6 +1061,14 @@ export function DealsApp({ initialSite }: { initialSite: SiteSettings }) {
           leaving={splashPhase === 'leaving'}
         />
       )}
+
+      <PreferenceDialog
+        open={preferenceDialogOpen}
+        options={tagOptions}
+        initialTags={preferenceTags}
+        onSave={savePreferences}
+        onCancel={cancelPreferences}
+      />
     </>
   );
 }

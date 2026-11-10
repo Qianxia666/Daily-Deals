@@ -8,19 +8,9 @@ import {
   getSiteSettings,
 } from '@/lib/runtime-settings';
 import { isFetching } from '@/lib/scheduler';
-import type { Category } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
-
-const CATEGORIES = new Set<Category>([
-  'free',
-  'limited',
-  'discount',
-  'membership',
-  'game',
-  'other',
-]);
 
 function parseList(value: string | null, max: number): string[] | null {
   if (!value) return null;
@@ -48,14 +38,26 @@ function parseIds(value: string | null): number[] | null {
   return ids;
 }
 
+/** 品类偏好标签：去重、限制长度与数量，异常值直接丢弃。 */
+function parseTags(raw: string | null): string[] | null {
+  if (!raw) return null;
+
+  const tags: string[] = [];
+  const seen = new Set<string>();
+  for (const part of raw.split(',')) {
+    const tag = part.trim();
+    if (tag.length < 2 || tag.length > 12 || seen.has(tag)) continue;
+    seen.add(tag);
+    tags.push(tag);
+    if (tags.length >= 8) break;
+  }
+
+  return tags.length > 0 ? tags : null;
+}
+
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const metaOnly = params.get('metaOnly') === '1';
-  const categoryValue = params.get('category');
-  const category =
-    categoryValue && CATEGORIES.has(categoryValue as Category)
-      ? (categoryValue as Category)
-      : null;
 
   const meta = getDealsMeta();
   const list = metaOnly
@@ -64,9 +66,9 @@ export async function GET(request: NextRequest) {
         limit: Number(params.get('limit')) || 40,
         cursor: params.get('cursor'),
         sources: parseList(params.get('sources'), 50),
-        category,
         onlyNew: params.get('onlyNew') === '1',
         ids: parseIds(params.get('ids')),
+        preferTags: parseTags(params.get('preferTags')),
       });
 
   const body = JSON.stringify({

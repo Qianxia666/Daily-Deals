@@ -57,6 +57,66 @@
   }
 }
 
+/* /search 的科技风背景：颜色全部取自站内 token，深浅色自动适配。 */
+@layer components {
+  .tech-aurora {
+    background-image:
+      radial-gradient(
+        55rem 28rem at 50% -8%,
+        rgb(161 162 7 / 0.14),
+        transparent 62%
+      ),
+      radial-gradient(
+        42rem 24rem at 82% 12%,
+        rgb(59 130 246 / 0.12),
+        transparent 65%
+      ),
+      radial-gradient(
+        38rem 20rem at 12% 78%,
+        rgb(15 23 42 / 0.08),
+        transparent 70%
+      );
+  }
+
+  .tech-grid {
+    background-image:
+      linear-gradient(to right, var(--color-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--color-line) 1px, transparent 1px);
+    background-size: 56px 56px;
+    -webkit-mask-image: radial-gradient(
+      ellipse 62% 52% at 50% 26%,
+      #000 25%,
+      transparent 78%
+    );
+    mask-image: radial-gradient(
+      ellipse 62% 52% at 50% 26%,
+      #000 25%,
+      transparent 78%
+    );
+  }
+
+  .tech-scan {
+    animation: tech-scan 14s linear infinite;
+  }
+}
+
+@keyframes tech-scan {
+  0% {
+    transform: translateY(0);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.7;
+  }
+  90% {
+    opacity: 0.12;
+  }
+  100% {
+    transform: translateY(100vh);
+    opacity: 0;
+  }
+}
+
 /*
  * 跟随设备外观自动切换深色主题。
  * 这里覆盖的是站内实际用到的少数 Tailwind 颜色工具类；
@@ -82,6 +142,26 @@
 
   [class~='bg-white/70'] {
     background-color: rgb(16 27 45 / 0.78);
+  }
+
+  [class~='bg-white/60'] {
+    background-color: rgb(16 27 45 / 0.7);
+  }
+
+  [class~='bg-white/75'] {
+    background-color: rgb(16 27 45 / 0.8);
+  }
+
+  [class~='bg-white/85'] {
+    background-color: rgb(16 27 45 / 0.88);
+  }
+
+  [class~='bg-paper/85'] {
+    background-color: rgb(7 13 24 / 0.88);
+  }
+
+  [class~='placeholder:text-slate-400']::placeholder {
+    color: #7c8da6;
   }
 
   [class~='bg-paper'] {
