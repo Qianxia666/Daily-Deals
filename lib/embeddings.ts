@@ -1,4 +1,9 @@
-import { getRuntimeBool, getRuntimeEnv, getRuntimeEnvNumber } from './runtime-settings';
+import {
+  getRuntimeBool,
+  getRuntimeEnv,
+  getRuntimeEnvFloat,
+  getRuntimeEnvNumber,
+} from './runtime-settings';
 
 /** 单次请求的文本条数，8B 模型下 16 条大约 8~10 秒。 */
 const BATCH_SIZE = 16;
@@ -35,7 +40,12 @@ export function getEmbeddingConfig(): EmbeddingConfig {
     url: getRuntimeEnv('EMBEDDING_API_URL').trim(),
     key: getRuntimeEnv('EMBEDDING_API_KEY').trim(),
     model: getRuntimeEnv('EMBEDDING_MODEL', 'Qwen/Qwen3-Embedding-8B').trim(),
-    threshold: getRuntimeEnvNumber('SUBSCRIPTION_VECTOR_THRESHOLD', 0.6, 0.3, 0.95),
+    threshold: getRuntimeEnvFloat(
+      'SUBSCRIPTION_VECTOR_THRESHOLD',
+      0.5,
+      0.3,
+      0.95,
+    ),
     maxPerDeal: getRuntimeEnvNumber('SUBSCRIPTION_VECTOR_MAX_PER_DEAL', 20, 1, 100),
     stopwords,
   };

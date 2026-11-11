@@ -46,6 +46,7 @@ import {
   type SearchScopeOptions,
 } from './search-index';
 import { getTagRunProgress } from './tag-progress';
+import { expandKeyword, hasExpansion } from './keyword-expand';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS deals (
@@ -252,6 +253,16 @@ CREATE TABLE IF NOT EXISTS vector_match_log (
 );
 CREATE INDEX IF NOT EXISTS idx_vector_log_created ON vector_match_log(created_at);
 
+CREATE TABLE IF NOT EXISTS keyword_expansions (
+  keyword TEXT PRIMARY KEY COLLATE NOCASE,
+  kind TEXT NOT NULL DEFAULT 'other',
+  expansions TEXT NOT NULL DEFAULT '[]',
+  model TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'ready',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS public_digests (
   digest_date TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -295,6 +306,7 @@ interface ExistingDealRow {
   ai_summary: string | null;
   ai_value: string | null;
   ai_action: string | null;
+  ai_attempts: number;
   ai_model: string | null;
   ai_at: string | null;
   ai_tags_at: string | null;
@@ -714,8 +726,8 @@ export function upsertDeals(deals: RawDeal[]): number {
 
   const findExisting = db.prepare(
     `SELECT id, title, description, ai_title, ai_summary,
-            ai_model, ai_at, ai_tags_at, body_fetched_at,
-            tags, proposed_tags, entities
+            ai_value, ai_action, ai_attempts, ai_model, ai_at, ai_tags_at,
+            body_fetched_at, tags, proposed_tags, entities
      FROM deals WHERE link = ?`,
   );
   const updateExisting = db.prepare(`
@@ -732,7 +744,10 @@ export function upsertDeals(deals: RawDeal[]): number {
         tags = ?,
         proposed_tags = ?,
         entities = ?,
-        ai_tags_at = ?
+        ai_tags_at = ?,
+        ai_value = ?,
+        ai_action = ?,
+        ai_attempts = ?
     WHERE link = ?
   `);
   const insertDeal = db.prepare(`
@@ -780,6 +795,9 @@ export function upsertDeals(deals: RawDeal[]): number {
           contentChanged ? '[]' : existing.proposed_tags ?? '[]',
           contentChanged ? '[]' : existing.entities ?? '[]',
           contentChanged ? null : existing.ai_tags_at,
+          contentChanged ? null : existing.ai_value,
+          contentChanged ? null : existing.ai_action,
+          contentChanged ? 0 : existing.ai_attempts,
           item.link,
         );
         indexDealById(db, existing.id, searchMaxChars);
@@ -1232,7 +1250,8 @@ export function getPopularTags(limit = 500): PopularTag[] {
   return db
     .prepare(
       `SELECT json_each.value AS tag, COUNT(*) AS count
-       FROM deals d, json_each(d.tags)
+       FROM deals d,
+            json_each(CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END)
        WHERE (d.expires_at IS NULL OR d.expires_at > ?)
          AND d.first_seen_at >= ?
          AND d.source IN (${visible.map(() => '?').join(', ')})
@@ -2547,10 +2566,12 @@ export function updateSubscriptionKeyword(
   }
 }
 
-export function setUserDisabled(id: number, disabled: boolean): void {
-  getDb()
-    .prepare('UPDATE users SET disabled = ? WHERE id = ?')
-    .run(disabled ? 1 : 0, id);
+export function setUserDisabled(id: number, disabled: boolean): boolean {
+  return (
+    getDb()
+      .prepare('UPDATE users SET disabled = ? WHERE id = ?')
+      .run(disabled ? 1 : 0, id).changes > 0
+  );
 }
 
 /* ------------------------------ 会话 ------------------------------ */
@@ -2899,6 +2920,7 @@ interface MatchDealRow {
   description: string;
   tags: string | null;
   proposed_tags: string | null;
+  entities: string | null;
   expires_at: string | null;
   link: string;
 }
@@ -3026,13 +3048,86 @@ export function getDealById(id: number): DealDetail | null {
   };
 }
 
+export interface SubscriptionMatchOptions {
+  /** 是否展开品类词到品牌、品牌词到别名，默认开启。 */
+  expand?: boolean;
+  /** 分层计分阈值，默认 2；只有摘要与正文提及不足以命中。 */
+  minScore?: number;
+}
+
+/** 读取已缓存的 AI 关键词扩展。 */
+export function readKeywordExpansions(
+  keywords: string[],
+): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  if (keywords.length === 0) return map;
+  const rows = getDb()
+    .prepare(
+      `SELECT keyword, expansions FROM keyword_expansions
+       WHERE status = 'ready'
+         AND keyword IN (${keywords.map(() => '?').join(', ')})`,
+    )
+    .all(...keywords) as { keyword: string; expansions: string }[];
+  for (const row of rows) {
+    map.set(row.keyword.toLowerCase(), parseStoredTags(row.expansions));
+  }
+  return map;
+}
+
+/** 尚未做过 AI 扩展的启用订阅词（内置词表已覆盖的除外）。 */
+export function listKeywordsMissingExpansion(limit = 20): string[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT DISTINCT s.keyword AS keyword FROM subscriptions s
+       JOIN users u ON u.id = s.user_id
+       LEFT JOIN keyword_expansions e ON e.keyword = s.keyword COLLATE NOCASE
+       WHERE s.enabled = 1 AND u.disabled = 0
+         AND (e.keyword IS NULL OR (e.status = 'failed' AND e.updated_at < ?))`,
+    )
+    .all(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()) as {
+    keyword: string;
+  }[];
+  return rows
+    .map((row) => row.keyword)
+    .filter((keyword) => !hasExpansion(keyword))
+    .slice(0, limit);
+}
+
+export function saveKeywordExpansion(
+  keyword: string,
+  kind: string,
+  expansions: string[],
+  model: string,
+  status: 'ready' | 'failed',
+): void {
+  const now = new Date().toISOString();
+  getDb()
+    .prepare(
+      `INSERT INTO keyword_expansions
+         (keyword, kind, expansions, model, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(keyword) DO UPDATE SET
+         kind = excluded.kind,
+         expansions = excluded.expansions,
+         model = excluded.model,
+         status = excluded.status,
+         updated_at = excluded.updated_at`,
+    )
+    .run(keyword, kind, JSON.stringify(expansions), model, status, now, now);
+}
+
 /** 新优惠打完标签后，按用户关键词生成待投递记录（幂等）。 */
-export function matchDealToSubscriptions(dealId: number): number {
+export function matchDealToSubscriptions(
+  dealId: number,
+  options: SubscriptionMatchOptions = {},
+): number {
+  const expand = options.expand ?? true;
+  const minScore = options.minScore ?? 2;
   const db = getDb();
   const deal = db
     .prepare(
       `SELECT id, title, ai_title, ai_summary, description, tags,
-              proposed_tags, expires_at, link
+              proposed_tags, entities, expires_at, link
        FROM deals
        WHERE id = ?
          AND EXISTS (
@@ -3044,17 +3139,32 @@ export function matchDealToSubscriptions(dealId: number): number {
   if (!deal) return 0;
   if (deal.expires_at && Date.parse(deal.expires_at) <= Date.now()) return 0;
 
-  const haystack = [
-    deal.title,
-    deal.ai_title ?? '',
-    deal.ai_summary ?? '',
-    deal.description,
-    ...parseStoredTags(deal.tags),
-    ...parseStoredTags(deal.proposed_tags),
-  ]
-    .join('\n')
-    .toLowerCase();
-  if (!haystack.trim()) return 0;
+  // 按可信度分层：AI 抽出的实体最强，标签次之，标题再次，摘要与正文只作弱信号。
+  const layers: { text: string; weight: number }[] = [
+    { text: parseStoredTags(deal.entities).join('\n'), weight: 4 },
+    {
+      text: [
+        ...parseStoredTags(deal.tags),
+        ...parseStoredTags(deal.proposed_tags),
+      ].join('\n'),
+      weight: 3,
+    },
+    { text: deal.ai_title ?? '', weight: 2 },
+    { text: deal.title, weight: 2 },
+    { text: deal.ai_summary ?? '', weight: 1 },
+    { text: deal.description, weight: 1 },
+  ].map((layer) => ({ text: layer.text.toLowerCase(), weight: layer.weight }));
+
+  if (!layers.some((layer) => layer.text.trim())) return 0;
+
+  const scoreOf = (form: string): number => {
+    if (!form) return 0;
+    let score = 0;
+    for (const layer of layers) {
+      if (layer.text.includes(form)) score += layer.weight;
+    }
+    return score;
+  };
 
   const subs = db
     .prepare(
@@ -3065,9 +3175,22 @@ export function matchDealToSubscriptions(dealId: number): number {
     )
     .all() as { id: number; user_id: number; keyword: string }[];
 
-  const matched = subs.filter((sub) =>
-    haystack.includes(sub.keyword.trim().toLowerCase()),
-  );
+  const dynamicExpansions = expand
+    ? readKeywordExpansions(subs.map((sub) => sub.keyword.trim()))
+    : new Map<string, string[]>();
+
+  const matched = subs.filter((sub) => {
+    const key = sub.keyword.trim().toLowerCase();
+    const forms = expand
+      ? [...expandKeyword(sub.keyword), ...(dynamicExpansions.get(key) ?? [])]
+      : [key];
+    let best = 0;
+    for (const form of forms) {
+      best = Math.max(best, scoreOf(form));
+      if (best >= minScore) return true;
+    }
+    return false;
+  });
   if (matched.length === 0) return 0;
 
   // 同一用户多个关键词命中同一条优惠时只推送一次，取最早创建的关键词。
@@ -3121,7 +3244,57 @@ export function matchDealToSubscriptions(dealId: number): number {
   return created;
 }
 
-export function listPendingDeliveries(limit = 50): PendingDelivery[] {
+/**
+ * 关键词扩展刚补上时，回扫最近入库的文章补匹配。
+ * 匹配是幂等的（deliveries 有唯一约束），重复调用不会重复投递。
+ */
+export function backfillRecentDeals(
+  minutes: number,
+  options: SubscriptionMatchOptions = {},
+): number {
+  const since = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+  const rows = getDb()
+    .prepare(
+      `SELECT d.id FROM deals d
+       WHERE d.first_seen_at >= ?
+         AND EXISTS (
+           SELECT 1 FROM sources s
+           WHERE s.id = d.source AND s.state = 'active' AND s.enabled = 1
+         )
+       ORDER BY d.id ASC
+       LIMIT 800`,
+    )
+    .all(since) as { id: number }[];
+
+  let created = 0;
+  for (const row of rows) {
+    created += matchDealToSubscriptions(row.id, options);
+  }
+  return created;
+}
+
+export function listPendingDeliveries(
+  limit = 50,
+  options: { skipSaturatedUsers?: number } = {},
+): PendingDelivery[] {
+  // 已达今日限额的用户，其条目会一直留在队列里占位，
+  // 若不在这里剔除，会让后续用户的待投递永远排不上（队列饥饿）。
+  const saturated = options.skipSaturatedUsers;
+  const saturationFilter =
+    typeof saturated === 'number' && saturated > 0
+      ? `AND (
+           SELECT COUNT(*) FROM deliveries sent
+           WHERE sent.user_id = d.user_id
+             AND sent.status = 'sent'
+             AND sent.sent_at >= ?
+         ) < ?`
+      : '';
+  const params: unknown[] = [new Date().toISOString()];
+  if (saturationFilter) {
+    params.push(todayStartIso(), saturated);
+  }
+  params.push(limit);
+
   const rows = getDb()
     .prepare(
       `SELECT d.id, d.user_id, d.subscription_id, d.channel_id, d.deal_id,
@@ -3136,10 +3309,11 @@ export function listPendingDeliveries(limit = 50): PendingDelivery[] {
        JOIN deals ON deals.id = d.deal_id
        WHERE d.status = 'pending' AND d.attempts < 3
          AND (deals.expires_at IS NULL OR deals.expires_at > ?)
+         ${saturationFilter}
        ORDER BY d.id ASC
        LIMIT ?`,
     )
-    .all(new Date().toISOString(), limit) as {
+    .all(...params) as {
     id: number;
     user_id: number;
     subscription_id: number;
@@ -3391,10 +3565,11 @@ export function listPendingDigests(limit = 30): PendingDigest[] {
        JOIN channels c ON c.id = g.channel_id AND c.enabled = 1
        JOIN users u ON u.id = g.user_id AND u.disabled = 0
        WHERE g.status = 'pending' AND g.attempts < 3
+         AND g.digest_date = ?
        ORDER BY g.id ASC
        LIMIT ?`,
     )
-    .all(Math.min(Math.max(limit, 1), 200)) as {
+    .all(todayKey(), Math.min(Math.max(limit, 1), 200)) as {
     id: number;
     user_id: number;
     channel_id: number;
@@ -3784,9 +3959,7 @@ export interface DealVectorInput {
   id: number;
   title: string;
   ai_title: string | null;
-  ai_summary: string | null;
   tags: string;
-  description: string;
 }
 
 /** 需要补算向量的启用关键词（缺失或模型版本不一致）。 */
@@ -3882,9 +4055,7 @@ export function listDealsNeedingVector(
       `SELECT d.id,
               d.title,
               d.ai_title,
-              d.ai_summary,
-              d.tags,
-              d.description
+              d.tags
        FROM deals d
        JOIN sources s ON s.id = d.source AND s.state = 'active' AND s.enabled = 1
        WHERE (d.expires_at IS NULL OR d.expires_at > ?)
@@ -3968,7 +4139,7 @@ export function insertVectorDeliveries(
      SELECT ?, ?, ?, ?, ?
      WHERE NOT EXISTS (
        SELECT 1 FROM deliveries
-       WHERE user_id = ? AND deal_id = ?
+       WHERE user_id = ? AND channel_id = ? AND deal_id = ?
      )`,
   );
   const now = new Date().toISOString();
@@ -3984,6 +4155,7 @@ export function insertVectorDeliveries(
           dealId,
           now,
           match.userId,
+          channelId,
           dealId,
         ).changes;
       }

@@ -30,8 +30,8 @@ export async function sendAdminAlert(
     getRuntimeEnvNumber('ALERT_COOLDOWN_MINUTES', 60, 5, 1440) * 60_000;
   const now = Date.now();
   if (now - (cooldowns.get(key) ?? 0) < cooldownMs) return;
-  cooldowns.set(key, now);
 
+  let delivered = false;
   await Promise.all(
     targets.map(async ({ kind, config }) => {
       try {
@@ -44,6 +44,7 @@ export async function sendAdminAlert(
           },
           { title, lines },
         );
+        delivered = true;
       } catch (error) {
         console.warn(
           `[alert] ${CHANNEL_LABELS[kind]}告警发送失败：${
@@ -53,4 +54,7 @@ export async function sendAdminAlert(
       }
     }),
   );
+
+  // 只有至少一个渠道发送成功才进入冷却，否则下次仍可重试。
+  if (delivered) cooldowns.set(key, now);
 }

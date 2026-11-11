@@ -110,7 +110,15 @@ export function stripHtml(input: string): string {
 export function normalizeDate(value: unknown): string | null {
   const text = nodeText(value).trim();
   if (!text) return null;
-  const timestamp = Date.parse(text);
+
+  // 中文源常见 "2026-11-11 17:12:00" 这类没有时区的写法，
+  // 按站点默认时区（东八区）解释，避免跟随进程时区偏移。
+  const hasZone = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(text) || /\b(?:GMT|UTC)\b/i.test(text);
+  const isoLocal = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?$/.test(text);
+  const normalized =
+    !hasZone && isoLocal ? `${text.replace(' ', 'T')}+08:00` : text;
+
+  const timestamp = Date.parse(normalized);
   if (Number.isNaN(timestamp)) return null;
   return new Date(timestamp).toISOString();
 }
@@ -140,7 +148,8 @@ export function parseRssFeed(xml: string, feedUrl: string): ParsedFeedItem[] {
   for (const entry of entries) {
     if (!entry || typeof entry !== 'object') continue;
 
-    const title = stripHtml(nodeText(entry.title));
+    // 个别源会返回异常长的标题，入库前统一截断。
+    const title = stripHtml(nodeText(entry.title)).slice(0, 200);
     const link = absoluteUrl(extractLink(entry), feedUrl);
     if (!title || !link) continue;
 

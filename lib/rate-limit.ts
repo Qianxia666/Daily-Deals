@@ -6,6 +6,7 @@ interface Bucket {
 }
 
 const store = new Map<string, Bucket>();
+let lastSweep = 0;
 
 /** 取客户端 IP；没有反向代理头时回退为全局计数。 */
 export function getClientIp(request: NextRequest): string {
@@ -24,7 +25,9 @@ export function checkRateLimit(
 ): { ok: boolean; retryAfter: number } {
   const now = Date.now();
 
-  if (store.size > 5_000) {
+  // 定期清理过期桶，避免低流量下过期条目长期驻留内存。
+  if (now - lastSweep > 60_000) {
+    lastSweep = now;
     for (const [entryKey, bucket] of store) {
       if (bucket.resetAt <= now) store.delete(entryKey);
     }

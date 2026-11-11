@@ -73,10 +73,12 @@ async function fetchBody(deal: PendingBodyDeal): Promise<BodyResult> {
  * 全局串行，保证对镜像站和线报站都足够温和。
  */
 export async function backfillOneBody(): Promise<boolean> {
-  const [next] = listPendingBodyDeals(1);
+  // 取一小批而不是一条：某个来源处于暂停期时不应拖住其他来源。
+  const candidates = listPendingBodyDeals(10);
+  const next = candidates.find(
+    (deal) => Date.now() >= (pausedUntil.get(deal.source) ?? 0),
+  );
   if (!next) return false;
-
-  if (Date.now() < (pausedUntil.get(next.source) ?? 0)) return false;
 
   const result = await fetchBody(next);
 
@@ -107,6 +109,8 @@ export async function backfillOneBody(): Promise<boolean> {
   const count = (failures.get(next.source) ?? 0) + 1;
   failures.set(next.source, count);
   if (count >= MAX_CONSECUTIVE_FAILURES) {
+    // 连续失败说明这条详情页本身有问题，标记已尝试，避免永远卡在队首。
+    markDealBodyFetched(next.id);
     pausedUntil.set(next.source, Date.now() + FAILURE_PAUSE_MS);
     failures.delete(next.source);
     console.warn(`[body] ${next.source} 连续失败 ${count} 次，暂停 30 分钟`);

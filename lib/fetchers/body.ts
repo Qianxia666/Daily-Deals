@@ -66,8 +66,9 @@ function sliceDiv(html: string, openTag: RegExp): string | null {
  */
 export function extractBody(kind: string, html: string): string | null {
   if (kind === 'sina_weibo') {
+    // 站点可能给同一元素追加其他类名，这里用包含匹配而不是全等。
     const article = html.match(
-      /<article class="article-content">([\s\S]*?)<\/article>/i,
+      /<article\b[^>]*class="[^"]*\barticle-content\b[^"]*"[^>]*>([\s\S]*?)<\/article>/i,
     )?.[1];
 
     const text = article

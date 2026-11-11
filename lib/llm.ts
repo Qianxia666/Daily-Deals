@@ -959,6 +959,120 @@ async function callSearchModel(
   return null;
 }
 
+const EXPAND_SYSTEM_PROMPT = `你是优惠信息订阅的关键词扩展助手。用户会给出一个关键词数组，请对每个词判断类型并给出扩展词。
+
+类型说明：
+- category：品类词（如"空调""奶茶""猫粮"），列出该品类下最常见的品牌名，6–12 个，必须是真实存在的品牌
+- brand：品牌词（如"格力""喜茶"），列出该品牌常见的别名、英文名、简称，0–3 个
+- other：泛词或无法归类（如"免费""红包""优惠"），返回空数组
+
+硬性规则：
+1. 只输出确定存在的品牌与别名，不确定就不要写，严禁编造
+2. 不要输出品类本身的同义词，不要输出其他品类名
+3. 品牌名使用中文常用写法，英文别名用小写
+4. 每个输入词必须返回一条，keyword 原样返回
+
+输出 JSON：
+{"items":[{"keyword":"空调","kind":"category","expansions":["格力","美的","海尔"]}]}`;
+
+export interface KeywordExpansionResult {
+  keyword: string;
+  kind: string;
+  expansions: string[];
+}
+
+/** 让模型批量判断订阅词类型并给出品牌/别名扩展，一次请求处理多个词。 */
+export async function expandKeywordsWithAi(
+  keywords: string[],
+): Promise<KeywordExpansionResult[] | null> {
+  if (keywords.length === 0) return [];
+  const config = readConfig();
+  if (!config) return null;
+
+  const payload = {
+    model: config.model,
+    messages: [
+      { role: 'system', content: EXPAND_SYSTEM_PROMPT },
+      { role: 'user', content: JSON.stringify({ keywords }) },
+    ],
+    temperature: 0.1,
+    max_tokens: Math.min(2048, 300 + keywords.length * 120),
+    response_format: { type: 'json_object' },
+  };
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await request(
+        config.endpoint,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify(payload),
+        },
+        config.timeoutMs,
+      );
+
+      const body = await response.text();
+
+      if (!response.ok) {
+        const retryable = response.status === 429 || response.status >= 500;
+        if (retryable && attempt === 0) {
+          await sleep(1_000);
+          continue;
+        }
+        throw new Error(`HTTP ${response.status}: ${body.slice(0, 160)}`);
+      }
+
+      const data = JSON.parse(body) as {
+        choices?: { message?: { content?: string } }[];
+      };
+      const content = data.choices?.[0]?.message?.content ?? '';
+      const parsed = parseBatchContent(content) as { items?: unknown } | undefined;
+      const items = Array.isArray(parsed?.items) ? parsed.items : [];
+
+      const results: KeywordExpansionResult[] = [];
+      for (const raw of items) {
+        if (!raw || typeof raw !== 'object') continue;
+        const item = raw as Record<string, unknown>;
+        const keyword =
+          typeof item.keyword === 'string' ? item.keyword.trim() : '';
+        if (!keyword) continue;
+        const kind = typeof item.kind === 'string' ? item.kind : 'other';
+        const expansions = Array.isArray(item.expansions)
+          ? item.expansions
+              .filter((value): value is string => typeof value === 'string')
+              .map((value) => value.trim())
+              .filter(Boolean)
+              .slice(0, 12)
+          : [];
+        results.push({ keyword, kind, expansions });
+      }
+
+      if (results.length > 0) return results;
+      if (attempt === 0) continue;
+    } catch (error) {
+      if (attempt === 0) continue;
+      console.warn(
+        `[keyword] AI 扩展失败：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return null;
+    }
+  }
+
+  return null;
+}
+
+/** 当前 AI 模型名，用于记录扩展来源。 */
+export function getAiModelName(): string {
+  return readConfig()?.model ?? '';
+}
+
 /**
  * 让模型从当前真实条目中筛选搜索结果。
  * 返回 null 表示 AI 不可用或输出不可解析，调用方应回退到关键词匹配。

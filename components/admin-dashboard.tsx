@@ -697,8 +697,10 @@ export function AdminDashboard() {
       if (!searchIndex) throw new Error('未返回索引状态');
       applyStatus(searchIndex);
 
-      // 后台异步重建，轮询进度直到结束。
-      while (searchIndex.rebuilding) {
+      // 后台异步重建，轮询进度直到结束（最多约 2 分钟，避免服务端异常时无限轮询）。
+      let attempts = 0;
+      while (searchIndex.rebuilding && attempts < 150) {
+        attempts += 1;
         await new Promise((resolve) => window.setTimeout(resolve, 800));
         const statusResponse = await fetch('/api/admin/search-index', {
           cache: 'no-store',

@@ -34,7 +34,7 @@ export async function POST() {
   } catch (error) {
     console.error('[admin] rebuild search index failed', error);
     return NextResponse.json(
-      { error: `重建索引失败：${error instanceof Error ? error.message : String(error)}` },
+      { error: '重建索引失败，请查看服务端日志' },
       { status: 500 },
     );
   }

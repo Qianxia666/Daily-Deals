@@ -201,7 +201,12 @@ function itemLines(message: NotifyMessage): string[] {
 function barkEndpoint(target: NotifyTarget): string {
   const raw = target.webhook.trim() || target.key.trim();
   if (!raw) throw new Error('未配置 Bark Key');
-  if (/^https?:\/\//i.test(raw)) return raw;
+  if (/^https?:\/\//i.test(raw)) {
+    // 自建 Bark 服务同样要限制 https 与内网地址，避免 SSRF。
+    const error = validateWebhook('bark', raw);
+    if (error) throw new Error(error);
+    return raw;
+  }
 
   const error = allowAnyHost() ? null : 'Bark 只支持 https 地址';
   if (error) throw new Error(error);
@@ -267,6 +272,14 @@ export async function sendNotification(
     );
     if (!response.ok) {
       throw new Error(`Bark 推送失败：HTTP ${response.status}`);
+    }
+    // Bark 成功时返回 {"code":200}，Key 无效等情况仍是 HTTP 200。
+    const payload = await readJson(response);
+    const code = payload.code;
+    if (typeof code === 'number' && code !== 200) {
+      const detail =
+        (payload.message as string | undefined) ?? `code ${code}`;
+      throw new Error(`Bark 推送失败：${detail}`);
     }
     return;
   }

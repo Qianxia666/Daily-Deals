@@ -15,7 +15,10 @@ export async function GET(request: NextRequest) {
   const rawStatus = searchParams.get('status') ?? 'all';
   const status =
     rawStatus === 'active' || rawStatus === 'disabled' ? rawStatus : 'all';
-  const page = Math.max(1, Math.floor(Number(searchParams.get('page')) || 1));
+  const page = Math.min(
+    10_000,
+    Math.max(1, Math.floor(Number(searchParams.get('page')) || 1)),
+  );
   const pageSize = Math.min(
     50,
     Math.max(5, Math.floor(Number(searchParams.get('pageSize')) || 20)),
@@ -47,6 +50,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: '参数错误' }, { status: 400 });
   }
 
-  setUserDisabled(id, body?.disabled === true);
+  if (!setUserDisabled(id, body?.disabled === true)) {
+    return NextResponse.json({ error: '用户不存在' }, { status: 404 });
+  }
   return NextResponse.json({ ok: true });
 }

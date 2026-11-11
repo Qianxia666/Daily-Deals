@@ -866,13 +866,37 @@ const FIELDS: RuntimeFieldDef[] = [
     ],
   },
   {
+    key: 'SUBSCRIPTION_MATCH_EXPAND_ENABLED',
+    label: '关键词智能扩展',
+    group: '订阅匹配',
+    description:
+      '开启后，品类词自动覆盖该品类的常见品牌（订「奶茶」也能收到喜茶、霸王茶姬），品牌词覆盖英文名与俗称（订「喜茶」也能收到 HEYTEA）。关闭则只做原文精确匹配。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'SUBSCRIPTION_MATCH_MIN_SCORE',
+    label: '匹配命中阈值',
+    group: '订阅匹配',
+    description:
+      '按可信度计分：AI 实体 4 分、品类标签 3 分、AI 标题与原始标题各 2 分、摘要与正文各 1 分。达到该分数才推送，默认 2；调高更严格，调低更宽松。',
+    type: 'number',
+    defaultValue: '2',
+    min: 1,
+    max: 8,
+  },
+  {
     key: 'SUBSCRIPTION_VECTOR_THRESHOLD',
     label: '相似度阈值',
     group: '订阅向量',
     description:
-      '余弦相似度达到该值才算命中，默认 0.6。调高更严格、误推少但可能漏推；调低相反。',
+      '余弦相似度达到该值才算命中，默认 0.5。调高更严格、误推少但可能漏推；调低相反。',
     type: 'number',
-    defaultValue: '0.6',
+    defaultValue: '0.5',
     min: 0.3,
     max: 0.95,
   },
@@ -1188,6 +1212,19 @@ export function getRuntimeEnvNumber(
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) return fallback;
   return clamp(Math.round(value), min, max);
+}
+
+/** 读取小数配置（如 0~1 的相似度阈值），不做取整。 */
+export function getRuntimeEnvFloat(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const raw = getRuntimeEnvRaw(key);
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return clamp(value, min, max);
 }
 
 /** 全局刷新间隔（分钟）。 */

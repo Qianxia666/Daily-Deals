@@ -423,6 +423,9 @@ export function ensureSearchIndex(
   ).count;
 
   if (version !== SEARCH_INDEX_VERSION || indexed !== deals) {
+    // 后台重建进行中时不要同步重建，避免并发清空/写入同一张表。
+    if (getProgress().running) return true;
+
     const started = Date.now();
     const total = rebuildSearchIndex(db, maxChars);
     console.log(

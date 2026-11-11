@@ -80,7 +80,10 @@ function toDigestItem(
  */
 export function matchSubscriptionsForDeal(dealId: number): void {
   try {
-    matchDealToSubscriptions(dealId);
+    matchDealToSubscriptions(dealId, {
+      expand: runtimeEnabled('SUBSCRIPTION_MATCH_EXPAND_ENABLED'),
+      minScore: getRuntimeEnvNumber('SUBSCRIPTION_MATCH_MIN_SCORE', 2, 1, 8),
+    });
   } catch (error) {
     console.warn(
       `[delivery] 订阅匹配失败（deal=${dealId}）：${
@@ -94,13 +97,16 @@ export function matchSubscriptionsForDeal(dealId: number): void {
 export async function deliverPending(): Promise<void> {
   if (runtime.__dailyDealsDeliveryRunning) return;
 
-  const pending = listPendingDeliveries(30);
+  const limits = getAccountLimits();
+  // 满额用户的条目留在队列里会让其他用户永远排不上，这里直接排除。
+  const pending = listPendingDeliveries(30, {
+    skipSaturatedUsers: limits.dailyPush,
+  });
   if (pending.length === 0) return;
 
   runtime.__dailyDealsDeliveryRunning = true;
 
   try {
-    const limits = getAccountLimits();
     const sentByUser = new Map<number, number>();
 
     for (const item of pending) {
@@ -204,10 +210,13 @@ export async function runOverflowDigest(date: string): Promise<void> {
     const sent =
       sentByUser.get(group.userId) ?? countUserPushesToday(group.userId);
     sentByUser.set(group.userId, sent);
-    if (sent < limits.dailyPush) continue;
 
     const unique = [...group.deals.values()];
     if (unique.length === 0) continue;
+    // 今日剩余额度足够逐条推送时交给即时推送；否则合并成一条，
+    // 避免 20:30 之后才达标的条目拖到次日被静默丢弃。
+    if (unique.length <= limits.dailyPush - sent) continue;
+
     const items = unique.slice(0, 100);
 
     const keywords = [...group.keywords];

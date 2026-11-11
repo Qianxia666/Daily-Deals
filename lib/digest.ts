@@ -161,7 +161,10 @@ export function buildPublicDigest(date: string): PublicDigest {
 
 export function ensurePublicDigest(date: string): PublicDigest {
   const existing = getPublicDigest(date);
-  if (existing && !hasHiddenSource(existing)) return existing;
+  // 当天数据仍在增长，缓存会漏掉新收录的优惠；历史日期仅在来源变动时重建。
+  if (existing && date !== todayKey() && !hasHiddenSource(existing)) {
+    return existing;
+  }
   const digest = buildPublicDigest(date);
   savePublicDigest(digest);
   return digest;

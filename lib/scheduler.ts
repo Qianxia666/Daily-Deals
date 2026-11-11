@@ -1,10 +1,13 @@
 import {
+  backfillRecentDeals,
+  listKeywordsMissingExpansion,
   listSources,
   listSourceStatus,
   getLastFetchedAt,
   pruneDeals,
   resetNewFlags,
   saveFetchRun,
+  saveKeywordExpansion,
   skipStalePendingDeliveries,
   upsertDeals,
   type SourceRunStatus,
@@ -12,7 +15,11 @@ import {
 } from './db';
 import { fetchSource } from './fetchers';
 import { describeFetchError } from './http';
-import { enrichPendingDeals } from './llm';
+import {
+  enrichPendingDeals,
+  expandKeywordsWithAi,
+  getAiModelName,
+} from './llm';
 import { runBackupIfDue } from './backup';
 import { sendAdminAlert } from './alerts';
 import {
@@ -24,6 +31,7 @@ import { startBodyBackfillWorker } from './body-backfill';
 import {
   getGlobalIntervalMinutes,
   getRuntimeEnvNumber,
+  getRuntimeEnvRaw,
 } from './runtime-settings';
 import { SOURCE_TIMEOUT_MS } from './sources';
 import { getEmbeddingConfig } from './embeddings';
@@ -42,6 +50,7 @@ const runtime = globalThis as typeof globalThis & {
   __dailyDealsSchedulerStarted?: boolean;
   __dailyDealsFetching?: boolean;
   __dailyDealsVectorBusy?: boolean;
+  __dailyDealsKeywordBusy?: boolean;
 };
 
 export function isFetching(): boolean {
@@ -230,11 +239,17 @@ export function startScheduler(): void {
   runtime.__dailyDealsSchedulerStarted = true;
 
   const tick = () => {
-    runBackupIfDue();
+    try {
+      runBackupIfDue();
 
-    const due = dueSources();
-    if (due.length === 0) return;
-    void runFetchRound(due.map((source) => source.id));
+      const due = dueSources();
+      if (due.length === 0) return;
+      void runFetchRound(due.map((source) => source.id)).catch((error) => {
+        console.error('[scheduler] 抓取轮次失败：', error);
+      });
+    } catch (error) {
+      console.error('[scheduler] tick 失败：', error);
+    }
   };
 
   setTimeout(tick, 2_500 + Math.random() * 57_500);
@@ -242,10 +257,14 @@ export function startScheduler(): void {
 
   // 每 60 秒处理一次订阅推送、每日摘要与跨天清理。
   const deliveryTick = async () => {
-    skipStalePendingDeliveries();
-    await runScheduledDigests();
-    await deliverPending();
-    await deliverPendingDigests();
+    try {
+      skipStalePendingDeliveries();
+      await runScheduledDigests();
+      await deliverPending();
+      await deliverPendingDigests();
+    } catch (error) {
+      console.error('[scheduler] 投递调度失败：', error);
+    }
   };
   setTimeout(() => {
     void deliveryTick();
@@ -281,6 +300,74 @@ export function startScheduler(): void {
   setInterval(() => {
     void vectorTick();
   }, 60_000);
+
+  // 表外订阅词：每 10 分钟检查一次，批量交给 AI 判断品类并补品牌/别名。
+  const keywordTick = async () => {
+    if (runtime.__dailyDealsKeywordBusy) return;
+    runtime.__dailyDealsKeywordBusy = true;
+    try {
+      const missing = listKeywordsMissingExpansion(20);
+      if (missing.length === 0) return;
+
+      const results = await expandKeywordsWithAi(missing);
+      const model = getAiModelName();
+      if (!results) {
+        // AI 不可用时先标记失败，24 小时后再试，避免空转。
+        for (const keyword of missing) {
+          saveKeywordExpansion(keyword, 'other', [], model, 'failed');
+        }
+        return;
+      }
+
+      const byKeyword = new Map(
+        results.map((item) => [item.keyword.trim().toLowerCase(), item]),
+      );
+      let expanded = 0;
+      for (const keyword of missing) {
+        const result = byKeyword.get(keyword.trim().toLowerCase());
+        if (result) {
+          saveKeywordExpansion(
+            keyword,
+            result.kind,
+            result.expansions,
+            model,
+            'ready',
+          );
+          if (result.expansions.length > 0) expanded += 1;
+        } else {
+          saveKeywordExpansion(keyword, 'other', [], model, 'failed');
+        }
+      }
+
+      // 扩展补上之前抓到的文章不会自动重匹配，这里回扫最近 3 小时补齐。
+      if (expanded > 0) {
+        const created = backfillRecentDeals(180, {
+          expand:
+            (getRuntimeEnvRaw('SUBSCRIPTION_MATCH_EXPAND_ENABLED') ?? 'true') !==
+            'false',
+          minScore: getRuntimeEnvNumber(
+            'SUBSCRIPTION_MATCH_MIN_SCORE',
+            2,
+            1,
+            8,
+          ),
+        });
+        console.log(
+          `[keyword] ${expanded} 个词补齐扩展，回扫最近 3 小时，补入队 ${created} 条`,
+        );
+      }
+    } catch (error) {
+      console.error('[keyword] tick failed:', error);
+    } finally {
+      runtime.__dailyDealsKeywordBusy = false;
+    }
+  };
+  setTimeout(() => {
+    void keywordTick();
+  }, 40_000);
+  setInterval(() => {
+    void keywordTick();
+  }, 10 * 60_000);
 
   // 详情正文补全（微博镜像与线报酷）：串行慢速执行，不阻塞抓取。
   startBodyBackfillWorker();

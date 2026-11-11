@@ -21,7 +21,10 @@ export async function generateMetadata(): Promise<Metadata> {
 
 function safeNext(value: string | string[] | undefined): string {
   const raw = Array.isArray(value) ? value[0] : value;
-  if (!raw || !raw.startsWith('/') || raw.startsWith('//')) return '/account';
+  // 只允许站内相对路径；反斜杠会被部分浏览器当成协议相对地址。
+  if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) {
+    return '/account';
+  }
   return raw;
 }
 

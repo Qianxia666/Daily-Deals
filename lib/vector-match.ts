@@ -67,27 +67,24 @@ function dot(left: Float32Array, right: Float32Array): number {
   return sum;
 }
 
+/**
+ * 只取「AI 标题 + 原始标题 + 标签」做向量。
+ * 摘要和描述里大量套话/规则噪声会拉长文本、稀释相似度，
+ * 导致长文档的分数系统性低于短文本校准值，这里刻意不拼。
+ */
 function describeDealText(deal: {
   title: string;
   ai_title: string | null;
-  ai_summary: string | null;
   tags: string;
-  description: string;
 }): string {
   const tags = deal.tags
     .replace(/[[\]"]/g, ' ')
     .replace(/,/g, ' ')
     .trim();
-  const text = [
-    deal.ai_title ?? '',
-    deal.title,
-    deal.ai_summary ?? '',
-    tags,
-    deal.description.slice(0, 200),
-  ]
+  const text = [deal.ai_title ?? '', deal.title, tags]
     .filter(Boolean)
     .join('\n')
-    .slice(0, 500);
+    .slice(0, 200);
   return text || deal.title;
 }
 

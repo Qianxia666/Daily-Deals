@@ -102,6 +102,8 @@ export function DealsApp({
   const dataRef = useRef<DealsListResponse | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const hasStoredPreferencesRef = useRef(false);
+  // 请求序号：并发请求时只应用最新一次响应，避免旧数据覆盖新数据。
+  const requestSeqRef = useRef(0);
 
   useEffect(() => {
     dataRef.current = data;
@@ -256,8 +258,13 @@ export function DealsApp({
         cursor?: string | null;
         append?: boolean;
         metaOnly?: boolean;
+        silent?: boolean;
       } = {},
     ): Promise<DealsListResponse | null> => {
+      // 轮询属于后台刷新，不抢占用户手动请求的序号。
+      const seq = options.silent
+        ? requestSeqRef.current
+        : ++requestSeqRef.current;
       const params = new URLSearchParams();
       params.set('limit', String(PAGE_SIZE));
 
@@ -299,6 +306,7 @@ export function DealsApp({
           return override ? { ...item, ...override } : item;
         });
 
+        if (seq !== requestSeqRef.current) return null;
         setData((previous) => {
           if (!previous) return { ...payload, items };
 
@@ -347,6 +355,7 @@ export function DealsApp({
         setLoadError(null);
         return { ...payload, items };
       } catch (error) {
+        if (seq !== requestSeqRef.current) return null;
         setLoadError(error instanceof Error ? error.message : '网络请求失败');
         return null;
       }
@@ -369,6 +378,7 @@ export function DealsApp({
       const current = dataRef.current;
       const payload = await fetchPage({
         metaOnly: Boolean(current && current.items.length > PAGE_SIZE),
+        silent: true,
       });
       if (stopped) return;
 
