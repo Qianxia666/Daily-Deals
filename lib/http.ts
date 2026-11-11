@@ -27,8 +27,8 @@ export function getOutboundDispatcher(): Dispatcher | null {
   const stored = getRuntimeEnvRaw('OUTBOUND_PROXY');
   const proxyUrl =
     (stored && stored.trim()) ||
-    process.env.HTTPS_PROXY?.trim() ||
-    process.env.HTTP_PROXY?.trim() ||
+    (getRuntimeEnvRaw('HTTPS_PROXY') ?? '').trim() ||
+    (getRuntimeEnvRaw('HTTP_PROXY') ?? '').trim() ||
     process.env.https_proxy?.trim() ||
     process.env.http_proxy?.trim() ||
     '';

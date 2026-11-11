@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { request } from './http';
-import { getSiteSettings } from './runtime-settings';
+import { getRuntimeEnvRaw, getSiteSettings } from './runtime-settings';
 import type { ChannelKind } from './types';
 
 export interface NotifyTarget {
@@ -38,7 +38,7 @@ const ALLOWED_HOSTS: Record<Exclude<ChannelKind, 'bark'>, string[]> = {
 const TIMEOUT_MS = 8_000;
 
 function allowAnyHost(): boolean {
-  return process.env.NOTIFY_ALLOW_ANY_HOST === '1';
+  return (getRuntimeEnvRaw('NOTIFY_ALLOW_ANY_HOST') ?? '').trim() === '1';
 }
 
 function isPrivateHost(hostname: string): boolean {

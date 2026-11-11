@@ -618,6 +618,23 @@ const FIELDS: RuntimeFieldDef[] = [
     type: 'text',
   },
   {
+    key: 'HTTPS_PROXY',
+    label: '抓取代理（HTTPS）',
+    group: '网络',
+    description:
+      '未填写「出站代理」时使用，优先级高于 HTTP 代理；例如 http://127.0.0.1:7890。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
+    key: 'HTTP_PROXY',
+    label: '抓取代理（HTTP）',
+    group: '网络',
+    description: '前两项都为空时的兜底代理，例如 http://127.0.0.1:7890。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
     key: 'JINA_API_KEY',
     label: 'Jina Reader Key',
     group: '网络',
@@ -1045,6 +1062,19 @@ const FIELDS: RuntimeFieldDef[] = [
       '例如 abcdefg123；也可填写 https://api.day.app/abcdefg123。后台告警使用。',
     type: 'password',
     secret: true,
+  },
+  {
+    key: 'NOTIFY_ALLOW_ANY_HOST',
+    label: '允许任意 webhook 域名',
+    group: '通知渠道',
+    description:
+      '关闭 webhook 域名白名单校验，仅用于自建推送服务调试；生产环境建议保持仅允许白名单。',
+    type: 'select',
+    defaultValue: '0',
+    options: [
+      { value: '0', label: '仅允许白名单域名' },
+      { value: '1', label: '允许任意域名' },
+    ],
   },
   {
     key: 'BACKUP_ENABLED',
@@ -1568,6 +1598,8 @@ export function saveRuntimeSettings(
       (def.key === 'SITE_URL' ||
         def.key === 'LLM_BASE_URL' ||
         def.key === 'OUTBOUND_PROXY' ||
+        def.key === 'HTTPS_PROXY' ||
+        def.key === 'HTTP_PROXY' ||
         def.key === 'FEISHU_WEBHOOK_URL' ||
         def.key === 'NOTIFY_WECOM_WEBHOOK' ||
         def.key === 'NOTIFY_FEISHU_WEBHOOK' ||
