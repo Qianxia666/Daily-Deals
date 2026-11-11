@@ -2,6 +2,7 @@ import type { SourceKind } from '../types';
 import { fetchEpicGames } from './epic';
 import { fetchLinuxDo } from './linuxdo';
 import { fetchRssSource } from './rss';
+import { fetchSinaWeibo } from './sina-weibo';
 import type { RawDeal } from './types';
 import { fetchXianbao } from './xianbao';
 
@@ -22,6 +23,8 @@ export async function fetchSource(config: FetchableSource): Promise<RawDeal[]> {
       return fetchEpicGames(config.url, config.id);
     case 'xianbao':
       return fetchXianbao(config.url, config.id);
+    case 'sina_weibo':
+      return fetchSinaWeibo(config.url, config.id);
     case 'rss':
     default:
       return fetchRssSource(config);

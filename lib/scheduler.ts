@@ -20,6 +20,7 @@ import {
   deliverPendingDigests,
   runScheduledDigests,
 } from './delivery';
+import { startBodyBackfillWorker } from './body-backfill';
 import {
   getGlobalIntervalMinutes,
   getRuntimeEnvNumber,
@@ -28,6 +29,12 @@ import { SOURCE_TIMEOUT_MS } from './sources';
 import type { RawDeal } from './fetchers/types';
 
 const failureCounts = new Map<string, number>();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 const runtime = globalThis as typeof globalThis & {
   __dailyDealsSchedulerStarted?: boolean;
@@ -77,9 +84,14 @@ export async function runFetchRound(sourceIds?: string[]): Promise<void> {
   if (runtime.__dailyDealsFetching) return;
 
   const all = listSources();
+  // 停用/已移除的来源停止抓取，并清空其失败计数，避免恢复后立刻误报告警。
+  for (const source of all) {
+    if (source.state !== 'active') failureCounts.delete(source.id);
+  }
+  const visible = all.filter((source) => source.state === 'active');
   const targets = sourceIds
-    ? all.filter((source) => sourceIds.includes(source.id))
-    : all;
+    ? visible.filter((source) => sourceIds.includes(source.id))
+    : visible;
 
   if (targets.length === 0) return;
 
@@ -89,7 +101,15 @@ export async function runFetchRound(sourceIds?: string[]): Promise<void> {
     // 只重置本轮来源的新增标记，避免部分来源轮次把其他来源的新标记清掉。
     resetNewFlags(targets.map((source) => source.id));
 
-    const outcomes = await Promise.all(targets.map(fetchOne));
+    const outcomes = await Promise.all(
+      targets.map(async (source) => {
+        // 同一轮内随机错开建连时间，避免多个来源在同一秒并发请求。
+        if (targets.length > 1) {
+          await sleep(Math.floor(Math.random() * 2_500));
+        }
+        return fetchOne(source);
+      }),
+    );
     const statuses: SourceRunStatus[] = [];
 
     for (const outcome of outcomes) {
@@ -159,7 +179,25 @@ export function triggerFetch(): boolean {
   return true;
 }
 
-/** 计算当前到期的来源：未抓取过，或距上次抓取已超过该来源的刷新间隔。 */
+function hashString(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * 每个来源在到期时间上叠加 ±30 秒的确定性抖动。
+ * 用「来源 + 上次抓取时间」做种子，同一轮里多次 tick 算出的偏移一致，
+ * 进程重启也不会跳变。
+ */
+function sourceJitterMs(sourceId: string, lastFetchedAt: string): number {
+  return (hashString(`${sourceId}:${lastFetchedAt}`) % 60_000) - 30_000;
+}
+
+/** 计算当前到期的来源：未抓取过，或已超过「刷新间隔 + 抖动」。 */
 function dueSources(): StoredSource[] {
   const statusMap = new Map(
     listSourceStatus().map((status) => [status.source, status.fetchedAt]),
@@ -167,7 +205,7 @@ function dueSources(): StoredSource[] {
   const globalMinutes = getGlobalIntervalMinutes();
   const now = Date.now();
 
-  return listSources().filter((source) => {
+  return listSources().filter((source) => source.state === 'active').filter((source) => {
     const last = statusMap.get(source.id);
     if (!last) return true;
 
@@ -175,13 +213,14 @@ function dueSources(): StoredSource[] {
     if (Number.isNaN(timestamp)) return true;
 
     const minutes = source.refreshMinutes ?? globalMinutes;
-    return now - timestamp >= minutes * 60_000;
+    return now >= timestamp + minutes * 60_000 + sourceJitterMs(source.id, last);
   });
 }
 
 /**
  * 服务启动即注册调度循环。
- * 每 60 秒检查一次各来源是否到期，因此后台修改全局/单来源刷新间隔后无需重启。
+ * 每 15 秒检查一次各来源是否到期（每个来源再叠加 ±30 秒抖动），
+ * 因此后台修改全局/单来源刷新间隔后无需重启。
  */
 export function startScheduler(): void {
   if (runtime.__dailyDealsSchedulerStarted) return;
@@ -195,8 +234,8 @@ export function startScheduler(): void {
     void runFetchRound(due.map((source) => source.id));
   };
 
-  setTimeout(tick, 2_500);
-  setInterval(tick, 60_000);
+  setTimeout(tick, 2_500 + Math.random() * 57_500);
+  setInterval(tick, 15_000);
 
   // 每 60 秒处理一次订阅推送、每日摘要与跨天清理。
   const deliveryTick = async () => {
@@ -217,10 +256,13 @@ export function startScheduler(): void {
     void enrichPendingDeals();
   }, 5 * 60_000);
 
+  // 详情正文补全（微博镜像与线报酷）：串行慢速执行，不阻塞抓取。
+  startBodyBackfillWorker();
+
   const globalMinutes = getGlobalIntervalMinutes();
   const lastFetchedAt = getLastFetchedAt();
   console.log(
-    `[scheduler] global=${globalMinutes}min tick=60s last=${
+    `[scheduler] global=${globalMinutes}min tick=15s jitter=±30s last=${
       lastFetchedAt ?? 'never'
     }`,
   );

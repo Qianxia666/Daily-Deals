@@ -21,6 +21,7 @@ import type {
   PublicDigest,
   SearchIndexStatus,
   SourceKind,
+  SourceState,
   SourceStatus,
   TagCandidate,
   TagStatus,
@@ -68,7 +69,8 @@ CREATE TABLE IF NOT EXISTS deals (
   tags TEXT NOT NULL DEFAULT '[]',
   proposed_tags TEXT NOT NULL DEFAULT '[]',
   entities TEXT NOT NULL DEFAULT '[]',
-  ai_tags_at TEXT
+  ai_tags_at TEXT,
+  body_fetched_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_deals_source ON deals(source);
 CREATE INDEX IF NOT EXISTS idx_deals_expires ON deals(expires_at);
@@ -112,8 +114,14 @@ CREATE TABLE IF NOT EXISTS sources (
   enabled INTEGER NOT NULL DEFAULT 1,
   builtin INTEGER NOT NULL DEFAULT 0,
   refresh_minutes INTEGER,
+  state TEXT NOT NULL DEFAULT 'active',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS removed_sources (
+  id TEXT PRIMARY KEY,
+  removed_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tag_candidates (
@@ -269,6 +277,7 @@ interface ExistingDealRow {
   ai_model: string | null;
   ai_at: string | null;
   ai_tags_at: string | null;
+  body_fetched_at: string | null;
   tags: string | null;
   proposed_tags: string | null;
   entities: string | null;
@@ -315,6 +324,7 @@ interface SourceRow {
   enabled: number;
   builtin: number;
   refresh_minutes: number | null;
+  state: string;
 }
 
 export interface StoredSource {
@@ -323,7 +333,7 @@ export interface StoredSource {
   url: string;
   kind: SourceKind;
   order: number;
-  hidden: boolean;
+  state: SourceState;
   refreshMinutes: number | null;
   builtin: boolean;
 }
@@ -350,7 +360,7 @@ export interface SourceRunStatus {
 
 export interface SourceSettingsInput {
   id: string;
-  hidden: boolean;
+  state: SourceState;
   refreshMinutes: number | null;
   name?: string;
   url?: string;
@@ -363,7 +373,7 @@ export interface NewSourceInput {
   url: string;
   kind: SourceKind;
   refreshMinutes: number | null;
-  hidden: boolean;
+  state: SourceState;
 }
 
 export type DealsSnapshot = Omit<
@@ -425,6 +435,7 @@ function migrate(db: Database.Database): void {
     ['proposed_tags', "TEXT NOT NULL DEFAULT '[]'"],
     ['entities', "TEXT NOT NULL DEFAULT '[]'"],
     ['ai_tags_at', 'TEXT'],
+    ['body_fetched_at', 'TEXT'],
   ];
 
   for (const [name, type] of additions) {
@@ -448,6 +459,19 @@ function migrate(db: Database.Database): void {
   if (!userColumns.some((column) => column.name === 'invite_code')) {
     db.exec('ALTER TABLE users ADD COLUMN invite_code TEXT');
   }
+
+  // 来源隐藏状态统一升级为三态：hidden=1 → paused，其余按 active。
+  const sourceColumns = db.prepare('PRAGMA table_info(sources)').all() as {
+    name: string;
+  }[];
+  if (!sourceColumns.some((column) => column.name === 'state')) {
+    db.exec(
+      "ALTER TABLE sources ADD COLUMN state TEXT NOT NULL DEFAULT 'active'",
+    );
+    db.exec(
+      "UPDATE sources SET state = CASE WHEN hidden = 1 THEN 'paused' ELSE 'active' END",
+    );
+  }
 }
 
 /**
@@ -466,6 +490,13 @@ function ensureSources(db: Database.Database): void {
     .all() as { source: string; sort_order: number; hidden: number }[];
   const legacy = new Map(legacyRows.map((row) => [row.source, row]));
 
+  // 旧版删除内置来源时只写了墓碑；这里补成 state='removed' 的真实记录，便于后台恢复。
+  const tombstones = new Set(
+    (
+      db.prepare('SELECT id FROM removed_sources').all() as { id: string }[]
+    ).map((row) => row.id),
+  );
+
   let maxOrder = existingRows.reduce(
     (max, row) => Math.max(max, row.sort_order),
     -1,
@@ -474,8 +505,8 @@ function ensureSources(db: Database.Database): void {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO sources (
       id, name, url, kind, sort_order, hidden, enabled, builtin,
-      refresh_minutes, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, NULL, ?, ?)
+      refresh_minutes, state, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 0, 1, 1, NULL, ?, ?, ?)
   `);
 
   const now = new Date().toISOString();
@@ -493,17 +524,26 @@ function ensureSources(db: Database.Database): void {
       }
       maxOrder = Math.max(maxOrder, order);
 
+      const state: SourceState = tombstones.has(source.id)
+        ? 'removed'
+        : old?.hidden
+          ? 'paused'
+          : 'active';
+
       insert.run(
         source.id,
         source.name,
         source.url,
         source.kind,
         order,
-        old?.hidden ? 1 : 0,
+        state,
         now,
         now,
       );
     }
+
+    // 墓碑已经转成真实记录，清空旧表避免之后重复参与判断。
+    db.prepare('DELETE FROM removed_sources').run();
   });
 
   seed();
@@ -516,17 +556,17 @@ function toStoredSource(row: SourceRow): StoredSource {
     url: row.url,
     kind: row.kind as SourceKind,
     order: row.sort_order,
-    hidden: row.hidden === 1,
+    state: (row.state as SourceState) || 'active',
     refreshMinutes: row.refresh_minutes,
     builtin: row.builtin === 1,
   };
 }
 
-/** 返回所有启用的来源（包含首页隐藏的来源，隐藏只影响展示）。 */
+/** 返回所有来源（包含停用与已移除，由调用方按 state 过滤）。 */
 export function listSources(): StoredSource[] {
   const rows = getDb()
     .prepare(
-      `SELECT id, name, url, kind, sort_order, hidden, enabled, builtin, refresh_minutes
+      `SELECT id, name, url, kind, sort_order, hidden, enabled, builtin, refresh_minutes, state
        FROM sources WHERE enabled = 1
        ORDER BY sort_order ASC, id ASC`,
     )
@@ -537,7 +577,7 @@ export function listSources(): StoredSource[] {
 export function getSource(id: string): StoredSource | null {
   const row = getDb()
     .prepare(
-      `SELECT id, name, url, kind, sort_order, hidden, enabled, builtin, refresh_minutes
+      `SELECT id, name, url, kind, sort_order, hidden, enabled, builtin, refresh_minutes, state
        FROM sources WHERE id = ?`,
     )
     .get(id) as SourceRow | undefined;
@@ -547,7 +587,28 @@ export function getSource(id: string): StoredSource | null {
 /** 新增自定义来源；id 已存在时返回 null。 */
 export function createSource(input: NewSourceInput): StoredSource | null {
   const db = getDb();
-  if (getSource(input.id)) return null;
+  const existing = getSource(input.id);
+
+  // 命中已移除的来源时直接恢复并覆盖配置，避免造出同名但解析器错误的假源。
+  if (existing) {
+    if (existing.state !== 'removed') return null;
+
+    db.prepare(
+      `UPDATE sources
+       SET name = ?, url = ?, kind = ?, state = ?, refresh_minutes = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(
+      input.name,
+      input.url,
+      // 恢复已移除的来源时沿用原解析器，避免把线报酷等专用源误改成 RSS。
+      existing.kind,
+      'active',
+      input.refreshMinutes,
+      new Date().toISOString(),
+      input.id,
+    );
+    return getSource(input.id);
+  }
 
   const maxOrder = db
     .prepare('SELECT MAX(sort_order) AS value FROM sources')
@@ -558,38 +619,52 @@ export function createSource(input: NewSourceInput): StoredSource | null {
   db.prepare(
     `INSERT INTO sources (
        id, name, url, kind, sort_order, hidden, enabled, builtin,
-       refresh_minutes, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)`,
+       refresh_minutes, state, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, 0, 1, 0, ?, ?, ?, ?)`,
   ).run(
     input.id,
     input.name,
     input.url,
     input.kind,
     order,
-    input.hidden ? 1 : 0,
     input.refreshMinutes,
+    input.state,
     now,
     now,
   );
+  // 重新添加同标识来源时，清除此前的内置来源移除标记。
+  db.prepare('DELETE FROM removed_sources WHERE id = ?').run(input.id);
 
   return getSource(input.id);
 }
 
-/** 删除自定义来源及其已入库条目。 */
+/** 移除来源：软删除，保留定义以便恢复；同时清空已入库条目与抓取状态。 */
 export function deleteSource(id: string): boolean {
   const db = getDb();
-  if (!getSource(id)) return false;
+  const source = getSource(id);
+  if (!source) return false;
 
   const remove = db.transaction(() => {
     deleteDealIndexesForSource(db, id);
     db.prepare('DELETE FROM deals WHERE source = ?').run(id);
     db.prepare('DELETE FROM source_status WHERE source = ?').run(id);
-    db.prepare('DELETE FROM source_settings WHERE source = ?').run(id);
-    db.prepare('DELETE FROM sources WHERE id = ?').run(id);
+    db.prepare('UPDATE sources SET state = ?, updated_at = ? WHERE id = ?').run(
+      'removed',
+      new Date().toISOString(),
+      id,
+    );
   });
 
   remove();
   return true;
+}
+
+/** 恢复已移除的来源；恢复后等待下一轮调度重新抓取。 */
+export function restoreSource(id: string): boolean {
+  const result = getDb()
+    .prepare("UPDATE sources SET state = 'active', updated_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), id);
+  return result.changes > 0;
 }
 
 /** 每轮开始时清空指定来源的新增标记；不传来源时清空全部。 */
@@ -615,7 +690,8 @@ export function upsertDeals(deals: RawDeal[]): number {
 
   const findExisting = db.prepare(
     `SELECT id, title, description, ai_title, ai_summary,
-            ai_model, ai_at, ai_tags_at, tags, proposed_tags, entities
+            ai_model, ai_at, ai_tags_at, body_fetched_at,
+            tags, proposed_tags, entities
      FROM deals WHERE link = ?`,
   );
   const updateExisting = db.prepare(`
@@ -652,6 +728,15 @@ export function upsertDeals(deals: RawDeal[]): number {
         | undefined;
 
       if (existing) {
+        // 正文已经补全的条目，列表页的摘要不再覆盖，避免把完整正文刷回摘要。
+        if (existing.body_fetched_at && !item.bodyComplete) {
+          db.prepare('UPDATE deals SET last_seen_at = ? WHERE id = ?').run(
+            now,
+            existing.id,
+          );
+          continue;
+        }
+
         const nextDescription = item.description || existing.description;
         const contentChanged =
           item.title !== existing.title ||
@@ -827,10 +912,18 @@ export function getVisibleSourceIds(): string[] {
   const db = getDb();
   const rows = db
     .prepare(
-      'SELECT id FROM sources WHERE hidden = 0 ORDER BY sort_order ASC',
+      "SELECT id FROM sources WHERE state = 'active' AND enabled = 1 ORDER BY sort_order ASC",
     )
     .all() as { id: string }[];
   return rows.map((row) => row.id);
+}
+
+/** 来源是否对外可见（启用且未停用/移除）；来源记录不存在时视为不可见。 */
+export function isSourceVisible(sourceId: string): boolean {
+  const row = getDb()
+    .prepare('SELECT state, enabled FROM sources WHERE id = ?')
+    .get(sourceId) as { state: string; enabled: number } | undefined;
+  return Boolean(row && row.state === 'active' && row.enabled === 1);
 }
 
 export function getLastFetchedAt(): string | null {
@@ -942,7 +1035,7 @@ export function getDealsSnapshot(): DealsSnapshot {
 
   const stored = listSources();
   const nameMap = new Map(stored.map((source) => [source.id, source.name]));
-  const visible = stored.filter((source) => !source.hidden);
+  const visible = stored.filter((source) => source.state === 'active');
   const visibleIds = new Set(visible.map((source) => source.id));
 
   const items: DealItem[] = rows
@@ -1048,7 +1141,7 @@ export function getDealsMeta(): Omit<DealsSnapshot, 'items'> {
     .all(now, retentionCutoff) as SourceCountRow[];
 
   const stored = listSources();
-  const visible = stored.filter((source) => !source.hidden);
+  const visible = stored.filter((source) => source.state === 'active');
   const statusMap = new Map(statusRows.map((row) => [row.source, row]));
   const countMap = new Map(countRows.map((row) => [row.source, row.count]));
 
@@ -1108,7 +1201,7 @@ export function getPopularTags(limit = 500): PopularTag[] {
     Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
   ).toISOString();
   const visible = listSources()
-    .filter((source) => !source.hidden)
+    .filter((source) => source.state === 'active')
     .map((source) => source.id);
   if (visible.length === 0) return [];
 
@@ -1153,7 +1246,7 @@ export function getDealsList(query: DealsListQuery): DealsListResult {
   const stored = listSources();
   const nameMap = new Map(stored.map((source) => [source.id, source.name]));
   const visible = stored
-    .filter((source) => !source.hidden)
+    .filter((source) => source.state === 'active')
     .map((source) => source.id);
   if (visible.length === 0) return empty;
 
@@ -1310,7 +1403,7 @@ export function saveSourceSettings(items: SourceSettingsInput[]): void {
   const update = db.prepare(`
     UPDATE sources
     SET sort_order = ?,
-        hidden = ?,
+        state = ?,
         refresh_minutes = ?,
         name = COALESCE(?, name),
         url = COALESCE(?, url),
@@ -1324,7 +1417,7 @@ export function saveSourceSettings(items: SourceSettingsInput[]): void {
     items.forEach((item, index) => {
       update.run(
         index,
-        item.hidden ? 1 : 0,
+        item.state,
         item.refreshMinutes,
         item.name ?? null,
         item.url ?? null,
@@ -1378,7 +1471,7 @@ export function getAdminData(): AdminBaseData {
       error: status?.error ?? null,
       fetchedAt: status?.fetched_at ?? null,
       order: source.order,
-      hidden: source.hidden,
+      state: source.state,
       url: source.url,
       kind: source.kind,
       refreshMinutes: source.refreshMinutes,
@@ -1425,12 +1518,91 @@ export function getTagStatus(): TagStatus {
   };
 }
 
+export interface PendingBodyDeal {
+  id: number;
+  link: string;
+  source: string;
+  kind: string;
+}
+
+/**
+ * 历史积压不再回补：只处理这个时间点之后入库的条目。
+ * 需要重新放开历史补全时，把这个值往前改即可。
+ */
+const BACKFILL_SINCE = '2026-11-11T02:12:00.000Z';
+
+/**
+ * 待补全正文的条目：只取启用来源、尚未补全、未过期且入库时间在截止点之后的记录。
+ */
+export function listPendingBodyDeals(limit = 1): PendingBodyDeal[] {
+  return getDb()
+    .prepare(
+      `SELECT d.id, d.link, d.source, s.kind
+       FROM deals d
+       JOIN sources s ON s.id = d.source
+       WHERE s.kind IN ('sina_weibo', 'xianbao')
+         AND s.state = 'active'
+         AND s.enabled = 1
+         AND d.body_fetched_at IS NULL
+         AND d.first_seen_at >= ?
+         AND (d.expires_at IS NULL OR d.expires_at > ?)
+       ORDER BY d.id DESC
+       LIMIT ?`,
+    )
+    .all(
+      BACKFILL_SINCE,
+      new Date().toISOString(),
+      limit,
+    ) as PendingBodyDeal[];
+}
+
+/** 写入完整正文，并清空 AI 结果，让摘要按新正文重新生成。title 为空时保留原标题。 */
+export function saveDealBody(
+  id: number,
+  title: string | null,
+  description: string,
+): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `UPDATE deals
+     SET title = COALESCE(?, title),
+         description = ?,
+         body_fetched_at = ?,
+         ai_title = NULL,
+         ai_summary = NULL,
+         ai_value = NULL,
+         ai_action = NULL,
+         ai_model = NULL,
+         ai_at = NULL,
+         ai_attempts = 0,
+         ai_tags_at = NULL,
+         tags = '[]',
+         proposed_tags = '[]',
+         entities = '[]',
+         last_seen_at = ?
+     WHERE id = ?`,
+  ).run(title, description, now, now, id);
+
+  indexDealById(db, id, readSearchIndexMaxChars(db));
+}
+
+/** 详情抓取失败时标记为已尝试，保留摘要，避免反复重试。 */
+export function markDealBodyFetched(id: number): void {
+  getDb()
+    .prepare('UPDATE deals SET body_fetched_at = ? WHERE id = ?')
+    .run(new Date().toISOString(), id);
+}
+
 /** 取出尚未生成 AI 摘要且未超过失败次数的在架条目。 */
 export function listDealsForAi(
   limit: number,
   maxAttempts: number,
 ): AiPendingDeal[] {
   const now = new Date().toISOString();
+  // 微博镜像先补正文再生成摘要；超过 24 小时仍未补到正文的，用摘要兜底，避免长期不展示。
+  const bodyDeadline = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   return getDb()
     .prepare(
       `SELECT id, title, description, source
@@ -1438,10 +1610,15 @@ export function listDealsForAi(
        WHERE ai_at IS NULL
          AND ai_attempts < ?
          AND (expires_at IS NULL OR expires_at > ?)
+         AND (
+           body_fetched_at IS NOT NULL
+           OR first_seen_at <= ?
+           OR source NOT IN (SELECT id FROM sources WHERE kind = 'sina_weibo')
+         )
        ORDER BY is_new DESC, COALESCE(published_at, first_seen_at) DESC, id DESC
        LIMIT ?`,
     )
-    .all(maxAttempts, now, limit) as AiPendingDeal[];
+    .all(maxAttempts, now, bodyDeadline, limit) as AiPendingDeal[];
 }
 
 /** 记录一次失败的摘要尝试，达到上限后不再重复消耗 AI 额度。 */
@@ -2832,7 +3009,12 @@ export function matchDealToSubscriptions(dealId: number): number {
     .prepare(
       `SELECT id, title, ai_title, ai_summary, description, tags,
               proposed_tags, expires_at, link
-       FROM deals WHERE id = ?`,
+       FROM deals
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM sources s
+           WHERE s.id = deals.source AND s.state = 'active' AND s.enabled = 1
+         )`,
     )
     .get(dealId) as MatchDealRow | undefined;
   if (!deal) return 0;
@@ -2864,7 +3046,17 @@ export function matchDealToSubscriptions(dealId: number): number {
   );
   if (matched.length === 0) return 0;
 
-  const userIds = [...new Set(matched.map((sub) => sub.user_id))];
+  // 同一用户多个关键词命中同一条优惠时只推送一次，取最早创建的关键词。
+  const perUser = new Map<number, { id: number; user_id: number }>();
+  for (const sub of matched) {
+    const current = perUser.get(sub.user_id);
+    if (!current || sub.id < current.id) {
+      perUser.set(sub.user_id, { id: sub.id, user_id: sub.user_id });
+    }
+  }
+  const uniqueMatches = [...perUser.values()];
+
+  const userIds = uniqueMatches.map((sub) => sub.user_id);
   const channels = db
     .prepare(
       `SELECT id, user_id FROM channels
@@ -2888,7 +3080,7 @@ export function matchDealToSubscriptions(dealId: number): number {
   let created = 0;
 
   const write = db.transaction(() => {
-    for (const sub of matched) {
+    for (const sub of uniqueMatches) {
       for (const channelId of byUser.get(sub.user_id) ?? []) {
         created += insert.run(
           sub.user_id,
@@ -3054,7 +3246,7 @@ export interface SiteDigestDeal {
 
 function visibleSourceIds(): string[] {
   return listSources()
-    .filter((source) => !source.hidden)
+    .filter((source) => source.state === 'active')
     .map((source) => source.id);
 }
 
@@ -3273,10 +3465,11 @@ export function skipUserPendingDeliveries(userId: number): void {
     .run(userId);
 }
 
-/** 跨天或已过期的待投递条目直接跳过，避免第二天补推旧内容。 */
+/** 跨天、已过期或历史重复的待投递条目直接跳过，避免补推旧内容或重复推送。 */
 export function skipStalePendingDeliveries(): number {
+  const db = getDb();
   const now = new Date().toISOString();
-  return getDb()
+  const stale = db
     .prepare(
       `UPDATE deliveries SET status = 'skipped'
        WHERE status = 'pending'
@@ -3286,9 +3479,31 @@ export function skipStalePendingDeliveries(): number {
              SELECT id FROM deals
              WHERE expires_at IS NOT NULL AND expires_at <= ?
            )
+           OR deal_id IN (
+             SELECT d.id FROM deals d
+             WHERE NOT EXISTS (
+               SELECT 1 FROM sources s
+               WHERE s.id = d.source AND s.state = 'active' AND s.enabled = 1
+             )
+           )
          )`,
     )
     .run(todayStartIso(), now).changes;
+
+  // 同一用户、同一渠道、同一优惠只保留最早的一条待投递记录。
+  const duplicated = db
+    .prepare(
+      `UPDATE deliveries SET status = 'skipped'
+       WHERE status = 'pending'
+         AND id NOT IN (
+           SELECT MIN(id) FROM deliveries
+           WHERE status = 'pending'
+           GROUP BY user_id, channel_id, deal_id
+         )`,
+    )
+    .run().changes;
+
+  return stale + duplicated;
 }
 
 export function getSiteDigestStats(): SiteDigestStats {
@@ -3463,7 +3678,7 @@ export function listDealsForPublicDigest(date: string): PublicDigestDeal[] {
       `SELECT d.id, COALESCE(NULLIF(TRIM(d.ai_title), ''), d.title) AS title,
               d.source, d.tags, d.expires_at, d.first_seen_at
        FROM deals d
-       JOIN sources s ON s.id = d.source AND s.enabled = 1 AND s.hidden = 0
+       JOIN sources s ON s.id = d.source AND s.enabled = 1 AND s.state = 'active'
        WHERE d.first_seen_at >= ? AND d.first_seen_at < ?
        ORDER BY d.first_seen_at DESC, d.id DESC
        LIMIT 1500`,
@@ -3506,7 +3721,7 @@ export function getRelatedDeals(
               COALESCE(NULLIF(TRIM(deals.ai_title), ''), deals.title) AS title,
               deals.source
        FROM deals
-       JOIN sources s ON s.id = deals.source AND s.enabled = 1 AND s.hidden = 0
+       JOIN sources s ON s.id = deals.source AND s.enabled = 1 AND s.state = 'active'
        WHERE deals.id != ?
          AND (deals.expires_at IS NULL OR deals.expires_at > ?)
          AND EXISTS (

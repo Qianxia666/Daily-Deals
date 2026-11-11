@@ -3,12 +3,18 @@
 import {
   ArrowDown,
   ArrowUp,
+  ChevronDown,
+  ChevronUp,
+  Eye,
+  EyeOff,
   LoaderCircle,
   LogOut,
   Megaphone,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
+  Search,
   Trash2,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -17,12 +23,14 @@ import type {
   AdminSource,
   RuntimeSettingView,
   SourceKind,
+  SourceState,
 } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { AdminInviteCodes } from './admin-invite-codes';
 import { AdminUserManager } from './admin-user-manager';
 import { NotificationSettings } from './notification-settings';
 import { Button } from './ui/button';
+import { CollapsibleSection } from './ui/collapsible-section';
 import { Input } from './ui/input';
 import { Switch } from './ui/switch';
 
@@ -31,7 +39,17 @@ const KIND_LABELS: Record<SourceKind, string> = {
   epic: 'Epic 官方接口',
   linuxdo: 'linux.do 专用',
   xianbao: '线报酷专用',
+  sina_weibo: '微博镜像专用',
 };
+
+const STATE_LABELS: Record<SourceState, string> = {
+  active: '启用',
+  paused: '已停用',
+  removed: '已移除',
+};
+
+type SourceStatusFilter = 'all' | 'ok' | 'error' | 'paused' | 'removed';
+type SourceKindFilter = 'all' | SourceKind;
 
 function formatDateTime(iso: string | null): string {
   if (!iso) return '—';
@@ -83,7 +101,7 @@ export function AdminDashboard() {
     name: '',
     id: '',
     url: '',
-    kind: 'rss' as 'rss' | 'epic',
+    kind: 'rss' as SourceKind,
     refreshMinutes: '',
   });
   const [loading, setLoading] = useState(true);
@@ -106,6 +124,18 @@ export function AdminDashboard() {
     type: 'ok' | 'error';
     text: string;
   } | null>(null);
+  const [sourceQuery, setSourceQuery] = useState('');
+  const [sourceStatusFilter, setSourceStatusFilter] =
+    useState<SourceStatusFilter>('all');
+  const [sourceKindFilter, setSourceKindFilter] =
+    useState<SourceKindFilter>('all');
+  const [expandedSources, setExpandedSources] = useState<Set<string>>(
+    new Set(),
+  );
+  const [selectedSources, setSelectedSources] = useState<Set<string>>(
+    new Set(),
+  );
+  const [batchBusy, setBatchBusy] = useState(false);
 
   const applyPayload = useCallback((payload: AdminData) => {
     setData(payload);
@@ -152,6 +182,216 @@ export function AdminDashboard() {
     return [...groups.entries()];
   }, [data]);
 
+  const sourceStats = useMemo(
+    () => ({
+      ok: sources.filter(
+        (source) => source.state === 'active' && source.ok === true,
+      ).length,
+      error: sources.filter(
+        (source) => source.state === 'active' && source.ok === false,
+      ).length,
+      paused: sources.filter((source) => source.state === 'paused').length,
+      removed: sources.filter((source) => source.state === 'removed').length,
+    }),
+    [sources],
+  );
+
+  const sourceKindOptions = useMemo(() => {
+    const kinds = new Set<SourceKind>();
+    for (const source of sources) kinds.add(source.kind);
+    return [...kinds];
+  }, [sources]);
+
+  const visibleSources = useMemo(() => {
+    const keyword = sourceQuery.trim().toLowerCase();
+    return sources.filter((source) => {
+      if (
+        sourceStatusFilter === 'ok' &&
+        (source.state !== 'active' || source.ok !== true)
+      ) {
+        return false;
+      }
+      if (
+        sourceStatusFilter === 'error' &&
+        (source.state !== 'active' || source.ok !== false)
+      ) {
+        return false;
+      }
+      if (
+        sourceStatusFilter === 'paused' &&
+        source.state !== 'paused'
+      ) {
+        return false;
+      }
+      if (
+        sourceStatusFilter === 'removed' &&
+        source.state !== 'removed'
+      ) {
+        return false;
+      }
+      if (sourceKindFilter !== 'all' && source.kind !== sourceKindFilter) {
+        return false;
+      }
+      if (!keyword) return true;
+      return (
+        source.name.toLowerCase().includes(keyword) ||
+        source.id.toLowerCase().includes(keyword) ||
+        source.url.toLowerCase().includes(keyword)
+      );
+    });
+  }, [sources, sourceQuery, sourceStatusFilter, sourceKindFilter]);
+
+  const toggleExpanded = (id: string) => {
+    setExpandedSources((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelected = (id: string) => {
+    setSelectedSources((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const selectAllVisible = () => {
+    setSelectedSources((previous) => {
+      const next = new Set(previous);
+      const allSelected = visibleSources.every((source) =>
+        next.has(source.id),
+      );
+      for (const source of visibleSources) {
+        if (allSelected) next.delete(source.id);
+        else next.add(source.id);
+      }
+      return next;
+    });
+  };
+
+  const batchSetState = (state: SourceState) => {
+    if (selectedSources.size === 0) return;
+    const count = selectedSources.size;
+    setSources((previous) =>
+      previous.map((source) =>
+        selectedSources.has(source.id) ? { ...source, state } : source,
+      ),
+    );
+    setSelectedSources(new Set());
+    setNotice(
+      `已标记 ${count} 个来源为${STATE_LABELS[state]}，点击「保存全部设置」生效`,
+    );
+    window.setTimeout(() => setNotice(null), 4000);
+  };
+
+  const batchRestore = async () => {
+    if (selectedSources.size === 0 || batchBusy) return;
+    const targets = sources.filter(
+      (source) =>
+        selectedSources.has(source.id) && source.state === 'removed',
+    );
+    if (targets.length === 0) {
+      setNotice('选中的来源中没有已移除项');
+      window.setTimeout(() => setNotice(null), 3000);
+      return;
+    }
+
+    setBatchBusy(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      let payload: AdminData | null = null;
+      let failed = 0;
+      for (const source of targets) {
+        const response = await fetch('/api/admin/sources', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'restore', id: source.id }),
+        });
+        if (!response.ok) {
+          failed += 1;
+          continue;
+        }
+        payload = (await response.json()) as AdminData;
+      }
+
+      if (payload) applyPayload(payload);
+      else await load();
+
+      setSelectedSources(new Set());
+      if (failed > 0) {
+        setError(`有 ${failed} 个来源恢复失败，请刷新后重试`);
+      } else {
+        setNotice(`已恢复 ${targets.length} 个来源，等待下一轮抓取`);
+        window.setTimeout(() => setNotice(null), 3000);
+      }
+    } catch (restoreError) {
+      setError(
+        restoreError instanceof Error ? restoreError.message : '批量恢复失败',
+      );
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const batchDelete = async () => {
+    if (selectedSources.size === 0 || batchBusy) return;
+    const targets = sources.filter((source) =>
+      selectedSources.has(source.id),
+    );
+    if (
+      !window.confirm(
+        `确定移除选中的 ${targets.length} 个来源？已入库条目会被清空；来源定义会保留，可随时在「已移除」里恢复。`,
+      )
+    ) {
+      return;
+    }
+
+    setBatchBusy(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      let payload: AdminData | null = null;
+      let failed = 0;
+      for (const source of targets) {
+        const response = await fetch('/api/admin/sources', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'delete', id: source.id }),
+        });
+        if (!response.ok) {
+          failed += 1;
+          continue;
+        }
+        payload = (await response.json()) as AdminData;
+      }
+
+      if (payload) applyPayload(payload);
+      else await load();
+
+      setSelectedSources(new Set());
+      setExpandedSources(new Set());
+      if (failed > 0) {
+        setError(`有 ${failed} 个来源删除失败，请刷新后重试`);
+      } else {
+        setNotice(`已删除 ${targets.length} 个来源`);
+        window.setTimeout(() => setNotice(null), 3000);
+      }
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error ? deleteError.message : '批量删除失败',
+      );
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   const pendingTagCandidates = useMemo(
     () =>
       (data?.tagCandidates ?? []).filter(
@@ -197,7 +437,7 @@ export function AdminDashboard() {
           },
           sources: sources.map((source) => ({
             id: source.id,
-            hidden: source.hidden,
+            state: source.state,
             refreshMinutes: source.refreshMinutes,
             name: source.name,
             url: source.url,
@@ -335,7 +575,7 @@ export function AdminDashboard() {
   const removeSource = async (source: AdminSource) => {
     if (
       !window.confirm(
-        `确定删除来源「${source.name}」？该来源已入库的条目也会一并删除。`,
+        `确定移除来源「${source.name}」？已入库条目会被清空；来源定义会保留，可随时在「已移除」里恢复。`,
       )
     ) {
       return;
@@ -355,14 +595,42 @@ export function AdminDashboard() {
         const payload = (await response.json().catch(() => null)) as
           | { error?: string }
           | null;
-        throw new Error(payload?.error ?? `删除失败（HTTP ${response.status}）`);
+        throw new Error(payload?.error ?? `移除失败（HTTP ${response.status}）`);
       }
 
       applyPayload((await response.json()) as AdminData);
-      setNotice('来源已删除');
+      setNotice('来源已移除，可在「已移除」筛选中恢复');
       window.setTimeout(() => setNotice(null), 3000);
     } catch (removeError) {
-      setError(removeError instanceof Error ? removeError.message : '删除失败');
+      setError(removeError instanceof Error ? removeError.message : '移除失败');
+    }
+  };
+
+  const restoreSource = async (source: AdminSource) => {
+    setError(null);
+    setNotice(null);
+
+    try {
+      const response = await fetch('/api/admin/sources', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'restore', id: source.id }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as
+          | { error?: string }
+          | null;
+        throw new Error(payload?.error ?? `恢复失败（HTTP ${response.status}）`);
+      }
+
+      applyPayload((await response.json()) as AdminData);
+      setNotice(`已恢复「${source.name}」，等待下一轮抓取`);
+      window.setTimeout(() => setNotice(null), 3000);
+    } catch (restoreError) {
+      setError(
+        restoreError instanceof Error ? restoreError.message : '恢复失败',
+      );
     }
   };
 
@@ -718,22 +986,26 @@ export function AdminDashboard() {
           </p>
         )}
 
-        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
+        <CollapsibleSection
+          id="announcement"
+          title={
+            <span className="flex items-center gap-2">
               <Megaphone
                 className="h-4 w-4 text-amber-600"
                 aria-hidden="true"
               />
-              <h2 className="text-sm font-semibold text-ink">首页公告</h2>
-            </div>
+              首页公告
+            </span>
+          }
+          actions={
             <Switch
               checked={announcementEnabled}
               onCheckedChange={setAnnouncementEnabled}
               label={announcementEnabled ? '已开启' : '已关闭'}
             />
-          </div>
-
+          }
+          defaultOpen={false}
+        >
           <textarea
             value={announcementText}
             onChange={(event) => setAnnouncementText(event.target.value)}
@@ -764,16 +1036,13 @@ export function AdminDashboard() {
               {savingAnnouncement ? '保存中' : '保存公告'}
             </Button>
           </div>
-        </section>
+        </CollapsibleSection>
 
-        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-semibold text-ink">来源管理</h2>
-              <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                调整首页顺序、隐藏来源、修改地址，或为单个来源设置独立刷新间隔（留空使用全局间隔）。
-              </p>
-            </div>
+        <CollapsibleSection
+          id="sources"
+          title="来源管理"
+          description="调整首页顺序、停用来源、修改地址，或为单个来源设置独立刷新间隔（留空使用全局间隔）。停用后停止抓取并保留数据；移除会清空条目但可在「已移除」里恢复。"
+          actions={
             <Button
               variant="outline"
               size="sm"
@@ -786,21 +1055,168 @@ export function AdminDashboard() {
               />
               重新加载
             </Button>
+          }
+          defaultOpen
+        >
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {[
+              { key: 'all' as const, label: '全部来源', value: sources.length },
+              { key: 'ok' as const, label: '正常', value: sourceStats.ok },
+              { key: 'error' as const, label: '异常', value: sourceStats.error },
+              {
+                key: 'paused' as const,
+                label: '已停用',
+                value: sourceStats.paused,
+              },
+              {
+                key: 'removed' as const,
+                label: '已移除',
+                value: sourceStats.removed,
+              },
+            ].map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                onClick={() => setSourceStatusFilter(item.key)}
+                className={cn(
+                  'cursor-pointer rounded-xl border px-3 py-2 text-left transition-colors',
+                  sourceStatusFilter === item.key
+                    ? 'border-gold/60 bg-amber-50/60'
+                    : 'border-line bg-slate-50 hover:border-slate-300',
+                )}
+              >
+                <span className="block text-[11px] text-slate-500">
+                  {item.label}
+                </span>
+                <span className="text-base font-semibold tabular-nums text-ink">
+                  {item.value}
+                </span>
+              </button>
+            ))}
           </div>
 
-          <div className="mt-3 space-y-3">
-            {sources.map((source, index) => (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <div className="relative min-w-[160px] flex-1">
+              <Search
+                className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400"
+                aria-hidden="true"
+              />
+              <Input
+                value={sourceQuery}
+                onChange={(event) => setSourceQuery(event.target.value)}
+                placeholder="搜索名称、标识或地址"
+                className="pl-8"
+              />
+            </div>
+            <select
+              value={sourceKindFilter}
+              onChange={(event) =>
+                setSourceKindFilter(event.target.value as SourceKindFilter)
+              }
+              className="h-11 rounded-xl border border-line bg-white px-3 text-xs text-ink"
+              aria-label="按类型筛选"
+            >
+              <option value="all">全部类型</option>
+              {sourceKindOptions.map((kind) => (
+                <option key={kind} value={kind}>
+                  {KIND_LABELS[kind] ?? kind}
+                </option>
+              ))}
+            </select>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={selectAllVisible}
+              disabled={visibleSources.length === 0}
+            >
+              全选当前
+            </Button>
+          </div>
+
+          {selectedSources.size > 0 ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-line bg-slate-50 px-3 py-2">
+              <span className="text-[11px] text-slate-600">
+                已选 {selectedSources.size} 个
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => batchSetState('paused')}
+                disabled={batchBusy}
+              >
+                批量停用
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => batchSetState('active')}
+                disabled={batchBusy}
+              >
+                批量启用
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void batchRestore()}
+                disabled={batchBusy}
+              >
+                批量恢复
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void batchDelete()}
+                disabled={batchBusy}
+                className="text-red-600"
+              >
+                批量移除
+              </Button>
+              <button
+                type="button"
+                onClick={() => setSelectedSources(new Set())}
+                className="ml-auto cursor-pointer text-[11px] text-slate-500 transition-colors hover:text-ink"
+              >
+                取消选择
+              </button>
+            </div>
+          ) : null}
+
+          <div className="mt-3 space-y-2">
+            {visibleSources.length === 0 ? (
+              <p className="rounded-xl border border-dashed border-line bg-slate-50/60 px-3 py-6 text-center text-[11px] text-slate-500">
+                没有符合筛选条件的来源
+              </p>
+            ) : null}
+            {visibleSources.map((source) => {
+              const expanded = expandedSources.has(source.id);
+              const realIndex = sources.findIndex(
+                (item) => item.id === source.id,
+              );
+              return (
               <div
                 key={source.id}
                 className={cn(
-                  'rounded-xl border p-3 transition-colors',
-                  source.hidden
-                    ? 'border-slate-200 bg-slate-50'
-                    : 'border-line bg-white',
+                  'rounded-xl border transition-colors',
+                  source.state === 'removed'
+                    ? 'border-red-100 bg-red-50/40'
+                    : source.state === 'paused'
+                      ? 'border-slate-200 bg-slate-50'
+                      : 'border-line bg-white',
                 )}
               >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
+                <div className="flex items-start gap-2.5 px-3 py-2.5">
+                  <input
+                    type="checkbox"
+                    checked={selectedSources.has(source.id)}
+                    onChange={() => toggleSelected(source.id)}
+                    aria-label={`选择 ${source.name}`}
+                    className="mt-1.5 h-3.5 w-3.5 shrink-0 cursor-pointer accent-slate-900"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => toggleExpanded(source.id)}
+                    className="min-w-0 flex-1 cursor-pointer text-left"
+                  >
                     <div className="flex flex-wrap items-center gap-1.5">
                       <span className="text-sm font-medium text-ink">
                         {source.name}
@@ -814,59 +1230,121 @@ export function AdminDashboard() {
                           内置
                         </span>
                       )}
-                      {source.hidden && (
-                        <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] text-slate-500">
-                          已隐藏
+                      {source.state !== 'active' && (
+                        <span
+                          className={cn(
+                            'rounded-full border px-2 py-0.5 text-[10px]',
+                            source.state === 'removed'
+                              ? 'border-red-200 bg-red-50 text-red-600'
+                              : 'border-slate-200 bg-white text-slate-500',
+                          )}
+                        >
+                          {STATE_LABELS[source.state]}
                         </span>
                       )}
                     </div>
-                    <p className="mt-1 text-[11px] text-slate-500">
-                      在架 {source.activeCount} · 本轮抓取 {source.count} ·
-                      更新 {formatDateTime(source.fetchedAt)} · 间隔{' '}
+                    <p className="mt-1 truncate text-[11px] text-slate-500">
+                      在架 {source.activeCount} · 更新{' '}
+                      {formatDateTime(source.fetchedAt)} · 间隔{' '}
                       {source.refreshMinutes
                         ? `${source.refreshMinutes} 分钟`
-                        : `全局（${data?.globalIntervalMinutes ?? 120} 分钟）`}
+                        : `全局 ${data?.globalIntervalMinutes ?? 120} 分钟`}{' '}
+                      · {KIND_LABELS[source.kind] ?? source.kind}
                     </p>
                     {source.ok === false && (
-                      <p className="mt-1 text-[11px] leading-relaxed text-red-700">
+                      <p className="mt-1 truncate text-[11px] leading-relaxed text-red-700">
                         异常：{source.error ?? '未知错误'}
                       </p>
                     )}
-                  </div>
+                  </button>
 
                   <div className="flex shrink-0 items-center gap-1">
+                    {source.state === 'removed' ? (
+                      <button
+                        type="button"
+                        aria-label={`恢复 ${source.name}`}
+                        onClick={() => void restoreSource(source)}
+                        className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-emerald-200 bg-white text-emerald-600 transition-colors hover:bg-emerald-50"
+                      >
+                        <RotateCcw className="h-4 w-4" aria-hidden="true" />
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          aria-label={
+                            source.state === 'paused'
+                              ? `启用 ${source.name}`
+                              : `停用 ${source.name}`
+                          }
+                          onClick={() =>
+                            patchSource(source.id, {
+                              state:
+                                source.state === 'paused'
+                                  ? 'active'
+                                  : 'paused',
+                            })
+                          }
+                          className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-line bg-white text-slate-600 transition-colors hover:bg-slate-50"
+                        >
+                          {source.state === 'paused' ? (
+                            <Eye className="h-4 w-4" aria-hidden="true" />
+                          ) : (
+                            <EyeOff className="h-4 w-4" aria-hidden="true" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`编辑 ${source.name}`}
+                          onClick={() => toggleExpanded(source.id)}
+                          className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-line bg-white text-slate-600 transition-colors hover:bg-slate-50"
+                        >
+                          {expanded ? (
+                            <ChevronUp className="h-4 w-4" aria-hidden="true" />
+                          ) : (
+                            <ChevronDown
+                              className="h-4 w-4"
+                              aria-hidden="true"
+                            />
+                          )}
+                        </button>
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      aria-label={`移除 ${source.name}`}
+                      onClick={() => void removeSource(source)}
+                      disabled={source.state === 'removed'}
+                      className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-red-200 bg-white text-red-600 transition-colors hover:bg-red-50 disabled:pointer-events-none disabled:opacity-40"
+                    >
+                      <Trash2 className="h-4 w-4" aria-hidden="true" />
+                    </button>
+                  </div>
+                </div>
+
+                {expanded ? (
+                <div className="border-t border-line px-3 py-3">
+                  <div className="mb-2 flex items-center justify-end gap-1">
                     <button
                       type="button"
                       aria-label={`上移 ${source.name}`}
-                      disabled={index === 0}
-                      onClick={() => move(index, -1)}
-                      className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg border border-line bg-white text-slate-600 transition-colors hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-40"
+                      disabled={realIndex <= 0}
+                      onClick={() => move(realIndex, -1)}
+                      className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-line bg-white text-slate-600 transition-colors hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-40"
                     >
                       <ArrowUp className="h-4 w-4" aria-hidden="true" />
                     </button>
                     <button
                       type="button"
                       aria-label={`下移 ${source.name}`}
-                      disabled={index === sources.length - 1}
-                      onClick={() => move(index, 1)}
-                      className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg border border-line bg-white text-slate-600 transition-colors hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-40"
+                      disabled={realIndex < 0 || realIndex >= sources.length - 1}
+                      onClick={() => move(realIndex, 1)}
+                      className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-line bg-white text-slate-600 transition-colors hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-40"
                     >
                       <ArrowDown className="h-4 w-4" aria-hidden="true" />
                     </button>
-                    {!source.builtin && (
-                      <button
-                        type="button"
-                        aria-label={`删除 ${source.name}`}
-                        onClick={() => void removeSource(source)}
-                        className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg border border-red-200 bg-white text-red-600 transition-colors hover:bg-red-50"
-                      >
-                        <Trash2 className="h-4 w-4" aria-hidden="true" />
-                      </button>
-                    )}
                   </div>
-                </div>
-
-                <div className="mt-2 grid gap-2 border-t border-line pt-2 sm:grid-cols-2">
+                  <div className="grid gap-2 sm:grid-cols-2">
                   <label className="min-w-0 text-[11px] text-slate-500">
                     名称
                     <Input
@@ -896,6 +1374,9 @@ export function AdminDashboard() {
                       >
                         <option value="rss">RSS / Atom</option>
                         <option value="epic">Epic 官方接口</option>
+                        <option value="linuxdo">linux.do 专用</option>
+                        <option value="xianbao">线报酷专用</option>
+                        <option value="sina_weibo">微博镜像专用</option>
                       </select>
                     )}
                   </label>
@@ -929,24 +1410,39 @@ export function AdminDashboard() {
                   </label>
                   <div className="flex items-end">
                     <Switch
-                      checked={!source.hidden}
+                      checked={source.state === 'active'}
                       onCheckedChange={(checked) =>
-                        patchSource(source.id, { hidden: !checked })
+                        patchSource(source.id, {
+                          state: checked ? 'active' : 'paused',
+                        })
                       }
-                      label={source.hidden ? '首页隐藏' : '首页显示'}
+                      label={
+                        source.state === 'active'
+                          ? '启用中·正常抓取'
+                          : '已停用·停止抓取'
+                      }
                     />
                   </div>
+                  </div>
                 </div>
+                ) : null}
               </div>
-            ))}
+              );
+            })}
           </div>
 
-          <div className="mt-4 rounded-xl border border-dashed border-line bg-slate-50/60 p-3">
-            <div className="flex items-center gap-2">
-              <Plus className="h-4 w-4 text-slate-600" aria-hidden="true" />
-              <h3 className="text-xs font-semibold text-ink">添加网站来源</h3>
-            </div>
-            <div className="mt-2 grid gap-2 sm:grid-cols-2">
+          <CollapsibleSection
+            id="add-source"
+            title={
+              <span className="flex items-center gap-2">
+                <Plus className="h-4 w-4 text-slate-600" aria-hidden="true" />
+                添加网站来源
+              </span>
+            }
+            className="mt-4 rounded-xl border-dashed bg-slate-50/60 p-3"
+            defaultOpen={false}
+          >
+            <div className="grid gap-2 sm:grid-cols-2">
               <label className="min-w-0 text-[11px] text-slate-500">
                 名称
                 <Input
@@ -966,7 +1462,7 @@ export function AdminDashboard() {
                 标识（可选）
                 <Input
                   value={newSource.id}
-                  placeholder="留空自动生成，小写英文/数字/-"
+                  placeholder="留空自动生成；填已移除来源的标识可直接恢复"
                   onChange={(event) =>
                     setNewSource((previous) => ({
                       ...previous,
@@ -997,13 +1493,16 @@ export function AdminDashboard() {
                   onChange={(event) =>
                     setNewSource((previous) => ({
                       ...previous,
-                      kind: event.target.value as 'rss' | 'epic',
+                      kind: event.target.value as SourceKind,
                     }))
                   }
                   className="mt-1 h-11 w-full rounded-xl border border-line bg-white px-3 text-sm text-ink transition-colors hover:border-slate-300 focus:border-slate-400"
                 >
                   <option value="rss">RSS / Atom</option>
                   <option value="epic">Epic 官方接口</option>
+                  <option value="linuxdo">linux.do 专用</option>
+                  <option value="xianbao">线报酷专用</option>
+                  <option value="sina_weibo">微博镜像专用</option>
                 </select>
               </label>
               <label className="min-w-0 text-[11px] text-slate-500">
@@ -1042,7 +1541,7 @@ export function AdminDashboard() {
                 {adding ? '添加中' : '添加来源'}
               </Button>
             </div>
-          </div>
+          </CollapsibleSection>
 
           <div className="mt-4 flex items-center justify-between gap-3">
             <p className="text-[11px] text-slate-500">
@@ -1060,16 +1559,13 @@ export function AdminDashboard() {
               {saving ? '保存中' : '保存全部设置'}
             </Button>
           </div>
-        </section>
+        </CollapsibleSection>
 
-        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-semibold text-ink">搜索索引</h2>
-              <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                全文索引负责为 AI 搜索召回候选。索引与数据条数不一致、或修改了「索引文本最大长度」后，可在这里手动重建。
-              </p>
-            </div>
+        <CollapsibleSection
+          id="search-index"
+          title="搜索索引"
+          description="全文索引负责为 AI 搜索召回候选。索引与数据条数不一致、或修改了「索引文本最大长度」后，可在这里手动重建。"
+          actions={
             <Button
               variant="outline"
               size="sm"
@@ -1088,8 +1584,9 @@ export function AdminDashboard() {
                 ? '重建中'
                 : '重建索引'}
             </Button>
-          </div>
-
+          }
+          defaultOpen={false}
+        >
           <div className="mt-3 grid gap-2 text-[11px] text-slate-600 sm:grid-cols-3">
             <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
               状态：
@@ -1118,16 +1615,13 @@ export function AdminDashboard() {
               最近重建：{formatDateTime(data?.searchIndex.builtAt ?? null)}
             </div>
           </div>
-        </section>
+        </CollapsibleSection>
 
-        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-semibold text-ink">品类标签</h2>
-              <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                新建优惠会在生成 AI 摘要时自动打上品类标签，让「奶茶」这类品类词也能命中蜜雪冰城、茶百道等品牌条目。这里用于补全历史数据。
-              </p>
-            </div>
+        <CollapsibleSection
+          id="tags"
+          title="品类标签"
+          description="新建优惠会在生成 AI 摘要时自动打上品类标签，让「奶茶」这类品类词也能命中蜜雪冰城、茶百道等品牌条目。这里用于补全历史数据。"
+          actions={
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 variant="outline"
@@ -1163,8 +1657,9 @@ export function AdminDashboard() {
                 重新打标
               </Button>
             </div>
-          </div>
-
+          }
+          defaultOpen={false}
+        >
           <div className="mt-3 grid gap-2 text-[11px] text-slate-600 sm:grid-cols-3">
             <div className="rounded-xl border border-line bg-slate-50 px-3 py-2">
               状态：
@@ -1230,17 +1725,16 @@ export function AdminDashboard() {
               {data.tags.lastError}
             </p>
           ) : null}
-        </section>
+        </CollapsibleSection>
 
-        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
-          <div>
-            <h2 className="text-sm font-semibold text-ink">标签候选</h2>
-            <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
-              AI 在词表外提出的新品类词会先进入候选池，立即参与搜索但不会出现在前台标签建议里。被{' '}
-              {data?.tags.promoteThreshold ?? 3} 条以上优惠使用后可一键转正；转正后并入受控词表，也可合并到已有标签或直接屏蔽。
-            </p>
-          </div>
-
+        <CollapsibleSection
+          id="tag-candidates"
+          title="标签候选"
+          description={`AI 在词表外提出的新品类词会先进入候选池，立即参与搜索但不会出现在前台标签建议里。被 ${
+            data?.tags.promoteThreshold ?? 3
+          } 条以上优惠使用后可一键转正；转正后并入受控词表，也可合并到已有标签或直接屏蔽。`}
+          defaultOpen={false}
+        >
           {pendingTagCandidates.length === 0 ? (
             <p className="mt-3 rounded-xl border border-dashed border-line bg-slate-50 px-3 py-4 text-center text-[11px] text-slate-500">
               暂无待审核候选
@@ -1299,25 +1793,18 @@ export function AdminDashboard() {
               })}
             </div>
           )}
-        </section>
+        </CollapsibleSection>
 
         <AdminUserManager />
 
         <AdminInviteCodes />
 
-        <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
-          <div>
-            <h2 className="text-sm font-semibold text-ink">
-              刷新与运行时配置
-            </h2>
-            <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
-              全局刷新间隔、AI 接口、代理与管理员密码都在这里设置。保存后立即生效；标注「需重建容器」的容器级参数除外。
-            </p>
-            <p className="mt-1 text-[11px] leading-relaxed text-amber-700">
-              这里的修改优先于服务器 .env，保存后立即生效；未在后台修改过的项会读取 .env，修改 .env 后需重建容器才会生效。
-            </p>
-          </div>
-
+        <CollapsibleSection
+          id="runtime"
+          title="刷新与运行时配置"
+          description="全局刷新间隔、AI 接口、代理与管理员密码都在这里设置。保存后立即生效；标注「需重建容器」的容器级参数除外。这里的修改优先于服务器 .env；未在后台修改过的项会读取 .env，修改 .env 后需重建容器才会生效。"
+          defaultOpen={false}
+        >
           <div className="mt-4 space-y-4">
             {runtimeGroups.map(([group, fields]) =>
               group === '通知渠道' ? (
@@ -1494,7 +1981,7 @@ export function AdminDashboard() {
               {saving ? '保存中' : '保存全部设置'}
             </Button>
           </div>
-        </section>
+        </CollapsibleSection>
       </main>
     </div>
   );

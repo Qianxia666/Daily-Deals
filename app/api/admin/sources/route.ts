@@ -1,12 +1,25 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { isAdmin } from '@/lib/admin';
-import { createSource, deleteSource, getSource } from '@/lib/db';
+import {
+  createSource,
+  deleteSource,
+  getSource,
+  restoreSource,
+} from '@/lib/db';
 import { getAdminPayload } from '@/lib/runtime-settings';
+import type { SourceKind } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{1,39}$/;
+const KINDS: SourceKind[] = [
+  'rss',
+  'epic',
+  'linuxdo',
+  'xianbao',
+  'sina_weibo',
+];
 
 interface SourceBody {
   action?: unknown;
@@ -54,14 +67,16 @@ export async function POST(request: NextRequest) {
     if (!source) {
       return NextResponse.json({ error: '来源不存在' }, { status: 404 });
     }
-    if (source.builtin) {
-      return NextResponse.json(
-        { error: '内置来源不能删除，可以隐藏或修改地址' },
-        { status: 400 },
-      );
-    }
 
     deleteSource(id);
+    return NextResponse.json(getAdminPayload());
+  }
+
+  if (action === 'restore') {
+    const id = typeof body.id === 'string' ? body.id : '';
+    if (!restoreSource(id)) {
+      return NextResponse.json({ error: '来源不存在' }, { status: 404 });
+    }
     return NextResponse.json(getAdminPayload());
   }
 
@@ -85,7 +100,11 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const kind = body.kind === 'epic' ? 'epic' : 'rss';
+  const kind: SourceKind =
+    typeof body.kind === 'string' &&
+    KINDS.includes(body.kind as SourceKind)
+      ? (body.kind as SourceKind)
+      : 'rss';
   const refreshMinutes = normalizeRefresh(body.refreshMinutes);
   if (refreshMinutes === undefined) {
     return NextResponse.json(
@@ -110,7 +129,7 @@ export async function POST(request: NextRequest) {
     url,
     kind,
     refreshMinutes,
-    hidden: body.hidden === true,
+    state: 'active',
   });
 
   if (!created) {

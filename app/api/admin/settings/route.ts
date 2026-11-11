@@ -11,15 +11,23 @@ import {
   getAdminPayload,
   saveRuntimeSettings,
 } from '@/lib/runtime-settings';
-import type { SourceKind } from '@/lib/types';
+import type { SourceKind, SourceState } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
-const KINDS: SourceKind[] = ['rss', 'epic', 'linuxdo', 'xianbao'];
+const KINDS: SourceKind[] = [
+  'rss',
+  'epic',
+  'linuxdo',
+  'xianbao',
+  'sina_weibo',
+];
+const STATES: SourceState[] = ['active', 'paused', 'removed'];
 
 interface SourceBody {
   id?: unknown;
+  state?: unknown;
   hidden?: unknown;
   refreshMinutes?: unknown;
   name?: unknown;
@@ -118,7 +126,9 @@ export async function POST(request: NextRequest) {
       if (
         kind &&
         stored.builtin &&
-        (stored.kind === 'linuxdo' || stored.kind === 'xianbao') &&
+        (stored.kind === 'linuxdo' ||
+          stored.kind === 'xianbao' ||
+          stored.kind === 'sina_weibo') &&
         kind !== stored.kind
       ) {
         return NextResponse.json(
@@ -127,9 +137,18 @@ export async function POST(request: NextRequest) {
         );
       }
 
+      // 兼容旧版只传 hidden 的请求；否则以 state 为准。
+      const state: SourceState =
+        typeof item.state === 'string' &&
+        STATES.includes(item.state as SourceState)
+          ? (item.state as SourceState)
+          : item.hidden === true
+            ? 'paused'
+            : 'active';
+
       cleaned.push({
         id,
-        hidden: item.hidden === true,
+        state,
         refreshMinutes,
         name,
         url,

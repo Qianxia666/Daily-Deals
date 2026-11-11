@@ -1,8 +1,12 @@
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowUpRight,
   Bookmark,
   ChevronDown,
   Clock3,
+  FileText,
   Sparkles,
 } from 'lucide-react';
 import { formatPublishedAt, getExpiryInfo } from '@/lib/format';
@@ -65,6 +69,32 @@ export function DealCard({
   const titleChanged = Boolean(item.aiTitle && item.aiTitle !== item.title);
   const shortTitle = truncateText(displayTitle, 40);
   const hasAi = Boolean(item.aiSummary);
+  const [bodyOpen, setBodyOpen] = useState(false);
+  const [bodyClamped, setBodyClamped] = useState(false);
+  const bodyRef = useRef<HTMLParagraphElement>(null);
+  const hasBody = Boolean(item.description);
+  // 原文块底部的折角按钮会向下溢出，页脚需要留出空间。
+  const bodyToggle = !hasAi && hasBody && bodyClamped;
+
+  // 折叠高度小于内容高度时才需要「展开全文」。等一帧再量，避免样式未生效时误判。
+  useEffect(() => {
+    if (bodyOpen) return;
+    const element = bodyRef.current;
+    if (!element) return;
+
+    const check = () => {
+      setBodyClamped(element.scrollHeight > element.clientHeight + 1);
+    };
+
+    check();
+    const frame = requestAnimationFrame(check);
+    window.addEventListener('resize', check);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('resize', check);
+    };
+  }, [bodyOpen, item.description]);
   const publishedAt = formatPublishedAt(item.publishedAt);
   const hasOriginal = Boolean(item.description || titleChanged);
   const originalContent = (
@@ -140,26 +170,58 @@ export function DealCard({
           )}
         </div>
       ) : (
-        item.description && (
-          <p className="mt-2 line-clamp-3 text-[13px] leading-relaxed text-slate-600">
-            <Highlighted text={item.description} query={highlight} />
-          </p>
+        hasBody && (
+          <div
+            className={cn(
+              'relative mt-2.5 rounded-xl border border-slate-200 bg-slate-50/80 px-3 pt-2.5',
+              bodyClamped ? 'pb-6' : 'pb-2.5',
+            )}
+          >
+            <div className="flex items-center gap-1.5 text-[11px] font-medium text-slate-500">
+              <FileText className="h-3.5 w-3.5" aria-hidden="true" />
+              文章原文
+            </div>
+            <p
+              ref={bodyRef}
+              className={cn(
+                'mt-1 whitespace-pre-line text-[13px] leading-relaxed text-slate-700',
+                !bodyOpen && 'line-clamp-3',
+              )}
+            >
+              <Highlighted text={item.description ?? ''} query={highlight} />
+            </p>
+            {bodyClamped && (
+              <>
+                <span
+                  aria-hidden="true"
+                  className="pointer-events-none absolute -bottom-px left-1/2 h-px w-9 -translate-x-1/2 bg-white"
+                />
+                <button
+                  type="button"
+                  aria-label={bodyOpen ? '收起原文' : '展开原文'}
+                  title={bodyOpen ? '收起原文' : '展开原文'}
+                  aria-expanded={bodyOpen}
+                  onClick={() => setBodyOpen((open) => !open)}
+                  className="absolute -bottom-3.5 left-1/2 flex h-7 w-9 -translate-x-1/2 cursor-pointer items-center justify-center text-slate-300 transition-colors hover:text-slate-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
+                >
+                  <ChevronDown
+                    className={cn(
+                      'h-4 w-4 transition-transform duration-200',
+                      bodyOpen && 'rotate-180',
+                    )}
+                    aria-hidden="true"
+                  />
+                </button>
+              </>
+            )}
+          </div>
         )
-      )}
-
-      {!hasAi && hasOriginal && (
-        <details className="mt-2">
-          <summary className="w-fit cursor-pointer text-[11px] text-slate-400 transition-colors hover:text-slate-600">
-            查看原文
-          </summary>
-          <div className="mt-1.5">{originalContent}</div>
-        </details>
       )}
 
       <div
         className={cn(
           'flex flex-wrap items-center gap-1.5',
-          hasAi && hasOriginal ? 'mt-5' : 'mt-3',
+          hasAi && hasOriginal ? 'mt-5' : bodyToggle ? 'mt-5' : 'mt-3',
         )}
       >
         <Badge variant="outline">{item.sourceName}</Badge>

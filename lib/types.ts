@@ -1,7 +1,15 @@
 /** 来源标识由数据库动态维护，不再限制为固定枚举。 */
 export type SourceId = string;
 
-export type SourceKind = 'rss' | 'epic' | 'linuxdo' | 'xianbao';
+export type SourceKind =
+  | 'rss'
+  | 'epic'
+  | 'linuxdo'
+  | 'xianbao'
+  | 'sina_weibo';
+
+/** 来源三态：启用、停用（保留数据）、已移除（清空条目，可恢复）。 */
+export type SourceState = 'active' | 'paused' | 'removed';
 
 export interface DealItem {
   id: number;
@@ -72,7 +80,7 @@ export interface DealsListResponse extends DealsMeta {
 
 export interface AdminSource extends SourceStatus {
   order: number;
-  hidden: boolean;
+  state: SourceState;
   url: string;
   kind: SourceKind;
   refreshMinutes: number | null;

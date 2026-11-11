@@ -1,5 +1,6 @@
 import {
   getPublicDigest,
+  getVisibleSourceIds,
   listDealsForPublicDigest,
   savePublicDigest,
   todayKey,
@@ -160,10 +161,18 @@ export function buildPublicDigest(date: string): PublicDigest {
 
 export function ensurePublicDigest(date: string): PublicDigest {
   const existing = getPublicDigest(date);
-  if (existing) return existing;
+  if (existing && !hasHiddenSource(existing)) return existing;
   const digest = buildPublicDigest(date);
   savePublicDigest(digest);
   return digest;
+}
+
+/** 快照中是否存在已隐藏/停用来源的条目，存在则需要重建。 */
+function hasHiddenSource(digest: PublicDigest): boolean {
+  const visible = new Set(getVisibleSourceIds());
+  return digest.groups.some((group) =>
+    group.items.some((item) => !visible.has(item.source)),
+  );
 }
 
 export function refreshPublicDigest(date: string): PublicDigest {

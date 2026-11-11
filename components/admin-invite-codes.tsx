@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from 'react';
 import type { InviteCode } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { Button } from './ui/button';
+import { CollapsibleSection } from './ui/collapsible-section';
 import { Input } from './ui/input';
 
 function formatDate(iso: string | null): string {
@@ -172,20 +173,22 @@ export function AdminInviteCodes() {
   };
 
   return (
-    <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="flex items-center gap-2 text-sm font-semibold text-ink">
+    <CollapsibleSection
+      id="invite-codes"
+      title={
+        <span className="flex items-center gap-2">
           <Ticket className="h-4 w-4 text-gold" aria-hidden="true" />
           邀请码管理
-        </h2>
+        </span>
+      }
+      description="可随时生成多个同时有效的邀请码，并单独控制有效期与使用次数。开启「注册必须使用邀请码」后生效。"
+      actions={
         <span className="text-[11px] text-slate-400">
           共 {codes.length} 个
         </span>
-      </div>
-      <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
-        可随时生成多个同时有效的邀请码，并单独控制有效期与使用次数。开启「注册必须使用邀请码」后生效。
-      </p>
-
+      }
+      defaultOpen={false}
+    >
       <div className="mt-3 grid gap-2 sm:grid-cols-5">
         <label className="text-[11px] text-slate-500">
           数量
@@ -348,6 +351,6 @@ export function AdminInviteCodes() {
           })}
         </ul>
       )}
-    </section>
+    </CollapsibleSection>
   );
 }

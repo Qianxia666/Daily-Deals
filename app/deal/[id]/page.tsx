@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { SOURCE_NAMES } from '@/lib/constants';
-import { getDealById, getRelatedDeals } from '@/lib/db';
+import { getDealById, getRelatedDeals, isSourceVisible } from '@/lib/db';
 import { getSiteSettings } from '@/lib/runtime-settings';
 
 export const dynamic = 'force-dynamic';
@@ -29,7 +29,9 @@ export async function generateMetadata({
   const { id } = await params;
   const site = getSiteSettings();
   const deal = getDealById(Number(id));
-  if (!deal) return { title: `优惠详情 · ${site.title}` };
+  if (!deal || !isSourceVisible(deal.source)) {
+    return { title: `优惠详情 · ${site.title}` };
+  }
   return {
     title: `${deal.title} · ${site.title}`,
     description: (deal.summary || deal.description).slice(0, 120),
@@ -54,7 +56,7 @@ export default async function DealPage({
 }) {
   const { id } = await params;
   const deal = getDealById(Number(id));
-  if (!deal) notFound();
+  if (!deal || !isSourceVisible(deal.source)) notFound();
 
   const site = getSiteSettings();
   const sourceName =

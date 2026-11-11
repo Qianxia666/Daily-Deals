@@ -18,6 +18,7 @@ import type {
 } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { Button } from './ui/button';
+import { CollapsibleSection } from './ui/collapsible-section';
 import { Input } from './ui/input';
 
 const KIND_LABELS: Record<ChannelKind, string> = {
@@ -251,18 +252,20 @@ export function AdminUserManager() {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   return (
-    <section className="rounded-2xl border border-line bg-white p-4 shadow-sm sm:p-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="flex items-center gap-2 text-sm font-semibold text-ink">
+    <CollapsibleSection
+      id="users"
+      title={
+        <span className="flex items-center gap-2">
           <UserCog className="h-4 w-4 text-slate-500" aria-hidden="true" />
           注册用户管理
-        </h2>
+        </span>
+      }
+      description="可查看和修改用户邮箱、重置密码、管理订阅关键词与推送渠道。密码为加盐哈希，无法查看原密码。"
+      actions={
         <span className="text-[11px] text-slate-400">共 {total} 个账号</span>
-      </div>
-      <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
-        可查看和修改用户邮箱、重置密码、管理订阅关键词与推送渠道。密码为加盐哈希，无法查看原密码。
-      </p>
-
+      }
+      defaultOpen
+    >
       <div className="mt-3 flex flex-wrap gap-2">
         <div className="relative min-w-0 flex-1">
           <Search
@@ -766,6 +769,6 @@ export function AdminUserManager() {
           </div>
         </div>
       )}
-    </section>
+    </CollapsibleSection>
   );
 }
