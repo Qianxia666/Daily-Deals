@@ -26,6 +26,8 @@ import {
   getRuntimeEnvNumber,
 } from './runtime-settings';
 import { SOURCE_TIMEOUT_MS } from './sources';
+import { getEmbeddingConfig } from './embeddings';
+import { embedPendingDeals, syncKeywordVectors } from './vector-match';
 import type { RawDeal } from './fetchers/types';
 
 const failureCounts = new Map<string, number>();
@@ -39,6 +41,7 @@ function sleep(ms: number): Promise<void> {
 const runtime = globalThis as typeof globalThis & {
   __dailyDealsSchedulerStarted?: boolean;
   __dailyDealsFetching?: boolean;
+  __dailyDealsVectorBusy?: boolean;
 };
 
 export function isFetching(): boolean {
@@ -255,6 +258,29 @@ export function startScheduler(): void {
   setInterval(() => {
     void enrichPendingDeals();
   }, 5 * 60_000);
+
+  // 订阅向量：每 60 秒补齐关键词与文章向量，算完立即匹配。
+  const vectorTick = async () => {
+    if (runtime.__dailyDealsVectorBusy) return;
+    const config = getEmbeddingConfig();
+    if (!config.enabled) return;
+
+    runtime.__dailyDealsVectorBusy = true;
+    try {
+      await syncKeywordVectors(config);
+      await embedPendingDeals(config);
+    } catch (error) {
+      console.error('[vector] tick failed:', error);
+    } finally {
+      runtime.__dailyDealsVectorBusy = false;
+    }
+  };
+  setTimeout(() => {
+    void vectorTick();
+  }, 20_000);
+  setInterval(() => {
+    void vectorTick();
+  }, 60_000);
 
   // 详情正文补全（微博镜像与线报酷）：串行慢速执行，不阻塞抓取。
   startBodyBackfillWorker();

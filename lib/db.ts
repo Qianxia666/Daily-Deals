@@ -231,6 +231,27 @@ CREATE TABLE IF NOT EXISTS daily_digests (
 CREATE INDEX IF NOT EXISTS idx_digests_status ON daily_digests(status, id);
 CREATE INDEX IF NOT EXISTS idx_digests_date ON daily_digests(digest_date);
 
+CREATE TABLE IF NOT EXISTS keyword_vectors (
+  keyword TEXT PRIMARY KEY COLLATE NOCASE,
+  vector BLOB NOT NULL,
+  dims INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  source_count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vector_match_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id INTEGER NOT NULL,
+  keyword TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  score REAL NOT NULL,
+  pushed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  UNIQUE(deal_id, keyword, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vector_log_created ON vector_match_log(created_at);
+
 CREATE TABLE IF NOT EXISTS public_digests (
   digest_date TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -436,6 +457,9 @@ function migrate(db: Database.Database): void {
     ['entities', "TEXT NOT NULL DEFAULT '[]'"],
     ['ai_tags_at', 'TEXT'],
     ['body_fetched_at', 'TEXT'],
+    ['vector', 'BLOB'],
+    ['vector_model', 'TEXT'],
+    ['vector_at', 'TEXT'],
   ];
 
   for (const [name, type] of additions) {
@@ -3745,3 +3769,288 @@ export function getRelatedDeals(
   }));
 }
 
+
+/* ------------------------------------------------------------------ *
+ * 订阅向量匹配（关键词向量、文章向量与灰度日志）
+ * ------------------------------------------------------------------ */
+
+export interface KeywordVectorRecord {
+  keyword: string;
+  vector: Buffer;
+  dims: number;
+}
+
+export interface DealVectorInput {
+  id: number;
+  title: string;
+  ai_title: string | null;
+  ai_summary: string | null;
+  tags: string;
+  description: string;
+}
+
+/** 需要补算向量的启用关键词（缺失或模型版本不一致）。 */
+export function listKeywordsNeedingVector(
+  model: string,
+  limit = 200,
+): string[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT DISTINCT LOWER(TRIM(s.keyword)) AS keyword
+       FROM subscriptions s
+       JOIN users u ON u.id = s.user_id AND u.disabled = 0
+       LEFT JOIN keyword_vectors v
+         ON v.keyword = LOWER(TRIM(s.keyword)) AND v.model = ?
+       WHERE s.enabled = 1
+         AND LENGTH(TRIM(s.keyword)) >= 2
+         AND v.keyword IS NULL
+       ORDER BY keyword ASC
+       LIMIT ?`,
+    )
+    .all(model, Math.min(Math.max(limit, 1), 500)) as { keyword: string }[];
+
+  return rows.map((row) => row.keyword);
+}
+
+/** 写入关键词向量，并同步订阅引用计数。 */
+export function upsertKeywordVector(
+  keyword: string,
+  vector: Buffer,
+  dims: number,
+  model: string,
+): void {
+  const db = getDb();
+  const normalized = keyword.trim().toLowerCase();
+  const count = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM subscriptions s
+         JOIN users u ON u.id = s.user_id AND u.disabled = 0
+         WHERE s.enabled = 1 AND LOWER(TRIM(s.keyword)) = ?`,
+      )
+      .get(normalized) as { count: number }
+  ).count;
+
+  db.prepare(
+    `INSERT INTO keyword_vectors
+       (keyword, vector, dims, model, source_count, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(keyword) DO UPDATE SET
+       vector = excluded.vector,
+       dims = excluded.dims,
+       model = excluded.model,
+       source_count = excluded.source_count,
+       updated_at = excluded.updated_at`,
+  ).run(normalized, vector, dims, model, count, new Date().toISOString());
+}
+
+/** 读取指定模型的全部关键词向量，供内存缓存使用。 */
+export function listKeywordVectors(model: string): KeywordVectorRecord[] {
+  return getDb()
+    .prepare(
+      `SELECT keyword, vector, dims FROM keyword_vectors WHERE model = ?`,
+    )
+    .all(model) as KeywordVectorRecord[];
+}
+
+/** 刷新引用计数，并回收 30 天内无人使用的旧向量。 */
+export function refreshKeywordVectorRefCounts(): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE keyword_vectors
+     SET source_count = (
+       SELECT COUNT(*) FROM subscriptions s
+       JOIN users u ON u.id = s.user_id AND u.disabled = 0
+       WHERE s.enabled = 1 AND LOWER(TRIM(s.keyword)) = keyword_vectors.keyword
+     )`,
+  ).run();
+  db.prepare(
+    `DELETE FROM keyword_vectors
+     WHERE source_count = 0 AND updated_at < ?`,
+  ).run(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+}
+
+/** 需要补算向量的文章：来源可见、未过期、最近入库。 */
+export function listDealsNeedingVector(
+  model: string,
+  sinceIso: string,
+  limit = 20,
+): DealVectorInput[] {
+  return getDb()
+    .prepare(
+      `SELECT d.id,
+              d.title,
+              d.ai_title,
+              d.ai_summary,
+              d.tags,
+              d.description
+       FROM deals d
+       JOIN sources s ON s.id = d.source AND s.state = 'active' AND s.enabled = 1
+       WHERE (d.expires_at IS NULL OR d.expires_at > ?)
+         AND d.first_seen_at >= ?
+         AND (d.vector_at IS NULL OR d.vector_model != ?)
+       ORDER BY d.id DESC
+       LIMIT ?`,
+    )
+    .all(
+      new Date().toISOString(),
+      sinceIso,
+      model,
+      Math.min(Math.max(limit, 1), 100),
+    ) as DealVectorInput[];
+}
+
+export function saveDealVector(
+  dealId: number,
+  vector: Buffer,
+  model: string,
+): void {
+  getDb()
+    .prepare(
+      `UPDATE deals SET vector = ?, vector_model = ?, vector_at = ? WHERE id = ?`,
+    )
+    .run(vector, model, new Date().toISOString(), dealId);
+}
+
+export function getDealVector(
+  dealId: number,
+): { vector: Buffer; model: string } | null {
+  const row = getDb()
+    .prepare(
+      `SELECT vector, vector_model AS model FROM deals WHERE id = ? AND vector IS NOT NULL`,
+    )
+    .get(dealId) as { vector: Buffer; model: string } | undefined;
+  return row ?? null;
+}
+
+export function listEnabledSubscriptions(): {
+  id: number;
+  user_id: number;
+  keyword: string;
+}[] {
+  return getDb()
+    .prepare(
+      `SELECT s.id, s.user_id, s.keyword
+       FROM subscriptions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.enabled = 1 AND u.disabled = 0`,
+    )
+    .all() as { id: number; user_id: number; keyword: string }[];
+}
+
+/** 按用户去重后写入订阅投递记录，返回新增行数。 */
+export function insertVectorDeliveries(
+  dealId: number,
+  matches: { subscriptionId: number; userId: number }[],
+): number {
+  if (matches.length === 0) return 0;
+
+  const db = getDb();
+  const userIds = [...new Set(matches.map((item) => item.userId))];
+  const channels = db
+    .prepare(
+      `SELECT id, user_id FROM channels
+       WHERE enabled = 1 AND user_id IN (${userIds.map(() => '?').join(', ')})`,
+    )
+    .all(...userIds) as { id: number; user_id: number }[];
+
+  const byUser = new Map<number, number[]>();
+  for (const channel of channels) {
+    const list = byUser.get(channel.user_id) ?? [];
+    list.push(channel.id);
+    byUser.set(channel.user_id, list);
+  }
+
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO deliveries
+       (user_id, subscription_id, channel_id, deal_id, created_at)
+     SELECT ?, ?, ?, ?, ?
+     WHERE NOT EXISTS (
+       SELECT 1 FROM deliveries
+       WHERE user_id = ? AND deal_id = ?
+     )`,
+  );
+  const now = new Date().toISOString();
+  let created = 0;
+
+  const write = db.transaction(() => {
+    for (const match of matches) {
+      for (const channelId of byUser.get(match.userId) ?? []) {
+        created += insert.run(
+          match.userId,
+          match.subscriptionId,
+          channelId,
+          dealId,
+          now,
+          match.userId,
+          dealId,
+        ).changes;
+      }
+    }
+  });
+  write();
+
+  return created;
+}
+
+export function logVectorMatches(
+  entries: {
+    dealId: number;
+    keyword: string;
+    userId: number;
+    score: number;
+    pushed: boolean;
+  }[],
+): void {
+  if (entries.length === 0) return;
+
+  const insert = getDb().prepare(
+    `INSERT OR IGNORE INTO vector_match_log
+       (deal_id, keyword, user_id, score, pushed, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  const now = new Date().toISOString();
+  const write = getDb().transaction(() => {
+    for (const entry of entries) {
+      insert.run(
+        entry.dealId,
+        entry.keyword,
+        entry.userId,
+        entry.score,
+        entry.pushed ? 1 : 0,
+        now,
+      );
+    }
+  });
+  write();
+}
+
+export function readVectorStats(): {
+  keywords: number;
+  deals: number;
+  matchesToday: number;
+  pushedToday: number;
+} {
+  const db = getDb();
+  const today = new Date().toISOString().slice(0, 10);
+  const keywordRow = db
+    .prepare(`SELECT COUNT(*) AS count FROM keyword_vectors`)
+    .get() as { count: number };
+  const dealRow = db
+    .prepare(`SELECT COUNT(*) AS count FROM deals WHERE vector IS NOT NULL`)
+    .get() as { count: number };
+  const logRow = db
+    .prepare(
+      `SELECT COUNT(*) AS count, COALESCE(SUM(pushed), 0) AS pushed
+       FROM vector_match_log WHERE created_at >= ?`,
+    )
+    .get(`${today}T00:00:00.000Z`) as { count: number; pushed: number };
+
+  return {
+    keywords: keywordRow.count,
+    deals: dealRow.count,
+    matchesToday: logRow.count,
+    pushedToday: logRow.pushed,
+  };
+}

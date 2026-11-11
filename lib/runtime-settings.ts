@@ -840,6 +840,88 @@ const FIELDS: RuntimeFieldDef[] = [
     max: 8,
   },
   {
+    key: 'SUBSCRIPTION_VECTOR_ENABLED',
+    label: '启用订阅向量匹配',
+    group: '订阅向量',
+    description:
+      '开启后对字符串未命中的优惠做语义匹配，用于补足「喜茶」匹配「奶茶」这类漏推。关闭时行为与原来完全一致。',
+    type: 'select',
+    defaultValue: 'false',
+    options: [
+      { value: 'true', label: '开启' },
+      { value: 'false', label: '关闭' },
+    ],
+  },
+  {
+    key: 'SUBSCRIPTION_VECTOR_DRY_RUN',
+    label: '向量匹配灰度模式',
+    group: '订阅向量',
+    description:
+      '开启时只把匹配结果写入日志，不真正推送。建议先观察几天命中质量，再关闭灰度正式推送。',
+    type: 'select',
+    defaultValue: 'true',
+    options: [
+      { value: 'true', label: '仅记录不推送' },
+      { value: 'false', label: '正式推送' },
+    ],
+  },
+  {
+    key: 'SUBSCRIPTION_VECTOR_THRESHOLD',
+    label: '相似度阈值',
+    group: '订阅向量',
+    description:
+      '余弦相似度达到该值才算命中，默认 0.6。调高更严格、误推少但可能漏推；调低相反。',
+    type: 'number',
+    defaultValue: '0.6',
+    min: 0.3,
+    max: 0.95,
+  },
+  {
+    key: 'SUBSCRIPTION_VECTOR_MAX_PER_DEAL',
+    label: '单条优惠最多匹配人数',
+    group: '订阅向量',
+    description: '一条优惠最多通过向量匹配推送给多少人，默认 20，避免热门文章刷屏。',
+    type: 'number',
+    defaultValue: '20',
+    min: 1,
+    max: 100,
+  },
+  {
+    key: 'SUBSCRIPTION_VECTOR_STOPWORDS',
+    label: '向量匹配排除词',
+    group: '订阅向量',
+    description:
+      '这些词过于宽泛，不参与向量匹配，用逗号分隔。它们仍会走原来的字符串精确匹配。',
+    type: 'text',
+    defaultValue: '免费,白嫖,羊毛,优惠,红包',
+  },
+  {
+    key: 'EMBEDDING_API_URL',
+    label: 'Embedding 接口地址',
+    group: '订阅向量',
+    description:
+      'OpenAI 兼容的 base 地址，例如 https://api.example.com/v1；未填写时向量匹配自动不可用。',
+    type: 'text',
+    defaultValue: '',
+  },
+  {
+    key: 'EMBEDDING_API_KEY',
+    label: 'Embedding 接口密钥',
+    group: '订阅向量',
+    description: '用于调用 embedding 接口的密钥，仅保存在服务端。',
+    type: 'password',
+    secret: true,
+    defaultValue: '',
+  },
+  {
+    key: 'EMBEDDING_MODEL',
+    label: 'Embedding 模型',
+    group: '订阅向量',
+    description: '默认 Qwen/Qwen3-Embedding-8B。更换模型后旧向量会自动重算。',
+    type: 'text',
+    defaultValue: 'Qwen/Qwen3-Embedding-8B',
+  },
+  {
     key: 'NOTIFY_WECOM_ENABLED',
     label: '启用企业微信渠道',
     group: '通知渠道',
