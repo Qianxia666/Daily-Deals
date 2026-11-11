@@ -100,12 +100,12 @@ export function DealCard({
   const originalContent = (
     <div className="space-y-1.5">
       {titleChanged && (
-        <p className="text-[12px] leading-relaxed text-slate-500">
+        <p className="break-words text-[12px] leading-relaxed text-slate-500">
           原标题：{item.title}
         </p>
       )}
       {item.description && (
-        <p className="whitespace-pre-line text-[12px] leading-relaxed text-slate-500">
+        <p className="whitespace-pre-line break-words text-[12px] leading-relaxed text-slate-500">
           {item.description}
         </p>
       )}
@@ -123,7 +123,7 @@ export function DealCard({
           href={item.link}
           target="_blank"
           rel="noopener noreferrer"
-          className="min-w-0 flex-1 cursor-pointer text-[15px] font-semibold leading-snug tracking-tight text-ink underline-offset-4 hover:underline"
+          className="min-w-0 flex-1 break-words cursor-pointer text-[15px] font-semibold leading-snug tracking-tight text-ink underline-offset-4 hover:underline"
         >
           <Highlighted text={displayTitle} query={highlight} />
         </a>
@@ -184,7 +184,7 @@ export function DealCard({
             <p
               ref={bodyRef}
               className={cn(
-                'mt-1 whitespace-pre-line text-[13px] leading-relaxed text-slate-700',
+                'mt-1 whitespace-pre-line break-words text-[13px] leading-relaxed text-slate-700',
                 !bodyOpen && 'line-clamp-3',
               )}
             >

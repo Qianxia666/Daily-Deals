@@ -95,7 +95,7 @@ export default async function DealPage({
             </span>
           </div>
 
-          <h1 className="mt-3.5 text-3xl font-semibold leading-[1.2] tracking-tight text-ink md:text-[2.9rem]">
+          <h1 className="mt-3.5 break-words text-3xl font-semibold leading-[1.2] tracking-tight text-ink md:text-[2.9rem]">
             {deal.title}
           </h1>
 
@@ -141,7 +141,7 @@ export default async function DealPage({
                 优惠说明
               </p>
               {body ? (
-                <p className="mt-3 whitespace-pre-wrap text-[15px] leading-7 text-slate-700 md:text-base md:leading-8">
+                <p className="mt-3 whitespace-pre-wrap [overflow-wrap:anywhere] text-[15px] leading-7 text-slate-700 md:text-base md:leading-8">
                   {body}
                 </p>
               ) : (
@@ -158,7 +158,7 @@ export default async function DealPage({
                       ›
                     </span>
                   </summary>
-                  <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-500">
+                  <p className="mt-3 whitespace-pre-wrap [overflow-wrap:anywhere] text-sm leading-7 text-slate-500">
                     {description}
                   </p>
                 </details>

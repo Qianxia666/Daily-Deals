@@ -129,7 +129,7 @@ export default async function DigestDatePage({
                               →
                             </span>
                             <span className="min-w-0 flex-1">
-                              <span className="block text-[13.5px] font-medium leading-[1.45] text-ink transition-colors group-hover:text-gold">
+                              <span className="block break-words text-[13.5px] font-medium leading-[1.45] text-ink transition-colors group-hover:text-gold">
                                 {item.title}
                               </span>
                               <span className="mt-1 flex flex-wrap items-center gap-1.5 text-[10.5px] text-slate-400">
