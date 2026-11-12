@@ -118,6 +118,12 @@ export async function deliverPending(): Promise<void> {
       }
 
       try {
+        // 通知栏第一行放优惠本身，关键词与标签收进最后一行元信息。
+        const keyword = truncate(item.keyword, 12);
+        const meta =
+          item.tags.length > 0
+            ? `「${keyword}」${item.tags.slice(0, 2).join(' · ')}`
+            : `「${keyword}」`;
         await sendNotification(
           {
             kind: item.channelKind,
@@ -126,12 +132,10 @@ export async function deliverPending(): Promise<void> {
             key: item.channelKey,
           },
           {
-            title: `订阅命中：${item.keyword}`,
-            lines: [
-              item.dealTitle,
-              item.tags.length > 0 ? `标签：${item.tags.join(' · ')}` : '',
-            ].filter(Boolean),
+            title: truncate(item.dealTitle, 20),
+            lines: [truncate(item.aiSummary, 40), meta].filter(Boolean),
             link: dealUrl(item.dealId, item.dealLink),
+            group: keyword,
           },
         );
         markDeliverySent(item.id);

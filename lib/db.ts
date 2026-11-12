@@ -2939,6 +2939,7 @@ export interface PendingDelivery {
   channelKey: string;
   dealTitle: string;
   dealLink: string;
+  aiSummary: string;
   keyword: string;
   tags: string[];
   createdAt: string;
@@ -3301,7 +3302,7 @@ export function listPendingDeliveries(
               d.attempts, d.created_at, c.kind, c.name AS channel_name,
               c.webhook, c.secret, c.channel_key, s.keyword,
               COALESCE(NULLIF(TRIM(deals.ai_title), ''), deals.title) AS deal_title,
-              deals.link AS deal_link, deals.tags
+              deals.link AS deal_link, deals.tags, deals.ai_summary
        FROM deliveries d
        JOIN subscriptions s ON s.id = d.subscription_id AND s.enabled = 1
        JOIN channels c ON c.id = d.channel_id AND c.enabled = 1
@@ -3330,6 +3331,7 @@ export function listPendingDeliveries(
     deal_title: string;
     deal_link: string;
     tags: string | null;
+    ai_summary: string | null;
   }[];
 
   return rows.map((row) => ({
@@ -3346,6 +3348,7 @@ export function listPendingDeliveries(
     channelKey: row.channel_key,
     dealTitle: row.deal_title,
     dealLink: row.deal_link,
+    aiSummary: (row.ai_summary ?? '').trim(),
     keyword: row.keyword,
     tags: parseStoredTags(row.tags),
     createdAt: row.created_at,

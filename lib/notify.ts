@@ -20,6 +20,8 @@ export interface NotifyMessage {
   lines: string[];
   link?: string;
   items?: NotifyItem[];
+  /** Bark 通知分组名，缺省为「每日优惠」。 */
+  group?: string;
 }
 
 export const CHANNEL_LABELS: Record<ChannelKind, string> = {
@@ -247,12 +249,15 @@ export async function sendNotification(
   message: NotifyMessage,
 ): Promise<void> {
   if (target.kind === 'bark') {
+    const items = message.items ?? [];
     const body = [
       ...message.lines,
-      ...(message.items ?? []).map(
+      ...items.map(
         (item, index) => `${index + 1}. ${item.title}\n${item.url}`,
       ),
-      message.link ? `查看全部：${message.link}` : '',
+      message.link
+        ? `${items.length > 0 ? '查看全部' : '查看详情'}：${message.link}`
+        : '',
     ]
       .filter(Boolean)
       .join('\n');
@@ -265,7 +270,7 @@ export async function sendNotification(
           title: message.title,
           body,
           url: message.link ?? message.items?.[0]?.url ?? '',
-          group: '每日优惠',
+          group: message.group?.trim() || '每日优惠',
         }),
       },
       TIMEOUT_MS,
@@ -357,7 +362,7 @@ export async function sendNotification(
   const items = message.items ?? [];
   const link = message.link ?? items[0]?.url ?? '';
   const markdown = [
-    `### ${message.title}`,
+    message.lines.length === 0 && items.length === 0 ? message.title : '',
     ...message.lines,
     ...itemLines(message),
     link ? `[${actionLabel(items)}](${markdownUrl(link)})` : '',
