@@ -10,6 +10,10 @@ import {
 import { request } from './http';
 import { matchSubscriptionsForDeal } from './delivery';
 import {
+  getAiKeywordExpandTimeoutMs,
+  getAiSearchRerankTimeoutMs,
+  getAiSummaryTimeoutMs,
+  getAiTagTimeoutMs,
   getAiTagsBrandExtractEnabled,
   getAiTagsEnabled,
   getAiTagsProposeEnabled,
@@ -85,6 +89,9 @@ interface AiConfig {
   maxAttempts: number;
   concurrency: number;
   timeoutMs: number;
+  tagTimeoutMs: number;
+  searchTimeoutMs: number;
+  expandTimeoutMs: number;
 }
 
 interface AiResult {
@@ -122,12 +129,7 @@ function readConfig(): AiConfig | null {
     10,
   );
   const concurrency = getRuntimeEnvNumber('LLM_CONCURRENCY', 3, 1, 6);
-  const timeoutMs = getRuntimeEnvNumber(
-    'LLM_TIMEOUT_MS',
-    120_000,
-    10_000,
-    300_000,
-  );
+  const timeoutMs = getAiSummaryTimeoutMs();
 
   return {
     apiKey,
@@ -140,6 +142,9 @@ function readConfig(): AiConfig | null {
     maxAttempts,
     concurrency,
     timeoutMs,
+    tagTimeoutMs: getAiTagTimeoutMs(),
+    searchTimeoutMs: getAiSearchRerankTimeoutMs(),
+    expandTimeoutMs: getAiKeywordExpandTimeoutMs(),
   };
 }
 
@@ -658,7 +663,7 @@ async function callTagModelBatch(
           },
           body: JSON.stringify(payload),
         },
-        config.timeoutMs,
+        config.tagTimeoutMs,
       );
 
       const body = await response.text();
@@ -925,7 +930,7 @@ async function callSearchModel(
           },
           body: JSON.stringify(payload),
         },
-        config.timeoutMs,
+        config.searchTimeoutMs,
       );
 
       const body = await response.text();
@@ -1013,7 +1018,7 @@ export async function expandKeywordsWithAi(
           },
           body: JSON.stringify(payload),
         },
-        config.timeoutMs,
+        config.expandTimeoutMs,
       );
 
       const body = await response.text();

@@ -27,6 +27,7 @@ import {
   getAiSearchRewriteTimeoutMs,
   getAiSearchScope,
   getAiSearchSynonymEnabled,
+  getAiSearchTagSuggestTimeoutMs,
   getAiSearchUseSummary,
   getAiSearchDailyLimit,
   getKeywordSearchDays,
@@ -293,7 +294,7 @@ async function buildSemanticSuggestions(
       keywords,
       counts.map((row) => row.tag),
       limit,
-      getAiSearchRewriteTimeoutMs(),
+      getAiSearchTagSuggestTimeoutMs(),
     );
 
     if (picked === null) {

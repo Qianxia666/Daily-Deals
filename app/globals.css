@@ -176,6 +176,10 @@
     background-color: rgb(12 22 38 / 0.85);
   }
 
+  [class~='bg-slate-50/50'] {
+    background-color: rgb(12 22 38 / 0.55);
+  }
+
   [class~='bg-slate-50/60'] {
     background-color: rgb(12 22 38 / 0.7);
   }

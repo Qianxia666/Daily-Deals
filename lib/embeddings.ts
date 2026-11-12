@@ -1,4 +1,5 @@
 import {
+  getEmbeddingTimeoutMs,
   getRuntimeBool,
   getRuntimeEnv,
   getRuntimeEnvFloat,
@@ -7,7 +8,6 @@ import {
 
 /** 单次请求的文本条数，8B 模型下 16 条大约 8~10 秒。 */
 const BATCH_SIZE = 16;
-const REQUEST_TIMEOUT_MS = 90_000;
 const MAX_RETRIES = 2;
 
 /** 关键词侧使用的指令前缀，能明显拉开相关与不相关文本的分数。 */
@@ -23,6 +23,7 @@ export interface EmbeddingConfig {
   threshold: number;
   maxPerDeal: number;
   stopwords: string[];
+  timeoutMs: number;
 }
 
 export function getEmbeddingConfig(): EmbeddingConfig {
@@ -48,6 +49,7 @@ export function getEmbeddingConfig(): EmbeddingConfig {
     ),
     maxPerDeal: getRuntimeEnvNumber('SUBSCRIPTION_VECTOR_MAX_PER_DEAL', 20, 1, 100),
     stopwords,
+    timeoutMs: getEmbeddingTimeoutMs(),
   };
 }
 
@@ -91,7 +93,7 @@ async function requestBatch(
       Authorization: `Bearer ${config.key}`,
     },
     body: JSON.stringify({ model: config.model, input: texts }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(config.timeoutMs),
   });
 
   if (!response.ok) {

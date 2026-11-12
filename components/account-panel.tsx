@@ -4,6 +4,7 @@ import {
   BellRing,
   Bot,
   Check,
+  Link2,
   LoaderCircle,
   LogOut,
   Plus,
@@ -202,6 +203,7 @@ function SubscriptionsSection({
   run: (action: () => Promise<unknown>) => Promise<void>;
 }) {
   const [keyword, setKeyword] = useState('');
+  const [expandedId, setExpandedId] = useState<number | null>(null);
 
   const add = () => {
     const value = keyword.trim();
@@ -250,54 +252,85 @@ function SubscriptionsSection({
       ) : (
         <ul className="mt-3 divide-y divide-line/70">
           {data.subscriptions.map((item) => (
-            <li key={item.id} className="flex items-center justify-between gap-3 py-2.5">
-              <div className="min-w-0">
-                <p
-                  className={cn(
-                    'truncate text-sm',
-                    item.enabled ? 'text-ink' : 'text-slate-400 line-through',
+            <li key={item.id} className="py-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p
+                    className={cn(
+                      'truncate text-sm',
+                      item.enabled ? 'text-ink' : 'text-slate-400 line-through',
+                    )}
+                  >
+                    {item.keyword}
+                  </p>
+                  <p className="mt-0.5 text-[10px] text-slate-400">
+                    添加于 {formatTime(item.createdAt)}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <ToggleButton
+                    active={item.enabled}
+                    disabled={busy}
+                    onClick={() =>
+                      void run(() =>
+                        api('/api/account/subscriptions', {
+                          id: item.id,
+                          enabled: !item.enabled,
+                        }, 'PATCH'),
+                      )
+                    }
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setExpandedId(expandedId === item.id ? null : item.id)
+                    }
+                    title="查看关联词"
+                    aria-label={`查看「${item.keyword}」的关联词`}
+                    aria-expanded={expandedId === item.id}
+                    className={cn(
+                      'inline-flex h-7 w-7 cursor-pointer items-center justify-center rounded-lg border transition-colors',
+                      expandedId === item.id
+                        ? 'border-gold/60 bg-gold/10 text-gold'
+                        : 'border-line bg-white text-slate-400 hover:border-slate-300 hover:text-ink',
+                    )}
+                  >
+                    <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                  <IconButton
+                    label="删除"
+                    disabled={busy}
+                    onClick={() => {
+                      if (!window.confirm(`删除订阅「${item.keyword}」？`)) return;
+                      void run(() =>
+                        api('/api/account/subscriptions', { id: item.id }, 'DELETE'),
+                      );
+                    }}
+                  />
+                </div>
+              </div>
+              {expandedId === item.id && (
+                <div className="mt-2 rounded-lg border border-line bg-slate-50/80 px-2.5 py-2 text-[10px] leading-relaxed text-slate-500">
+                  {item.expansions.length > 0 ? (
+                    <>
+                      <span className="mr-1 text-slate-400">关联词</span>
+                      {item.expansions.map((word) => (
+                        <span
+                          key={word}
+                          className="mr-1 inline-block rounded border border-line bg-white px-1.5 py-0.5 text-slate-600"
+                        >
+                          {word}
+                        </span>
+                      ))}
+                      {item.expansionSource === 'ai' && (
+                        <span className="ml-1 text-gold">AI 拓展</span>
+                      )}
+                    </>
+                  ) : (
+                    'AI 未为这个词生成关联词，当前仅匹配关键词本身。'
                   )}
-                >
-                  {item.keyword}
-                </p>
-                <p className="mt-0.5 text-[10px] text-slate-400">
-                  添加于 {formatTime(item.createdAt)}
-                </p>
-                {item.expansions.length > 0 ? (
-                  <p className="mt-0.5 truncate text-[10px] text-slate-400">
-                    关联词 {item.expansions.join(' · ')}
-                    {item.expansionSource === 'ai' ? ' · AI' : ''}
-                  </p>
-                ) : (
-                  <p className="mt-0.5 text-[10px] text-slate-300">
-                    仅匹配关键词本身
-                  </p>
-                )}
-              </div>
-              <div className="flex shrink-0 items-center gap-1.5">
-                <ToggleButton
-                  active={item.enabled}
-                  disabled={busy}
-                  onClick={() =>
-                    void run(() =>
-                      api('/api/account/subscriptions', {
-                        id: item.id,
-                        enabled: !item.enabled,
-                      }, 'PATCH'),
-                    )
-                  }
-                />
-                <IconButton
-                  label="删除"
-                  disabled={busy}
-                  onClick={() => {
-                    if (!window.confirm(`删除订阅「${item.keyword}」？`)) return;
-                    void run(() =>
-                      api('/api/account/subscriptions', { id: item.id }, 'DELETE'),
-                    );
-                  }}
-                />
-              </div>
+                </div>
+              )}
             </li>
           ))}
         </ul>

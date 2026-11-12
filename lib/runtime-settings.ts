@@ -545,12 +545,76 @@ const FIELDS: RuntimeFieldDef[] = [
   },
   {
     key: 'LLM_TIMEOUT_MS',
-    label: 'AI 单次请求超时（毫秒）',
-    group: 'AI 改写与搜索',
-    description: '单次批量请求的超时时间，默认 120000（2 分钟）。',
+    label: 'AI 通用超时（毫秒）',
+    group: 'AI 调用超时',
+    description:
+      '兜底超时：下面各用途未单独填写时沿用此值，默认 120000（2 分钟）。',
     type: 'number',
     defaultValue: '120000',
     min: 10000,
+    max: 300000,
+  },
+  {
+    key: 'AI_SUMMARY_TIMEOUT_MS',
+    label: '批量富化超时（毫秒）',
+    group: 'AI 调用超时',
+    description:
+      '生成摘要、标题、标签、实体的单次批量请求超时，默认 120000。',
+    type: 'number',
+    defaultValue: '120000',
+    min: 10000,
+    max: 300000,
+  },
+  {
+    key: 'AI_TAG_TIMEOUT_MS',
+    label: '存量补标超时（毫秒）',
+    group: 'AI 调用超时',
+    description: '后台手动补标任务的单次批量请求超时，默认 120000。',
+    type: 'number',
+    defaultValue: '120000',
+    min: 10000,
+    max: 300000,
+  },
+  {
+    key: 'AI_SEARCH_RERANK_TIMEOUT_MS',
+    label: 'AI 搜索精排超时（毫秒）',
+    group: 'AI 调用超时',
+    description:
+      '用户搜索时把候选交给模型精排的超时，默认 20000。设置过长会明显拖慢搜索。',
+    type: 'number',
+    defaultValue: '20000',
+    min: 3000,
+    max: 120000,
+  },
+  {
+    key: 'AI_SEARCH_TAG_SUGGEST_TIMEOUT_MS',
+    label: '标签建议超时（毫秒）',
+    group: 'AI 调用超时',
+    description: '两次召回都为空时让模型推荐标签的超时，默认 8000。',
+    type: 'number',
+    defaultValue: '8000',
+    min: 2000,
+    max: 30000,
+  },
+  {
+    key: 'AI_KEYWORD_EXPAND_TIMEOUT_MS',
+    label: '关键词拓展超时（毫秒）',
+    group: 'AI 调用超时',
+    description:
+      '为订阅词生成品牌与别名的单次批量请求超时，默认 60000。',
+    type: 'number',
+    defaultValue: '60000',
+    min: 5000,
+    max: 300000,
+  },
+  {
+    key: 'EMBEDDING_TIMEOUT_MS',
+    label: '向量嵌入超时（毫秒）',
+    group: 'AI 调用超时',
+    description: '生成关键词或优惠向量的单次请求超时，默认 90000。',
+    type: 'number',
+    defaultValue: '90000',
+    min: 5000,
     max: 300000,
   },
   {
@@ -1242,6 +1306,51 @@ export function getRuntimeEnvNumber(
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) return fallback;
   return clamp(Math.round(value), min, max);
+}
+
+/**
+ * 读取某个 AI 用途的超时；该用途未单独填写时回退到 LLM_TIMEOUT_MS。
+ */
+function getAiTimeoutMs(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (getRuntimeEnv(key).trim() === '') {
+    return getRuntimeEnvNumber('LLM_TIMEOUT_MS', fallback, min, max);
+  }
+  return getRuntimeEnvNumber(key, fallback, min, max);
+}
+
+/** 批量富化（摘要/标题/标签/实体）超时。 */
+export function getAiSummaryTimeoutMs(): number {
+  return getAiTimeoutMs('AI_SUMMARY_TIMEOUT_MS', 120_000, 10_000, 300_000);
+}
+
+/** 存量补标任务超时。 */
+export function getAiTagTimeoutMs(): number {
+  return getAiTimeoutMs('AI_TAG_TIMEOUT_MS', 120_000, 10_000, 300_000);
+}
+
+/** AI 搜索精排超时。 */
+export function getAiSearchRerankTimeoutMs(): number {
+  return getAiTimeoutMs('AI_SEARCH_RERANK_TIMEOUT_MS', 20_000, 3_000, 120_000);
+}
+
+/** 零结果时的标签建议超时。 */
+export function getAiSearchTagSuggestTimeoutMs(): number {
+  return getAiTimeoutMs('AI_SEARCH_TAG_SUGGEST_TIMEOUT_MS', 8_000, 2_000, 30_000);
+}
+
+/** 订阅词 AI 拓展超时。 */
+export function getAiKeywordExpandTimeoutMs(): number {
+  return getAiTimeoutMs('AI_KEYWORD_EXPAND_TIMEOUT_MS', 60_000, 5_000, 300_000);
+}
+
+/** 向量嵌入超时。 */
+export function getEmbeddingTimeoutMs(): number {
+  return getAiTimeoutMs('EMBEDDING_TIMEOUT_MS', 90_000, 5_000, 300_000);
 }
 
 /** 读取小数配置（如 0~1 的相似度阈值），不做取整。 */

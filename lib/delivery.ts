@@ -122,8 +122,8 @@ export async function deliverPending(): Promise<void> {
         const keyword = truncate(item.keyword, 12);
         const meta =
           item.tags.length > 0
-            ? `「${keyword}」${item.tags.slice(0, 2).join(' · ')}`
-            : `「${keyword}」`;
+            ? `关键词「${keyword}」· 标签 ${item.tags.slice(0, 2).join(' / ')}`
+            : `关键词「${keyword}」`;
         await sendNotification(
           {
             kind: item.channelKind,
