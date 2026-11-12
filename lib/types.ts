@@ -172,6 +172,10 @@ export interface UserSubscription {
   keyword: string;
   enabled: boolean;
   createdAt: string;
+  /** 命中时额外参与匹配的关联词，不含关键词本身。 */
+  expansions: string[];
+  /** 关联词来源：内置词表、AI 拓展或暂无。 */
+  expansionSource: 'builtin' | 'ai' | 'none';
 }
 
 /** 用户自己的推送机器人配置。secret/key 不会回传给前端。 */

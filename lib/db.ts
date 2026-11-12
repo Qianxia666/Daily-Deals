@@ -2673,13 +2673,47 @@ export function listSubscriptions(userId: number): UserSubscription[] {
        WHERE user_id = ? ORDER BY id DESC`,
     )
     .all(userId) as SubscriptionRow[];
+  if (rows.length === 0) return [];
 
-  return rows.map((row) => ({
-    id: row.id,
-    keyword: row.keyword,
-    enabled: row.enabled === 1,
-    createdAt: row.created_at,
-  }));
+  // 展示用关联词：内置词表与 AI 拓展合并去重，原词本身不重复列出。
+  const aiRows = getDb()
+    .prepare(
+      `SELECT keyword, expansions FROM keyword_expansions
+       WHERE status = 'ready'
+         AND keyword IN (${rows.map(() => '?').join(', ')})`,
+    )
+    .all(...rows.map((row) => row.keyword)) as {
+    keyword: string;
+    expansions: string;
+  }[];
+  const aiMap = new Map(
+    aiRows.map((row) => [
+      row.keyword.toLowerCase(),
+      parseStoredTags(row.expansions),
+    ]),
+  );
+
+  return rows.map((row) => {
+    const forms = expandKeyword(row.keyword);
+    const self = forms[0] ?? row.keyword.toLowerCase();
+    const ai = aiMap.get(row.keyword.toLowerCase()) ?? [];
+    const merged: string[] = [];
+    const seen = new Set<string>([self]);
+    for (const word of [...ai, ...forms.slice(1)]) {
+      const key = word.toLowerCase();
+      if (!word.trim() || seen.has(key)) continue;
+      seen.add(key);
+      merged.push(word);
+    }
+    return {
+      id: row.id,
+      keyword: row.keyword,
+      enabled: row.enabled === 1,
+      createdAt: row.created_at,
+      expansions: merged.slice(0, 12),
+      expansionSource: merged.length === 0 ? 'none' : ai.length > 0 ? 'ai' : 'builtin',
+    };
+  });
 }
 
 export function countSubscriptions(userId: number): number {
@@ -2709,6 +2743,8 @@ export function addSubscription(
       keyword: keyword.trim(),
       enabled: true,
       createdAt: now,
+      expansions: [],
+      expansionSource: 'none',
     };
   } catch {
     return null;

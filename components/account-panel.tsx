@@ -263,6 +263,16 @@ function SubscriptionsSection({
                 <p className="mt-0.5 text-[10px] text-slate-400">
                   添加于 {formatTime(item.createdAt)}
                 </p>
+                {item.expansions.length > 0 ? (
+                  <p className="mt-0.5 truncate text-[10px] text-slate-400">
+                    关联词 {item.expansions.join(' · ')}
+                    {item.expansionSource === 'ai' ? ' · AI' : ''}
+                  </p>
+                ) : (
+                  <p className="mt-0.5 text-[10px] text-slate-300">
+                    仅匹配关键词本身
+                  </p>
+                )}
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
                 <ToggleButton
