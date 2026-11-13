@@ -361,3 +361,9 @@ docker-compose.yml   单容器编排
 ## 参与贡献
 
 欢迎提交 Issue 或 Pull Request。新增来源时请确保该来源允许抓取，并遵守其 robots 与使用条款。
+
+## 许可证
+
+本项目以 [GNU Affero General Public License v3.0](./LICENSE)（AGPL-3.0）发布。
+
+你可以自由使用、修改和分发；但如果修改后的程序以网络服务的形式对外提供，必须同样以 AGPL-3.0 开放对应的源代码。如需闭源商用授权，需另行联系作者。
