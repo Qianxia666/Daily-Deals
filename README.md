@@ -1,6 +1,6 @@
 # Daily Deals · 每日优惠情报
 
-自托管的免费 / 限免 / 低价优惠聚合站。服务端定时抓取公开 RSS 与官方接口，前端以移动端优先的卡片流展示，支持 AI 标题与摘要、AI 搜索、标签直达、来源筛选与收藏。
+自托管的免费 / 限免 / 低价优惠聚合站。服务端定时抓取公开 RSS 与官方接口，前端以移动端优先的卡片流展示，支持 AI 标题与摘要、AI 搜索、标签直达、关键词订阅推送、来源筛选与收藏。单个容器即可运行，数据落在本地 SQLite，不依赖任何外部数据库。
 
 只展示真实抓取到的数据：不生成示例优惠，不用假数据填充。某个来源抓取失败时会在后台标记异常并自动重试，不会影响其他来源。
 
@@ -8,6 +8,7 @@
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 | 桌面端 | 移动端 |
 | --- | --- |
@@ -19,13 +20,19 @@
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [AI 能力](#ai-能力)
+- [用户与订阅推送](#用户与订阅推送)
+- [SEO 与公开输出](#seo-与公开输出)
 - [管理后台](#管理后台)
 - [数据来源](#数据来源)
 - [数据、备份与安全](#数据备份与安全)
 - [API](#api)
 - [本地开发](#本地开发)
+- [升级与维护](#升级与维护)
 - [目录结构](#目录结构)
+- [常见问题](#常见问题)
+- [参与贡献](#参与贡献)
 - [免责声明](#免责声明)
+- [许可证](#许可证)
 
 ## 功能
 
@@ -36,7 +43,10 @@
 - **响应式卡片流**：移动端单列、桌面端双列、超宽屏三列，滚动触底自动加载下一批。
 - **标签直达**：卡片上的品类标签可点击，点击后按标签筛选站内优惠；地址栏同步 `?tag=`，支持刷新、分享与前进后退。
 - **本地状态**：收藏与筛选条件只保存在当前浏览器，不上传服务端，不影响其他用户。
-- **运维能力**：全屏加载动画、ETag 304、搜索与登录限流、SQLite 自动备份、来源失败飞书告警。
+- **运维能力**：全屏加载动画、ETag 304、搜索与登录限流、SQLite 自动备份、来源失败多渠道告警。
+- **账号与订阅**：可开关注册、邀请码、每日 AI 搜索配额；登录后可创建关键词订阅，按可信度打分匹配后推送到自己的飞书 / 企业微信 / 钉钉 / Bark 机器人。
+- **推送节流与汇总**：每用户每日推送条数上限，超出部分合并为一条摘要；另有全站每日汇总，不占个人额度。
+- **SEO 输出**：服务端渲染的标签落地页、动态 `sitemap.xml`、RSS（`/feed.xml` 与 `/rss.xml`）、每页自指 canonical 与过期页 `noindex`。
 
 ## 快速开始
 
@@ -136,6 +146,15 @@ docker compose logs -f app
 | `SITE_TITLE` | `每日优惠情报` | 首页主标题 |
 | `SITE_TAGLINE` | `AI 精简 · 定时自动聚合 · 只收录真实来源` | 首页副标题 |
 | `OUTBOUND_PROXY` | 空 | 出站代理，例如 `http://127.0.0.1:7890` |
+| `SITE_URL` | 空 | 站点公开地址，用于推送详情页链接、canonical、sitemap 与 RSS；建议填正式域名 |
+| `REGISTRATION_OPEN` | `true` | 是否开放注册 |
+| `REGISTRATION_INVITE_REQUIRED` | `false` | 注册是否必须填写邀请码 |
+| `AI_SEARCH_DAILY_LIMIT` | `50` | 每个登录用户每天的 AI 搜索次数，`0` 不限制 |
+| `ACCOUNT_MAX_SUBSCRIPTIONS` | `20` | 每个用户最多创建多少个关键词订阅 |
+| `ACCOUNT_DAILY_PUSH_LIMIT` | `20` | 每个用户每天最多收到多少条订阅推送 |
+| `DIGEST_SITE_ENABLED` | `true` | 是否发送全站每日优惠汇总 |
+| `SUBSCRIPTION_MATCH_MIN_SCORE` | `2` | 订阅命中阈值（实体 4 分、标签 3 分、标题 2 分、摘要 1 分） |
+| `SUBSCRIPTION_VECTOR_ENABLED` | `false` | 是否启用向量语义匹配（需配置 Embedding 接口） |
 
 <details>
 <summary>展开全部环境变量</summary>
@@ -229,6 +248,68 @@ docker compose logs -f app
 - 新抓取的优惠自动打标，不额外增加 AI 请求；存量数据可在后台「品类标签」区域一键补全，并显示进度。
 - 关闭 `AI_TAGS_ENABLED` 后不再生成标签，搜索退回纯字面匹配。
 
+## 用户与订阅推送
+
+前台 `/login` 注册登录，`/account` 管理订阅与推送渠道；后台可关闭注册、要求邀请码、调整配额。
+
+### 账号与准入
+
+- 注册开关 `REGISTRATION_OPEN`，邀请码开关 `REGISTRATION_INVITE_REQUIRED`（邀请码在后台生成，可设置有效期与使用次数）。
+- 登录态使用 HttpOnly Cookie 会话，与后台管理会话相互独立。
+- 每个登录用户每天的 AI 搜索次数受 `AI_SEARCH_DAILY_LIMIT` 限制，普通搜索不受限。
+- 未登录也可以浏览、筛选、普通搜索与使用标签直达。
+
+### 关键词订阅
+
+每条订阅就是一个关键词或短语，可单独启用/暂停；每个用户最多 `ACCOUNT_MAX_SUBSCRIPTIONS` 条。
+
+命中判定按可信度打分，达到 `SUBSCRIPTION_MATCH_MIN_SCORE`（默认 2）才推送：
+
+| 命中来源 | 分值 |
+| --- | --- |
+| AI 抽取的品牌/产品实体 | 4 |
+| 正式品类标签 | 3 |
+| AI 标题 / 原始标题 | 2 |
+| AI 摘要 / 正文 | 1 |
+
+- 可选**关键词扩展**：按词表与 AI 拓展把品牌词和品类词关联（如「喜茶」也能被「奶茶」类优惠命中）。
+- 可选**向量匹配**：字符串完全没命中时，用 Embedding 接口做语义补足，补「喜茶 ↔ 奶茶」这类漏推。默认关闭，建议先开灰度（只记录不推送）观察几天。
+- 同一订阅 + 同一渠道不会重复推送同一条优惠（按 `subscription_id + channel_id + deal_id` 唯一约束去重）。
+
+### 推送渠道
+
+每个用户在 `/account` 绑定自己的机器人，与系统告警用的渠道完全分开：
+
+| 渠道 | 绑定方式 |
+| --- | --- |
+| 飞书 | 群机器人 Webhook（可选签名密钥） |
+| 企业微信 | 群机器人 Webhook |
+| 钉钉 | 群机器人 Webhook（可选加签密钥） |
+| Bark | iOS 推送 Key |
+
+- `NOTIFY_ALLOW_ANY_HOST=false` 时只允许官方域名，避免把服务端当成 SSRF 跳板。
+- 绑定信息只存在本地数据库，仅本人可查看与删除；后台管理员可为用户解绑。
+
+### 节流与每日汇总
+
+- 每用户每天最多 `ACCOUNT_DAILY_PUSH_LIMIT` 条推送；超出后不再逐条发送，而是在 `DIGEST_OVERFLOW_TIME` 合并成一条摘要（`DIGEST_OVERFLOW_ENABLED`）。
+- 全站每日汇总由 `DIGEST_SITE_ENABLED` / `DIGEST_SITE_TIME` / `DIGEST_SITE_MAX_ITEMS` 控制，不占个人额度；历史汇总页为 `/digest/{YYYY-MM-DD}`。
+
+## SEO 与公开输出
+
+| 输出 | 路径 | 说明 |
+| --- | --- | --- |
+| 站点地图 | `/sitemap.xml` | 首页 + 搜索页 + 热门标签页 + 全部在架详情页；`lastmod` 取条目收录时间，15 分钟缓存 |
+| RSS | `/feed.xml`、`/rss.xml` | 最新 50 条在架优惠，请求时实时读库，10 分钟缓存 |
+| 标签落地页 | `/tag/{标签}` | 服务端渲染，每页 60 条并带分页，含相关标签入口 |
+| 详情页 | `/deal/{id}` | 自指 canonical；过期后返回 `noindex, follow`，避免收录死链 |
+| 日期汇总 | `/digest/{YYYY-MM-DD}` | 按天归档，服务端渲染 |
+| robots | `/robots.txt` | 声明 sitemap 与 Host |
+
+- canonical、`og:url`、sitemap、RSS 中的域名统一取 `SITE_URL`（后台「站点公开地址」）；未配置时回退请求头，反代或 IP 直连也能输出正确链接。
+- 首页页脚输出热门标签链接，形成「首页 → 标签页 → 详情页」的抓取层级，爬虫不必只依赖 sitemap。
+- 想加快收录：绑定正式域名并启用 HTTPS，在 Search Console 提交 `sitemap.xml`，再对重点页面手动请求编入索引。
+
 ## 管理后台
 
 访问 `/admin` 登录后可：
@@ -240,8 +321,10 @@ docker compose logs -f app
 - 编辑首页公告，并单独保存
 - 查看搜索索引状态、索引条数与最近重建时间，并可手动重建
 - 查看品类标签覆盖率、补全进度，并一键补全历史数据
-- 审核标签候选：转正、合并或屏蔽 AI 提出的新品类词
-- 修改站点文案与全部运行时变量，保存后立即生效
+- 审核标签候选：转正、合并或屏蔽 AI 提出的新标签，支持全选本页、跨页批量处理
+- 生成与撤销邀请码，查看每个用户的订阅、推送渠道与当日配额，可强制解绑渠道
+- 测试通知渠道是否可用（发送一条测试消息）
+- 修改站点文案、站点公开地址与全部运行时变量，保存后立即生效
 
 内置来源不能删除，只能隐藏或修改地址；删除自定义来源会同时删除其已入库条目。
 
@@ -299,11 +382,21 @@ docker compose up -d
 | GET | `/api/deals` | 在架条目、来源状态与统计；支持游标分页、筛选、`ids` 批量读取、`metaOnly` 与 ETag |
 | POST | `/api/fetch` | 管理员手动触发抓取 |
 | POST | `/api/search` | 搜索，Body：`{"query":"...","mode":"ai"\|"keyword","tag":"可选，精确标签筛选"}` |
+| POST | `/api/auth/register` | 注册（受注册开关与邀请码约束） |
+| POST | `/api/auth/login` / `/api/auth/logout` | 用户登录 / 退出 |
+| GET | `/api/auth/me` | 当前登录用户与配额用量 |
+| GET/POST | `/api/account/subscriptions` | 读取 / 新增或修改关键词订阅 |
+| GET/POST | `/api/account/channels` | 读取 / 绑定或删除自己的推送渠道 |
+| POST | `/api/admin/login` / `/api/admin/logout` | 后台登录 / 退出 |
+| GET/POST | `/api/admin/users` | 用户列表 / 调整用户状态与配额 |
+| GET/POST | `/api/admin/invites` | 邀请码列表 / 生成邀请码 |
+| POST | `/api/admin/notify/test` | 发送测试消息验证渠道 |
 | POST | `/api/admin/sources` | 新增 / 删除来源 |
 | POST | `/api/admin/settings` | 保存公告、来源配置与运行时变量 |
 | GET/POST | `/api/admin/search-index` | 查询搜索索引状态 / 后台重建索引 |
-| GET/POST | `/api/admin/tags` | 查询品类标签覆盖率与进度 / 补全历史标签 |
+| GET/POST | `/api/admin/tags` | 查询标签覆盖率与进度 / 补全历史标签 |
 | GET/POST | `/api/admin/tag-candidates` | 查询标签候选池 / 转正、合并或屏蔽候选 |
+| GET | `/sitemap.xml`、`/feed.xml`、`/rss.xml` | 站点地图与订阅输出（见上文 SEO 一节） |
 
 ## 本地开发
 
@@ -322,17 +415,41 @@ npm run build
 npm start
 ```
 
+## 升级与维护
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+- 数据库 schema 变更会在启动时自动迁移，数据卷 `./data` 不需要手动处理。
+- 升级前建议先停容器并备份 `data` 目录（见上一节）。
+- 修改 `.env` 后需要 `docker compose up -d` 重建容器；后台「运行时配置」保存后立即生效。
+- 想清空重来：`docker compose down && rm -rf data`，下次启动会重新建库并抓取。
+
 ## 目录结构
 
 ```text
 app/                 Next.js App Router 页面与 API
-components/          卡片流、筛选、加载动画与 UI 组件
-lib/fetchers/        各来源抓取与解析
-lib/db.ts            SQLite schema、去重与查询
+  api/               接口层（前台 / 账号 / 后台）
+  deal/[id]/         优惠详情页（服务端渲染 + 自指 canonical）
+  tag/[tag]/         标签落地页（服务端渲染 + 分页）
+  digest/[date]/     每日汇总归档页
+  sitemap.ts         sitemap 生成
+  feed.xml / rss.xml RSS 输出
+components/          卡片流、搜索、后台面板、账号与通知设置等 UI
+lib/fetchers/        各来源抓取与解析（RSS / JSON / HTML）
+lib/db.ts            SQLite schema、迁移、去重与查询
 lib/search-text.ts   中文二元分词、同义词与 FTS 查询构造
 lib/search-index.ts  FTS5 索引维护、召回与状态
-lib/llm.ts           AI 摘要、品类标签与搜索
-lib/scheduler.ts     定时抓取调度
+lib/llm.ts           AI 标题/摘要、标签与实体抽取、搜索精排
+lib/keyword-expand.ts 订阅词与标签的关联拓展
+lib/vector-match.ts  订阅向量匹配（可选）
+lib/delivery.ts      订阅命中判定与推送投递
+lib/notify.ts        飞书 / 企业微信 / 钉钉 / Bark 渠道
+lib/digest.ts        每日汇总与超限合并
+lib/scheduler.ts     抓取调度、摘要富化与推送任务
+lib/admin.ts         后台登录态与权限
 data/                数据库与备份（不提交）
 docker-compose.yml   单容器编排
 ```
@@ -354,13 +471,45 @@ docker-compose.yml   单容器编排
 **数据是真实的吗？**
 是。所有条目都来自公开 RSS 或官方接口，只保留标题、摘要和原文链接，不生成示例数据。
 
+**订阅推送没收到消息怎么办？**
+按顺序排查：`/account` 里渠道是否处于启用状态；后台「通知渠道」点测试是否成功；该关键词是否有命中（阈值 `SUBSCRIPTION_MATCH_MIN_SCORE` 调高会更严格）；是否已超出当日推送上限（超出会合并到汇总时间里发）。
+
+**部署在反代后面，链接变成 127.0.0.1 或 IP 怎么办？**
+在后台「站点公开地址」填写正式域名（如 `https://example.com`），canonical、sitemap、RSS 与推送链接都会改用它。
+
+**数据库能撑多少条？**
+SQLite 单机跑十万级条目没有压力；当前默认保留 30 天（`DATA_RETENTION_DAYS`），配合 FTS5 索引，搜索与列表都在百毫秒级。
+
+**AI 调用很贵吗？**
+默认每轮最多富化 80 条（`LLM_MAX_ITEMS_PER_RUN`），每批 20 条合并请求；标签与实体复用同一次调用，不额外计费。不配置 `LLM_*` 时完全不调用模型。
+
+**可以只跑抓取、不要账号和推送吗？**
+可以。把 `REGISTRATION_OPEN=false` 关掉注册即可，首页浏览、搜索与标签页完全不依赖账号体系。
+
 ## 免责声明
 
 本项目仅用于聚合公开信息，所有优惠内容的版权归原站点所有。请遵守各来源站点的使用条款；本项目不保证信息的时效性与准确性，交易前请以原文为准。
 
 ## 参与贡献
 
-欢迎提交 Issue 或 Pull Request。新增来源时请确保该来源允许抓取，并遵守其 robots 与使用条款。
+欢迎提交 Issue 或 Pull Request。提交前请确认：
+
+1. `npm run build` 能通过，不引入新的 TypeScript 报错；
+2. PR 描述里说明动机与行为变化，UI 改动附截图；
+3. 不要提交 `.env`、`data/`、日志或任何密钥、真实 Webhook 地址。
+
+### 新增一个来源
+
+1. 在 `lib/fetchers/` 下新增解析器，负责「抓取 → 条目数组（标题、链接、发布时间、正文）」；
+2. 在 `lib/sources.ts` 注册来源 id、名称、分类与默认地址；
+3. 在 `.env.example` 与本文档补上对应的 `*_URL` 变量；
+4. 确认该来源允许抓取（robots 与使用条款），并验证链接去重与时间解析正确。
+
+### 已知限制
+
+- 中文全文索引按二元词构建，单字查询不会命中；
+- 标签由模型生成，可能包含未审核的候选词（只进候选池，不进正式词表）；
+- 不内置登录鉴权以外的权限体系，多租户场景需要自行扩展。
 
 ## 许可证
 
