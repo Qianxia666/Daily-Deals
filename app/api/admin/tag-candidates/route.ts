@@ -14,12 +14,13 @@ export const runtime = 'nodejs';
 interface CandidateActionBody {
   action?: unknown;
   tag?: unknown;
+  tags?: unknown;
   target?: unknown;
 }
 
 function payload() {
   return {
-    tagCandidates: getTagCandidates(100),
+    tagCandidates: getTagCandidates(500),
     tags: getTagStatus(),
   };
 }
@@ -47,11 +48,65 @@ export async function POST(request: Request) {
   const target =
     typeof body?.target === 'string' ? body.target.trim() : '';
 
+  const known = new Set(getTagCandidates(5000).map((item) => item.tag));
+  const tags = Array.isArray(body?.tags)
+    ? [
+        ...new Set(
+          body.tags
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.trim())
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+
+  // 批量转正：一次最多 200 个，逐个走与单条相同的转正逻辑。
+  if (action === 'promote' && tags.length > 0) {
+    if (tags.length > 200) {
+      return NextResponse.json(
+        { error: '一次最多转正 200 个标签' },
+        { status: 400 },
+      );
+    }
+    const missing = tags.filter((item) => !known.has(item));
+    if (missing.length > 0) {
+      return NextResponse.json(
+        { error: `候选标签不存在：${missing.slice(0, 5).join('、')}` },
+        { status: 404 },
+      );
+    }
+    for (const item of tags) promoteTag(item);
+    return NextResponse.json(payload(), {
+      headers: { 'Cache-Control': 'no-store' },
+    });
+  }
+
+  // 批量屏蔽：一次最多 200 个，逐个走与单条相同的屏蔽逻辑。
+  if (action === 'block' && tags.length > 0) {
+    if (tags.length > 200) {
+      return NextResponse.json(
+        { error: '一次最多屏蔽 200 个标签' },
+        { status: 400 },
+      );
+    }
+    const missing = tags.filter((item) => !known.has(item));
+    if (missing.length > 0) {
+      return NextResponse.json(
+        { error: `候选标签不存在：${missing.slice(0, 5).join('、')}` },
+        { status: 404 },
+      );
+    }
+    for (const item of tags) blockTag(item);
+    return NextResponse.json(payload(), {
+      headers: { 'Cache-Control': 'no-store' },
+    });
+  }
+
   if (!tag) {
     return NextResponse.json({ error: '缺少标签' }, { status: 400 });
   }
 
-  if (!getTagCandidates(5000).some((item) => item.tag === tag)) {
+  if (!known.has(tag)) {
     return NextResponse.json({ error: '候选标签不存在' }, { status: 404 });
   }
 

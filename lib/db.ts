@@ -1268,6 +1268,181 @@ export function getPopularTags(limit = 500): PopularTag[] {
     ) as PopularTag[];
 }
 
+/** 站点地图用：在架且来源可见的优惠 id 与收录时间。 */
+export function listSitemapDeals(limit = 20000): {
+  id: number;
+  lastModified: string;
+}[] {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const retentionCutoff = new Date(
+    Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  const visible = listSources()
+    .filter((source) => source.state === 'active')
+    .map((source) => source.id);
+  if (visible.length === 0) return [];
+
+  return db
+    .prepare(
+      `SELECT d.id, d.first_seen_at AS lastModified
+       FROM deals d
+       WHERE (d.expires_at IS NULL OR d.expires_at > ?)
+         AND d.first_seen_at >= ?
+         AND d.source IN (${visible.map(() => '?').join(', ')})
+       ORDER BY d.first_seen_at DESC
+       LIMIT ?`,
+    )
+    .all(
+      now,
+      retentionCutoff,
+      ...visible,
+      Math.min(Math.max(limit, 1), 20000),
+    ) as { id: number; lastModified: string }[];
+}
+
+export interface LatestDealEntry {
+  id: number;
+  title: string;
+  summary: string;
+  source: string;
+  publishedAt: string | null;
+}
+
+/** RSS 订阅用：最新收录的在架优惠。 */
+export function listLatestDeals(limit = 50): LatestDealEntry[] {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const retentionCutoff = new Date(
+    Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  const visible = listSources()
+    .filter((source) => source.state === 'active')
+    .map((source) => source.id);
+  if (visible.length === 0) return [];
+
+  return db
+    .prepare(
+      `SELECT d.id,
+              COALESCE(NULLIF(d.ai_title, ''), d.title) AS title,
+              COALESCE(NULLIF(d.ai_summary, ''), d.description) AS summary,
+              d.source,
+              COALESCE(d.published_at, d.first_seen_at) AS publishedAt
+       FROM deals d
+       WHERE (d.expires_at IS NULL OR d.expires_at > ?)
+         AND d.first_seen_at >= ?
+         AND d.source IN (${visible.map(() => '?').join(', ')})
+       ORDER BY d.first_seen_at DESC, d.id DESC
+       LIMIT ?`,
+    )
+    .all(
+      now,
+      retentionCutoff,
+      ...visible,
+      Math.min(Math.max(limit, 1), 200),
+    ) as LatestDealEntry[];
+}
+
+export interface SitemapTagEntry {
+  tag: string;
+  count: number;
+  lastModified: string;
+}
+
+/** 站点地图用：标签页及其最后更新时间（该标签下最新一条优惠的收录时间）。 */
+export function listSitemapTags(
+  minCount = 5,
+  limit = 300,
+): SitemapTagEntry[] {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const retentionCutoff = new Date(
+    Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  const visible = listSources()
+    .filter((source) => source.state === 'active')
+    .map((source) => source.id);
+  if (visible.length === 0) return [];
+
+  return db
+    .prepare(
+      `SELECT j.value AS tag,
+              COUNT(*) AS count,
+              MAX(d.first_seen_at) AS lastModified
+       FROM deals d,
+            json_each(CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END) j
+       WHERE (d.expires_at IS NULL OR d.expires_at > ?)
+         AND d.first_seen_at >= ?
+         AND d.source IN (${visible.map(() => '?').join(', ')})
+       GROUP BY j.value
+       HAVING count >= ?
+       ORDER BY count DESC, tag ASC
+       LIMIT ?`,
+    )
+    .all(
+      now,
+      retentionCutoff,
+      ...visible,
+      Math.max(minCount, 1),
+      Math.min(Math.max(limit, 1), 1000),
+    ) as SitemapTagEntry[];
+}
+
+export interface TagLandingDeal {
+  id: number;
+  title: string;
+  summary: string;
+  source: string;
+  publishedAt: string | null;
+}
+
+/** 标签落地页用：按标签精确召回在架优惠，供搜索引擎抓取。 */
+export function listDealsByTag(
+  tag: string,
+  options: { limit?: number; offset?: number } = {},
+): { items: TagLandingDeal[]; total: number } {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const retentionCutoff = new Date(
+    Date.now() - getDataRetentionDays() * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  const visible = listSources()
+    .filter((source) => source.state === 'active')
+    .map((source) => source.id);
+  if (visible.length === 0) return { items: [], total: 0 };
+
+  const limit = Math.min(Math.max(options.limit ?? 60, 1), 100);
+  const offset = Math.max(options.offset ?? 0, 0);
+  const where = `FROM deals d
+     WHERE json_valid(d.tags)
+       AND EXISTS (SELECT 1 FROM json_each(d.tags) WHERE json_each.value = ?)
+       AND (d.expires_at IS NULL OR d.expires_at > ?)
+       AND d.first_seen_at >= ?
+       AND d.source IN (${visible.map(() => '?').join(', ')})`;
+  const params = [tag, now, retentionCutoff, ...visible];
+
+  const total = (
+    db.prepare(`SELECT COUNT(*) AS count ${where}`).get(...params) as {
+      count: number;
+    }
+  ).count;
+
+  const items = db
+    .prepare(
+      `SELECT d.id,
+              COALESCE(NULLIF(d.ai_title, ''), d.title) AS title,
+              COALESCE(NULLIF(d.ai_summary, ''), d.description) AS summary,
+              d.source,
+              d.published_at AS publishedAt
+       ${where}
+       ORDER BY COALESCE(d.published_at, d.first_seen_at) DESC, d.id DESC
+       LIMIT ? OFFSET ?`,
+    )
+    .all(...params, limit, offset) as TagLandingDeal[];
+
+  return { items, total };
+}
+
 /**
  * 按游标分页读取首页条目。
  * 排序与旧版一致：新条目优先，其次发布时间倒序，最后 id 倒序。
@@ -1529,7 +1704,7 @@ export function getAdminData(): AdminBaseData {
     sources,
     searchIndex: readSearchIndexStatus(db),
     tags: getTagStatus(),
-    tagCandidates: getTagCandidates(100),
+    tagCandidates: getTagCandidates(500),
     users: listAdminUsers(),
   };
 }
@@ -1694,7 +1869,12 @@ export function saveAiEnrichment(
   ).run(
     enrichment.title,
     enrichment.summary,
-    JSON.stringify(enrichment.tags),
+    JSON.stringify(
+      enrichment.tags.slice(
+        0,
+        readRuntimeNumber(db, 'AI_TAGS_MAX', 5, 2, 6),
+      ),
+    ),
     JSON.stringify(enrichment.proposedTags),
     JSON.stringify(enrichment.entities),
     now,
@@ -1719,8 +1899,12 @@ export function saveDealTags(
      SET tags = ?, proposed_tags = ?, entities = ?, ai_tags_at = ?
      WHERE id = ?`,
   ).run(
-    JSON.stringify(tags.slice(0, 2)),
-    JSON.stringify(proposedTags.slice(0, 3)),
+    JSON.stringify(
+      tags.slice(0, readRuntimeNumber(db, 'AI_TAGS_MAX', 5, 2, 6)),
+    ),
+    JSON.stringify(
+      proposedTags.slice(0, readRuntimeNumber(db, 'AI_TAGS_PROPOSE_MAX', 4, 0, 6)),
+    ),
     JSON.stringify(entities.slice(0, 6)),
     new Date().toISOString(),
     id,
@@ -1807,7 +1991,7 @@ function readPromotedTags(db: Database.Database): string[] {
     return parsed
       .map((item) => String(item).trim())
       .filter((item) => item.length >= 2 && item.length <= 12)
-      .slice(0, 200);
+      .slice(0, 800);
   } catch {
     return [];
   }
@@ -1822,7 +2006,8 @@ function recordCandidates(db: Database.Database, tags: string[]): void {
   const insert = db.prepare(
     `INSERT INTO tag_candidates (tag, status, merged_into, created_at, updated_at)
      VALUES (?, 'pending', NULL, ?, ?)
-     ON CONFLICT(tag) DO NOTHING`,
+     ON CONFLICT(tag) DO UPDATE SET updated_at = excluded.updated_at
+     WHERE tag_candidates.status = 'pending'`,
   );
   for (const tag of entries) insert.run(tag, now, now);
 
@@ -1852,21 +2037,49 @@ function recordCandidates(db: Database.Database, tags: string[]): void {
        )`,
   ).run();
 
+  // 超出上限时优先保留使用次数高的候选，同频次再按最近出现时间保留。
   db.prepare(
     `DELETE FROM tag_candidates
      WHERE status = 'pending'
        AND tag IN (
-         SELECT tag FROM tag_candidates
-         WHERE status = 'pending'
-         ORDER BY updated_at DESC
+         SELECT c.tag
+         FROM tag_candidates c
+         LEFT JOIN (
+           SELECT j.value AS tag, COUNT(*) AS count
+           FROM deals d, json_each(d.proposed_tags) j
+           GROUP BY j.value
+         ) t ON t.tag = c.tag
+         WHERE c.status = 'pending'
+         ORDER BY COALESCE(t.count, 0) DESC, c.updated_at DESC
          LIMIT -1 OFFSET ?
        )`,
   ).run(limit);
 }
 
-/** 候选池列表，按状态与使用次数排序。 */
+/** 0 有业务含义（全部显示），不能沿用 readRuntimeNumber 的正数限制。 */
+function readCandidateMinCount(db: Database.Database): number {
+  const row = db
+    .prepare('SELECT value FROM settings WHERE key = ?')
+    .get('env:AI_TAGS_CANDIDATE_MIN_COUNT') as { value: string } | undefined;
+  const raw = row?.value ?? process.env.AI_TAGS_CANDIDATE_MIN_COUNT ?? '';
+  if (raw.trim() === '') return 2;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return 2;
+  return Math.min(Math.round(value), 20);
+}
+
+/** 候选池列表，按状态、是否达到转正阈值、使用次数排序。 */
 export function getTagCandidates(limit = 100): TagCandidate[] {
-  const rows = getDb()
+  const db = getDb();
+  const threshold = readRuntimeNumber(
+    db,
+    'AI_TAGS_PROMOTE_THRESHOLD',
+    3,
+    2,
+    20,
+  );
+  const minCount = readCandidateMinCount(db);
+  const rows = db
     .prepare(
       `SELECT c.tag, c.status, c.merged_into, COALESCE(t.count, 0) AS count
        FROM tag_candidates c
@@ -1875,12 +2088,14 @@ export function getTagCandidates(limit = 100): TagCandidate[] {
          FROM deals d, json_each(d.proposed_tags) j
          GROUP BY j.value
        ) t ON t.tag = c.tag
+       WHERE c.status <> 'pending' OR COALESCE(t.count, 0) >= ?
        ORDER BY CASE c.status WHEN 'pending' THEN 0 ELSE 1 END ASC,
+                CASE WHEN COALESCE(t.count, 0) >= ? THEN 0 ELSE 1 END ASC,
                 COALESCE(t.count, 0) DESC,
                 c.updated_at DESC
        LIMIT ?`,
     )
-    .all(limit) as {
+    .all(minCount, threshold, limit) as {
     tag: string;
     status: string;
     merged_into: string | null;
@@ -1923,6 +2138,7 @@ export function promoteTag(tag: string): void {
     'UPDATE deals SET tags = ?, proposed_tags = ? WHERE id = ?',
   );
   const searchMaxChars = readSearchIndexMaxChars(db);
+  const tagsMax = readRuntimeNumber(db, 'AI_TAGS_MAX', 5, 2, 6);
 
   const apply = db.transaction(() => {
     for (const row of rows) {
@@ -1931,8 +2147,8 @@ export function promoteTag(tag: string): void {
         (item) => item !== tag,
       );
 
-      // 核心标签正常上限为 2 个；转正回填允许到 3 个，避免已满时丢词。
-      if (!tags.includes(tag) && tags.length < 3) {
+      // 转正回填时按当前标签上限补位，已满则只清理候选。
+      if (!tags.includes(tag) && tags.length < tagsMax) {
         tags.push(tag);
         update.run(JSON.stringify(tags), JSON.stringify(proposed), row.id);
         indexDealById(db, row.id, searchMaxChars);
@@ -1987,6 +2203,7 @@ export function mergeTag(from: string, to: string): void {
     'UPDATE deals SET tags = ?, proposed_tags = ? WHERE id = ?',
   );
   const searchMaxChars = readSearchIndexMaxChars(db);
+  const tagsMax = readRuntimeNumber(db, 'AI_TAGS_MAX', 5, 2, 6);
 
   const apply = db.transaction(() => {
     for (const row of rows) {
@@ -1999,7 +2216,7 @@ export function mergeTag(from: string, to: string): void {
         if (!proposed.includes(target) && proposed.length < 8) {
           proposed.push(target);
         }
-      } else if (!tags.includes(target) && tags.length < 2) {
+      } else if (!tags.includes(target) && tags.length < tagsMax) {
         tags.push(target);
       }
 

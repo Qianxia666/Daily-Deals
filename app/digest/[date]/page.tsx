@@ -19,6 +19,7 @@ export async function generateMetadata({
   return {
     title: `${digest.title} · ${site.title}`,
     description: digest.stats[0] ?? '每日优惠汇总',
+    alternates: { canonical: `/digest/${date}` },
   };
 }
 

@@ -32,9 +32,16 @@ export async function generateMetadata({
   if (!deal || !isSourceVisible(deal.source)) {
     return { title: `优惠详情 · ${site.title}` };
   }
+  const expired = deal.expiresAt
+    ? Date.parse(deal.expiresAt) <= Date.now()
+    : false;
   return {
     title: `${deal.title} · ${site.title}`,
     description: (deal.summary || deal.description).slice(0, 120),
+    alternates: { canonical: `/deal/${deal.id}` },
+    robots: expired
+      ? { index: false, follow: true }
+      : { index: true, follow: true },
   };
 }
 

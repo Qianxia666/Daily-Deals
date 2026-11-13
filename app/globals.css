@@ -169,19 +169,23 @@
   }
 
   [class~='bg-slate-50'] {
-    background-color: #0c1626;
+    background-color: #141f33;
   }
 
+  /*
+   * 卡片底色：浅色模式下是比白底略深的灰，深色模式下必须反过来比背景略亮，
+   * 否则半透明深色叠在 #101b2d 上会沉成黑洞，看起来像色块没渲染。
+   */
   [class~='bg-slate-50/80'] {
-    background-color: rgb(12 22 38 / 0.85);
+    background-color: rgb(232 240 251 / 0.09);
   }
 
   [class~='bg-slate-50/50'] {
-    background-color: rgb(12 22 38 / 0.55);
+    background-color: rgb(232 240 251 / 0.055);
   }
 
   [class~='bg-slate-50/60'] {
-    background-color: rgb(12 22 38 / 0.7);
+    background-color: rgb(232 240 251 / 0.07);
   }
 
   [class~='bg-slate-100'] {
@@ -272,6 +276,30 @@
 
   [class~='bg-amber-100'] {
     background-color: rgb(245 158 11 / 0.22);
+  }
+
+  /*
+   * 带透明度的变体不会被上面的纯色规则命中，必须单独列出，
+   * 否则选中态（如来源筛选的 amber-50/60）在深色下会显示成刺眼的亮色块。
+   */
+  [class~='bg-amber-50/60'] {
+    background-color: rgb(245 158 11 / 0.1);
+  }
+
+  [class~='bg-red-50/40'] {
+    background-color: rgb(239 68 68 / 0.08);
+  }
+
+  [class~='bg-violet-50/80'] {
+    background-color: rgb(139 92 246 / 0.14);
+  }
+
+  [class~='bg-emerald-50/60'] {
+    background-color: rgb(16 185 129 / 0.1);
+  }
+
+  [class~='bg-sky-50/60'] {
+    background-color: rgb(14 165 233 / 0.1);
   }
 
   [class~='border-amber-100'],

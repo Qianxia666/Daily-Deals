@@ -88,13 +88,27 @@ function coarseSelect(
   items: DealItem[],
   max: number,
   strategy: 'balanced' | 'recent',
+  maxPerSource = 0,
 ): DealItem[] {
-  if (items.length <= max) return items;
-  if (strategy === 'recent') return items.slice(0, max);
+  if (maxPerSource <= 0 && items.length <= max) return items;
+
+  if (strategy === 'recent') {
+    if (maxPerSource <= 0) return items.slice(0, max);
+    const counts = new Map<string, number>();
+    const selected: DealItem[] = [];
+    for (const item of items) {
+      if ((counts.get(item.source) ?? 0) >= maxPerSource) continue;
+      selected.push(item);
+      counts.set(item.source, (counts.get(item.source) ?? 0) + 1);
+      if (selected.length >= max) break;
+    }
+    return selected;
+  }
 
   const groups = new Map<string, DealItem[]>();
   for (const item of items) {
     const list = groups.get(item.source) ?? [];
+    if (maxPerSource > 0 && list.length >= maxPerSource) continue;
     list.push(item);
     groups.set(item.source, list);
   }
@@ -201,7 +215,8 @@ function rankCandidates(
     if (selected.length >= limit) break;
   }
 
-  if (selected.length < limit) {
+  // 有单来源上限时不补足：补足会把刚被上限裁掉的同源条目重新加回来。
+  if (maxPerSource <= 0 && selected.length < limit) {
     for (const { item } of scored) {
       if (selectedIds.has(item.id)) continue;
       selected.push(item);
@@ -643,6 +658,7 @@ export async function POST(request: NextRequest) {
       scoped,
       getAiSearchMaxItems(),
       getAiSearchCoarseStrategy(),
+      getAiSearchMaxPerSource(),
     );
     searchable = selected.map((item) =>
       dealToSearchDeal(item, useSummary),

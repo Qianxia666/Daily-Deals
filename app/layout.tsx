@@ -17,7 +17,10 @@ export async function generateMetadata(): Promise<Metadata> {
     title,
     description: site.tagline,
     applicationName: site.title,
-    alternates: { canonical: '/' },
+    alternates: {
+      canonical: '/',
+      types: { 'application/rss+xml': '/feed.xml' },
+    },
     openGraph: {
       title,
       description: site.tagline,

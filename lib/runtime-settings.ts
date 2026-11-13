@@ -205,12 +205,23 @@ const FIELDS: RuntimeFieldDef[] = [
   },
   {
     key: 'AI_TAG_VOCABULARY',
-    label: '品类标签词表',
+    label: '标签词表',
     group: 'AI 改写与搜索',
     description:
-      '每行或用逗号分隔。模型只会从词表里选标签；新增品类后保存即可，存量数据可在「品类标签」区域一键补全。',
+      '每行或用逗号分隔。词表同时包含品类标签与品牌标签，模型只会从词表里选；转正的新标签会自动并入这里。存量数据可在「品类标签」区域补全。',
     type: 'textarea',
     defaultValue: DEFAULT_TAG_VOCABULARY.join('\n'),
+  },
+  {
+    key: 'AI_TAGS_MAX',
+    label: '每条标签上限',
+    group: 'AI 改写与搜索',
+    description:
+      '默认 5，范围 2–6。模型优先使用词表标签；词表没有更精确的类目时，可直接输出精确类目词与品牌。',
+    type: 'number',
+    defaultValue: '5',
+    min: 2,
+    max: 6,
   },
   {
     key: 'AI_TAGS_PROPOSE_ENABLED',
@@ -229,18 +240,19 @@ const FIELDS: RuntimeFieldDef[] = [
     key: 'AI_TAGS_PROPOSE_MAX',
     label: '每条最多提议标签数',
     group: 'AI 改写与搜索',
-    description: '默认 2，设为 0 表示不提议新标签；提议词不会进入正式词表。',
+    description:
+      '默认 4，设为 0 表示不提议新标签；提议的具体类目和品牌会进入候选池，达到晋升阈值后才出现在标签建议中。',
     type: 'number',
-    defaultValue: '2',
+    defaultValue: '4',
     min: 0,
-    max: 3,
+    max: 6,
   },
   {
     key: 'AI_TAGS_PROMOTE_THRESHOLD',
-    label: '候选自动转正阈值',
+    label: '可转正标记阈值',
     group: 'AI 改写与搜索',
     description:
-      '同一提议标签被多少条优惠使用后进入可转正状态，默认 3；达到阈值的提议标签也会进入零结果标签建议。',
+      '同一提议标签被多少条优惠使用后标记为「可转正」，默认 3。仅用于后台标记和零结果标签建议，不会自动转正，也不限制候选进入候选池。',
     type: 'number',
     defaultValue: '3',
     min: 2,
@@ -256,6 +268,17 @@ const FIELDS: RuntimeFieldDef[] = [
     defaultValue: '500',
     min: 50,
     max: 5000,
+  },
+  {
+    key: 'AI_TAGS_CANDIDATE_MIN_COUNT',
+    label: '候选隐藏阈值',
+    group: 'AI 改写与搜索',
+    description:
+      '待处理候选的使用次数低于该值时不在后台显示，默认 2；设为 0 表示全部显示。只影响列表展示，不删除记录，次数涨上来后会自动出现。',
+    type: 'number',
+    defaultValue: '2',
+    min: 0,
+    max: 20,
   },
   {
     key: 'AI_TAGS_BRAND_EXTRACT_ENABLED',
@@ -381,10 +404,10 @@ const FIELDS: RuntimeFieldDef[] = [
   },
   {
     key: 'AI_SEARCH_MAX_PER_SOURCE',
-    label: '单来源候选上限',
+    label: '单来源搜索结果上限',
     group: 'AI 改写与搜索',
     description:
-      '每个来源最多进入多少条候选，0 表示不限制；用于避免大来源占满结果。',
+      'AI 搜索召回阶段，同一个来源最多保留多少条结果，0 表示不限制；用于避免大来源占满搜索结果。只作用于站内搜索，与标签候选池无关。',
     type: 'number',
     defaultValue: '0',
     min: 0,
@@ -1423,13 +1446,18 @@ export function getAiTagsProposeEnabled(): boolean {
   return getRuntimeBool('AI_TAGS_PROPOSE_ENABLED', true);
 }
 
+/** 每条优惠最多保留的核心标签数。 */
+export function getAiTagsMax(): number {
+  return getRuntimeEnvNumber('AI_TAGS_MAX', 5, 2, 6);
+}
+
 /** 允许 0，表示不提议新标签。 */
 export function getAiTagsProposeMax(): number {
   const raw = getRuntimeEnvRaw('AI_TAGS_PROPOSE_MAX');
-  if (raw === null || raw.trim() === '') return 2;
+  if (raw === null || raw.trim() === '') return 4;
   const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0) return 2;
-  return Math.min(Math.round(value), 3);
+  if (!Number.isFinite(value) || value < 0) return 4;
+  return Math.min(Math.round(value), 6);
 }
 
 export function getAiTagsPromoteThreshold(): number {
@@ -1465,7 +1493,7 @@ export function getAiTagVocabulary(): string[] {
     .map((tag) => tag.trim())
     .filter((tag) => tag.length >= 2 && tag.length <= 12);
 
-  return [...new Set([...tags, ...getPromotedTags()])].slice(0, 200);
+  return [...new Set([...tags, ...getPromotedTags()])].slice(0, 800);
 }
 
 export function getAiSearchFtsEnabled(): boolean {
@@ -1650,7 +1678,11 @@ export function getRuntimeAdminFields(): RuntimeSettingView[] {
       group: def.group,
       description: def.description,
       type: def.type,
-      value: def.secret ? '' : effectiveValue(def),
+      value: def.secret
+        ? ''
+        : def.key === 'AI_TAG_VOCABULARY'
+          ? getAiTagVocabulary().join('\n')
+          : effectiveValue(def),
       configured,
       secret: def.secret,
       options: def.options,

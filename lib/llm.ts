@@ -16,6 +16,7 @@ import {
   getAiTagTimeoutMs,
   getAiTagsBrandExtractEnabled,
   getAiTagsEnabled,
+  getAiTagsMax,
   getAiTagsProposeEnabled,
   getAiTagsProposeMax,
   getAiTagVocabulary,
@@ -31,25 +32,26 @@ import {
 
 interface TagOptions {
   vocabulary: string[];
+  tagsMax: number;
   proposeEnabled: boolean;
   proposeMax: number;
   brandExtractEnabled: boolean;
 }
 
 function buildSummaryPrompt(options: TagOptions): string {
-  const { vocabulary, proposeEnabled, proposeMax, brandExtractEnabled } =
+  const { vocabulary, tagsMax, proposeEnabled, proposeMax, brandExtractEnabled } =
     options;
 
   const tagRule =
     vocabulary.length > 0
-      ? `8. tags 是 1–2 个品类标签，只能从下列词表中选，不能自造：${vocabulary.join(
+      ? `8. tags 返回 1–${tagsMax} 个标签：优先使用下列词表中的标签：${vocabulary.join(
           '、',
-        )}。标签用于「搜奶茶能找到蜜雪冰城」这类品类检索，与原文是否出现该词无关。`
-      : '8. tags 返回空数组 []。';
+        )}。词表没有更精确的类目时，可以直接输出 2–6 字的精确类目词（洗发水、抽纸、瑜伽垫）或品牌名，品牌不得与类目组合。禁止宽泛词、平台名、店铺后缀、促销词、价格与规格。`
+      : `8. tags 返回 1–${tagsMax} 个 2–6 字的精确类目词或品牌名，品牌不得与类目组合；禁止宽泛词、平台名、店铺后缀、促销词、价格与规格。`;
 
   const proposeRule =
     proposeEnabled && proposeMax > 0
-      ? `9. proposedTags 是 0–${proposeMax} 个词表中没有的新品类词，仅当词表都不合适时才提出。要求 2–8 个汉字，必须是品类而非品牌名，不能与 tags 重复；没有合适的新词时返回 []。`
+      ? `9. proposedTags：只上报没有出现在 tags 中的"精确类目"与"品牌"，先类目后品牌，各最多 2 个，总数不超过 ${proposeMax} 个；类目为 2–6 字商品名词（洗发水、抽纸），不得带价格/规格/材质/促销语；品牌只报原文逐字出现的商品品牌（优衣库、徕芬），不得与类目组合，并同时写入 brands；没有合适的新词时返回 []。`
       : '9. proposedTags 返回空数组 []。';
 
   const entityRule = brandExtractEnabled
@@ -164,22 +166,47 @@ function numbersAreGrounded(
   return produced.every((value) => available.has(value));
 }
 
-/** 只接受词表内的标签，最多 2 个，避免模型自造词。 */
-function normalizeTags(value: unknown, vocabulary: string[]): string[] {
-  if (!Array.isArray(value) || vocabulary.length === 0) return [];
+/** 泛化词、平台名、店铺后缀、价格规格与促销语，不能作为标签。 */
+const TAG_BLOCKLIST = new Set([
+  '好物', '推荐', '优惠', '超值', '免费', '热卖', '促销', '特价', '新品', '爆款',
+  '旗舰店', '官方', '自营', '店铺', '商城', '淘宝', '天猫', '京东', '拼多多', '抖音', '快手',
+]);
 
-  const allowed = new Set(vocabulary);
+function isNoisyTag(tag: string): boolean {
+  if (TAG_BLOCKLIST.has(tag)) return true;
+  if (/^\d+(?:\.\d+)?$/.test(tag)) return true;
+  if (/(旗舰店|官方店|专营店|自营店)$/.test(tag)) return true;
+  // 带价格/规格的组合词（8.5元、9.9折、600ml、5件套）不是标签。
+  if (
+    /\d/.test(tag) &&
+    /(元|折|ml|kg|g|l|升|毫升|件套|件装|片装|瓶装|盒装|袋装|支装|个装|只装)(?![a-z])/i.test(
+      tag,
+    )
+  ) {
+    return true;
+  }
+  if (/(特价|捡漏|好价|合集|秒杀|包邮)/.test(tag)) return true;
+  return false;
+}
+
+/** 核心标签：优先词表，也接受模型输出的精确类目与品牌，最多 tagsMax 个。 */
+function normalizeTags(value: unknown, options: TagOptions): string[] {
+  if (!Array.isArray(value)) return [];
+
+  const max = options.tagsMax > 0 ? options.tagsMax : 5;
   const tags: string[] = [];
   for (const entry of value) {
     const tag = cleanText(entry, 12);
-    if (!allowed.has(tag) || tags.includes(tag)) continue;
+    if (tag.length < 2) continue;
+    if (isNoisyTag(tag)) continue;
+    if (tags.includes(tag)) continue;
     tags.push(tag);
-    if (tags.length >= 2) break;
+    if (tags.length >= max) break;
   }
   return tags;
 }
 
-/** 词表之外的新品类词，立即进入候选池但不会直接进入前台标签建议。 */
+/** 词表之外的新品类词或品牌，立即进入候选池但不会直接进入前台标签建议。 */
 function normalizeProposedTags(
   value: unknown,
   vocabulary: string[],
@@ -193,6 +220,7 @@ function normalizeProposedTags(
   for (const entry of value) {
     const tag = cleanText(entry, 12);
     if (tag.length < 2 || tag.length > 8) continue;
+    if (isNoisyTag(tag)) continue;
     if (allowed.has(tag.toLowerCase())) continue;
     if (result.some((item) => item.toLowerCase() === tag.toLowerCase())) {
       continue;
@@ -270,15 +298,17 @@ function normalizeResult(
       )
     : [];
 
+  const tags = normalizeTags(raw.tags, options);
+
   return {
     title,
     summary,
-    tags: normalizeTags(raw.tags, options.vocabulary),
+    tags,
     proposedTags: normalizeProposedTags(
       raw.proposedTags,
       options.vocabulary,
       options,
-    ),
+    ).filter((tag) => !tags.includes(tag)),
     entities,
   };
 }
@@ -478,6 +508,7 @@ export async function enrichPendingDeals(): Promise<void> {
     const tagsEnabled = getAiTagsEnabled();
     const options: TagOptions = {
       vocabulary: tagsEnabled ? getAiTagVocabulary() : [],
+      tagsMax: getAiTagsMax(),
       proposeEnabled: tagsEnabled && getAiTagsProposeEnabled(),
       proposeMax: tagsEnabled ? getAiTagsProposeMax() : 0,
       brandExtractEnabled: tagsEnabled && getAiTagsBrandExtractEnabled(),
@@ -541,8 +572,16 @@ export async function enrichPendingDeals(): Promise<void> {
 const TAG_SYSTEM_PROMPT = `你是中文优惠信息分类器。用户会给出 items 数组，每项包含 id、title、summary、description。请为每条优惠输出品类标签、可选的新品类词，以及可抽取的品牌与产品。
 
 硬性规则：
-1. tags：1–2 个品类标签，只能选择词表中给出的标签，不得自造、不得改写；确实无法归类时选择"其他"。
-2. proposedTags：__PROPOSE_RULE__ 必须是品类而非品牌名，不能与 tags 重复。
+1. tags：返回 1–__TAGS_MAX__ 个标签，优先使用词表（__VOCABULARY__）中的词；词表没有更精确的类目时，可以直接输出 2–6 字的精确类目词（洗发水、抽纸、瑜伽垫）或品牌名，品牌不得与类目组合（禁止"薇姿洗发水"）。禁止宽泛词、平台名、店铺后缀、促销词、价格与规格、纯数字；只有完全无法判断时才选择"其他"。
+2. proposedTags：只上报没有出现在 tags 中的"精确类目"与"品牌"，先类目后品牌，类目和品牌各最多 2 个，总数不超过 __PROPOSE_MAX__ 个。
+   类目：2–6 字商品名词，粒度到二级类目（洗发水、抽纸、瑜伽垫、空气炸锅），不得包含价格/折扣（8.5元、9.9折）、规格（600ml、5件套）、材质修饰（不锈钢、亚克力）或促销语（特价、捡漏、合集）。
+   品牌：只报原文逐字出现的商品品牌，保留官方写法（babycare、海尔 Haier、徕芬）；不得报平台名、店铺后缀、型号系列。
+   品牌与类目必须分开，禁止组合成"薇姿洗发水"这类词。
+   示例：
+   "京东9.9津贴捡漏合集（不锈钢鸣音水壶、亚克力小推车）"→ ["水壶","推车"]
+   "8.5元特价舒蕾山茶花洗发水600ml"→ ["洗发水","舒蕾"]
+   "徕芬i2电动牙刷"→ ["电动牙刷","徕芬"]
+   禁止输出：宽泛词（好物/推荐/优惠/超值/免费/热卖/促销/特价/新品/爆款）、平台名（淘宝/京东/拼多多/天猫/抖音）、店铺后缀（旗舰店/官方店/专营店）、纯数字、地名、与 tags 重复的词。
 3. brands、products：__ENTITY_RULE__
 4. 结合标题与摘要判断真实品类，不要被无关词干扰（例如"奶茶色口红"不是奶茶）。
 5. 每个输入 id 必须返回一条，id 原样返回。
@@ -585,12 +624,12 @@ function parseTagResults(
     const deal = byId.get(id);
     if (!deal || results.has(id)) continue;
 
-    const tags = normalizeTags(raw.tags, options.vocabulary);
+    const tags = normalizeTags(raw.tags, options);
     const proposedTags = normalizeProposedTags(
       raw.proposedTags,
       options.vocabulary,
       options,
-    );
+    ).filter((tag) => !tags.includes(tag));
     const entities = options.brandExtractEnabled
       ? normalizeEntities(
           [
@@ -623,13 +662,12 @@ async function callTagModelBatch(
     description: deal.description.slice(0, 500),
   }));
 
-  const proposeRule =
-    options.proposeEnabled && options.proposeMax > 0
-      ? `0–${options.proposeMax} 个词表中没有的新品类词，仅当词表都不合适时才提出；每个 2–8 个汉字。`
-      : '返回空数组 []。';
   const entityRule = options.brandExtractEnabled
     ? '从该项 title、description 原文中逐字抽取品牌名与产品名，必须能在原文中找到，没有则返回 []。'
     : '返回空数组 []。';
+
+  const proposeMax =
+    options.proposeEnabled && options.proposeMax > 0 ? options.proposeMax : 0;
 
   const payload = {
     model: config.model,
@@ -640,7 +678,8 @@ async function callTagModelBatch(
           '__VOCABULARY__',
           options.vocabulary.join('、'),
         )
-          .replace('__PROPOSE_RULE__', proposeRule)
+          .replace('__TAGS_MAX__', String(options.tagsMax))
+          .replace('__PROPOSE_MAX__', String(proposeMax))
           .replace('__ENTITY_RULE__', entityRule),
       },
       { role: 'user', content: JSON.stringify({ items }) },
@@ -726,6 +765,7 @@ export function startTagBackfill(force = false): TagRunProgress {
 
   const options: TagOptions = {
     vocabulary: getAiTagVocabulary(),
+    tagsMax: getAiTagsMax(),
     proposeEnabled: getAiTagsProposeEnabled(),
     proposeMax: getAiTagsProposeMax(),
     brandExtractEnabled: getAiTagsBrandExtractEnabled(),

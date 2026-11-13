@@ -51,6 +51,8 @@ const STATE_LABELS: Record<SourceState, string> = {
 type SourceStatusFilter = 'all' | 'ok' | 'error' | 'paused' | 'removed';
 type SourceKindFilter = 'all' | SourceKind;
 
+const CANDIDATE_PAGE_SIZE = 50;
+
 function formatDateTime(iso: string | null): string {
   if (!iso) return '—';
   const date = new Date(iso);
@@ -112,6 +114,10 @@ export function AdminDashboard() {
   const [rebuildingIndex, setRebuildingIndex] = useState(false);
   const [backfillingTags, setBackfillingTags] = useState(false);
   const [tagActionBusy, setTagActionBusy] = useState<string | null>(null);
+  const [selectedCandidates, setSelectedCandidates] = useState<Set<string>>(
+    new Set(),
+  );
+  const [candidatePage, setCandidatePage] = useState(1);
   const [notifyBusy, setNotifyBusy] = useState<string | null>(null);
   const [notifyResult, setNotifyResult] = useState<{
     kind: string;
@@ -399,6 +405,168 @@ export function AdminDashboard() {
       ),
     [data],
   );
+
+  const candidateTotalPages = Math.max(
+    1,
+    Math.ceil(pendingTagCandidates.length / CANDIDATE_PAGE_SIZE),
+  );
+  const currentCandidatePage = Math.min(candidatePage, candidateTotalPages);
+  const pagedCandidates = useMemo(
+    () =>
+      pendingTagCandidates.slice(
+        (currentCandidatePage - 1) * CANDIDATE_PAGE_SIZE,
+        currentCandidatePage * CANDIDATE_PAGE_SIZE,
+      ),
+    [pendingTagCandidates, currentCandidatePage],
+  );
+  const allPageCandidatesSelected =
+    pagedCandidates.length > 0 &&
+    pagedCandidates.every((item) => selectedCandidates.has(item.tag));
+
+  const toggleCandidate = (tag: string) => {
+    setSelectedCandidates((previous) => {
+      const next = new Set(previous);
+      if (next.has(tag)) next.delete(tag);
+      else next.add(tag);
+      return next;
+    });
+  };
+
+  const togglePageCandidates = () => {
+    setSelectedCandidates((previous) => {
+      const next = new Set(previous);
+      if (pagedCandidates.every((item) => next.has(item.tag))) {
+        for (const item of pagedCandidates) next.delete(item.tag);
+      } else {
+        for (const item of pagedCandidates) next.add(item.tag);
+      }
+      return next;
+    });
+  };
+
+  const promoteSelectedCandidates = async () => {
+    if (tagActionBusy || selectedCandidates.size === 0) return;
+
+    const tags = [...selectedCandidates];
+    const chunkSize = 100;
+    setTagActionBusy('__bulk__');
+    setError(null);
+    setNotice(`正在转正 0 / ${tags.length}`);
+
+    try {
+      for (let index = 0; index < tags.length; index += chunkSize) {
+        const chunk = tags.slice(index, index + chunkSize);
+        const response = await fetch('/api/admin/tag-candidates', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'promote', tags: chunk }),
+        });
+
+        if (response.status === 401) {
+          window.location.reload();
+          return;
+        }
+
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              tagCandidates?: AdminData['tagCandidates'];
+              tags?: AdminData['tags'];
+              error?: string;
+            }
+          | null;
+
+        if (!response.ok) {
+          throw new Error(payload?.error ?? `HTTP ${response.status}`);
+        }
+
+        setData((previous) =>
+          previous
+            ? {
+                ...previous,
+                tagCandidates:
+                  payload?.tagCandidates ?? previous.tagCandidates,
+                tags: payload?.tags ?? previous.tags,
+              }
+            : previous,
+        );
+        setNotice(
+          `正在转正 ${Math.min(index + chunk.length, tags.length)} / ${tags.length}`,
+        );
+      }
+
+      setSelectedCandidates(new Set());
+      setNotice(`已转正 ${tags.length} 个标签`);
+      window.setTimeout(() => setNotice(null), 3000);
+    } catch (actionError) {
+      setError(
+        actionError instanceof Error ? actionError.message : '批量转正失败',
+      );
+    } finally {
+      setTagActionBusy(null);
+    }
+  };
+
+  const blockSelectedCandidates = async () => {
+    if (tagActionBusy || selectedCandidates.size === 0) return;
+
+    const tags = [...selectedCandidates];
+    const chunkSize = 100;
+    setTagActionBusy('__bulk_block__');
+    setError(null);
+    setNotice(`正在屏蔽 0 / ${tags.length}`);
+
+    try {
+      for (let index = 0; index < tags.length; index += chunkSize) {
+        const chunk = tags.slice(index, index + chunkSize);
+        const response = await fetch('/api/admin/tag-candidates', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'block', tags: chunk }),
+        });
+
+        if (response.status === 401) {
+          window.location.reload();
+          return;
+        }
+
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              tagCandidates?: AdminData['tagCandidates'];
+              tags?: AdminData['tags'];
+              error?: string;
+            }
+          | null;
+
+        if (!response.ok) {
+          throw new Error(payload?.error ?? `HTTP ${response.status}`);
+        }
+
+        setData((previous) =>
+          previous
+            ? {
+                ...previous,
+                tagCandidates:
+                  payload?.tagCandidates ?? previous.tagCandidates,
+                tags: payload?.tags ?? previous.tags,
+              }
+            : previous,
+        );
+        setNotice(
+          `正在屏蔽 ${Math.min(index + chunk.length, tags.length)} / ${tags.length}`,
+        );
+      }
+
+      setSelectedCandidates(new Set());
+      setNotice(`已屏蔽 ${tags.length} 个标签`);
+      window.setTimeout(() => setNotice(null), 3000);
+    } catch (actionError) {
+      setError(
+        actionError instanceof Error ? actionError.message : '批量屏蔽失败',
+      );
+    } finally {
+      setTagActionBusy(null);
+    }
+  };
 
   const move = (index: number, delta: number) => {
     setSources((previous) => {
@@ -788,6 +956,12 @@ export function AdminDashboard() {
             }
           : previous,
       );
+      setSelectedCandidates((previous) => {
+        if (!previous.has(tag)) return previous;
+        const next = new Set(previous);
+        next.delete(tag);
+        return next;
+      });
       setNotice(
         action === 'promote'
           ? `已转正「${tag}」`
@@ -1742,8 +1916,61 @@ export function AdminDashboard() {
               暂无待审核候选
             </p>
           ) : (
-            <div className="mt-3 space-y-2">
-              {pendingTagCandidates.map((item) => {
+            <>
+              <p className="mt-3 text-[11px] text-slate-500">
+                共 {pendingTagCandidates.length} 条待审核，按使用次数从高到低排列。
+              </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-line bg-slate-50 px-3 py-2">
+                <label className="flex items-center gap-1.5 text-[11px] text-slate-600">
+                  <input
+                    type="checkbox"
+                    className="size-3.5 accent-gold"
+                    checked={allPageCandidatesSelected}
+                    onChange={togglePageCandidates}
+                  />
+                  全选本页
+                </label>
+                <span className="text-[11px] tabular-nums text-slate-500">
+                  已选 {selectedCandidates.size} 条
+                </span>
+                <div className="ml-auto flex items-center gap-1.5">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      selectedCandidates.size === 0 || tagActionBusy !== null
+                    }
+                    onClick={() => setSelectedCandidates(new Set())}
+                  >
+                    清空
+                  </Button>
+                  <Button
+                    size="sm"
+                    disabled={
+                      selectedCandidates.size === 0 || tagActionBusy !== null
+                    }
+                    onClick={() => void promoteSelectedCandidates()}
+                  >
+                    {tagActionBusy === '__bulk__'
+                      ? '转正中…'
+                      : `转正所选（${selectedCandidates.size}）`}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={
+                      selectedCandidates.size === 0 || tagActionBusy !== null
+                    }
+                    onClick={() => void blockSelectedCandidates()}
+                  >
+                    {tagActionBusy === '__bulk_block__'
+                      ? '屏蔽中…'
+                      : `屏蔽所选（${selectedCandidates.size}）`}
+                  </Button>
+                </div>
+              </div>
+              <div className="mt-2 space-y-2">
+              {pagedCandidates.map((item) => {
                 const ready =
                   item.count >= (data?.tags.promoteThreshold ?? 3);
                 const busy = tagActionBusy === item.tag;
@@ -1753,6 +1980,13 @@ export function AdminDashboard() {
                     key={item.tag}
                     className="flex flex-wrap items-center gap-2 rounded-xl border border-line bg-slate-50 px-3 py-2"
                   >
+                    <input
+                      type="checkbox"
+                      className="size-3.5 shrink-0 accent-gold"
+                      checked={selectedCandidates.has(item.tag)}
+                      onChange={() => toggleCandidate(item.tag)}
+                      aria-label={`选择 ${item.tag}`}
+                    />
                     <span className="text-sm font-medium text-ink">
                       {item.tag}
                     </span>
@@ -1793,7 +2027,40 @@ export function AdminDashboard() {
                   </div>
                 );
               })}
-            </div>
+              </div>
+              {candidateTotalPages > 1 && (
+                <div className="mt-3 flex items-center justify-center gap-2 text-[11px] text-slate-500">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={currentCandidatePage <= 1}
+                    onClick={() =>
+                      setCandidatePage(Math.max(1, currentCandidatePage - 1))
+                    }
+                  >
+                    上一页
+                  </Button>
+                  <span className="tabular-nums">
+                    第 {currentCandidatePage} / {candidateTotalPages} 页
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={currentCandidatePage >= candidateTotalPages}
+                    onClick={() =>
+                      setCandidatePage(
+                        Math.min(
+                          candidateTotalPages,
+                          currentCandidatePage + 1,
+                        ),
+                      )
+                    }
+                  >
+                    下一页
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </CollapsibleSection>
 
