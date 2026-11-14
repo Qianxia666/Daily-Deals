@@ -10,9 +10,17 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-| 桌面端 | 移动端 |
+| 桌面端首页 | 关键词搜索 |
 | --- | --- |
-| ![桌面端首页](screenshots/desktop-overview.png) | ![移动端首页](screenshots/mobile-375.png) |
+| ![桌面端首页](screenshots/desktop-home.png) | ![关键词搜索](screenshots/desktop-search.png) |
+
+| 标签落地页 | 优惠详情页 |
+| --- | --- |
+| ![标签落地页](screenshots/desktop-tag.png) | ![优惠详情页](screenshots/desktop-deal.png) |
+
+| 移动端首页 | 移动端详情页 |
+| --- | --- |
+| <img src="screenshots/mobile-home.png" width="330" alt="移动端首页" /> | <img src="screenshots/mobile-deal.png" width="330" alt="移动端详情页" /> |
 
 ## 目录
 
@@ -415,6 +423,16 @@ npm run build
 npm start
 ```
 
+### 重新生成界面截图
+
+README 里的截图由 `scripts/screenshots.mjs` 生成（只依赖 `playwright-core` + 本机 Chrome）：
+
+```bash
+SITE_BASE=https://example.com CHROME_PATH=/path/to/chrome npm run screenshots
+```
+
+脚本会预置偏好缓存，避免首页首次访问弹出「选择感兴趣的品类」遮罩；输出固定写到 `screenshots/`。
+
 ## 升级与维护
 
 ```bash
@@ -450,6 +468,7 @@ lib/notify.ts        飞书 / 企业微信 / 钉钉 / Bark 渠道
 lib/digest.ts        每日汇总与超限合并
 lib/scheduler.ts     抓取调度、摘要富化与推送任务
 lib/admin.ts         后台登录态与权限
+scripts/             开发辅助脚本（截图生成等）
 data/                数据库与备份（不提交）
 docker-compose.yml   单容器编排
 ```
