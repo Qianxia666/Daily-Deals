@@ -6,9 +6,11 @@ import {
 } from './runtime-settings';
 
 const LAST_BACKUP_KEY = 'backup:last_at';
+let backupRunning = false;
 
 /** 到点则生成一份 SQLite 快照；失败只记录日志，不影响抓取。 */
-export function runBackupIfDue(): void {
+export async function runBackupIfDue(): Promise<void> {
+  if (backupRunning) return;
   if (!getRuntimeBool('BACKUP_ENABLED', true)) return;
 
   const intervalMs =
@@ -19,8 +21,9 @@ export function runBackupIfDue(): void {
   const dir = getRuntimeEnv('BACKUP_DIR', './data/backups');
   const keep = getRuntimeEnvNumber('BACKUP_KEEP', 7, 1, 30);
 
+  backupRunning = true;
   try {
-    const file = backupDatabase(dir, keep);
+    const file = await backupDatabase(dir, keep);
     setSetting(LAST_BACKUP_KEY, new Date().toISOString());
     console.log(`[backup] saved=${file} keep=${keep}`);
   } catch (error) {
@@ -29,5 +32,7 @@ export function runBackupIfDue(): void {
         error instanceof Error ? error.message : String(error)
       }`,
     );
+  } finally {
+    backupRunning = false;
   }
 }

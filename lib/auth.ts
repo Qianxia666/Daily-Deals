@@ -24,7 +24,7 @@ export function isValidEmail(value: string): boolean {
 }
 
 export function isValidPassword(value: string): boolean {
-  return value.length >= 6 && value.length <= 72;
+  return value.length >= 8 && value.length <= 72;
 }
 
 export async function hashPassword(
@@ -89,12 +89,16 @@ export function applySessionCookie(
   session: SessionStart,
   request: NextRequest,
 ): void {
+  const forwardedProto = request.headers.get('x-forwarded-proto') ?? '';
+  const secure =
+    forwardedProto.split(',')[0]?.trim() === 'https' ||
+    request.nextUrl.protocol === 'https:';
   response.cookies.set(SESSION_COOKIE, session.token, {
     httpOnly: true,
     sameSite: 'lax',
     path: '/',
     maxAge: SESSION_DAYS * 24 * 60 * 60,
-    secure: request.nextUrl.protocol === 'https:',
+    secure,
   });
 }
 

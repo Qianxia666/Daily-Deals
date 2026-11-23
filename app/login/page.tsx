@@ -25,6 +25,17 @@ function safeNext(value: string | string[] | undefined): string {
   if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) {
     return '/account';
   }
+  // 浏览器解析 URL 时会移除制表符/换行，"/\n/evil.com" 会变成 "//evil.com"。
+  if (/[\u0000-\u001f\u007f\s]/.test(raw)) {
+    return '/account';
+  }
+  // 最终用 URL 解析确认仍是同源路径，避免其它形式的协议相对地址绕过。
+  try {
+    const target = new URL(raw, 'http://site.invalid');
+    if (target.origin !== 'http://site.invalid') return '/account';
+  } catch {
+    return '/account';
+  }
   return raw;
 }
 

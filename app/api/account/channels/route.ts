@@ -9,7 +9,12 @@ import {
   updateChannel,
 } from '@/lib/db';
 import { CHANNEL_LABELS, sendNotification, validateWebhook } from '@/lib/notify';
-import { getAccountLimits, getSiteSettings } from '@/lib/runtime-settings';
+import {
+  getAccountLimits,
+  getRuntimeBool,
+  getSiteSettings,
+} from '@/lib/runtime-settings';
+import { checkRateLimit } from '@/lib/rate-limit';
 import type { ChannelKind } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -119,7 +124,7 @@ export async function PATCH(request: NextRequest) {
     | null;
 
   const id = Number(body?.id);
-  if (!Number.isInteger(id)) {
+  if (!Number.isSafeInteger(id) || id <= 0) {
     return NextResponse.json({ error: '参数错误' }, { status: 400 });
   }
 
@@ -132,8 +137,12 @@ export async function PATCH(request: NextRequest) {
     typeof body?.webhook === 'string' && body.webhook.trim()
       ? body.webhook.trim().slice(0, 500)
       : undefined;
-  if (webhook) {
-    const error = validateTarget(current.kind, webhook, '');
+  const key =
+    typeof body?.key === 'string' && body.key.trim()
+      ? body.key.trim().slice(0, 300)
+      : undefined;
+  if (webhook || key) {
+    const error = validateTarget(current.kind, webhook ?? '', key ?? '');
     if (error) return NextResponse.json({ error }, { status: 400 });
   }
 
@@ -155,7 +164,6 @@ export async function PATCH(request: NextRequest) {
         ? body.key.trim().slice(0, 300)
         : undefined,
   });
-
   if (!ok) return NextResponse.json({ error: '渠道不存在' }, { status: 404 });
   return NextResponse.json({ ok: true });
 }
@@ -168,7 +176,7 @@ export async function DELETE(request: NextRequest) {
     | { id?: unknown }
     | null;
   const id = Number(body?.id);
-  if (!Number.isInteger(id)) {
+  if (!Number.isSafeInteger(id) || id <= 0) {
     return NextResponse.json({ error: '参数错误' }, { status: 400 });
   }
 
@@ -187,8 +195,21 @@ export async function PUT(request: NextRequest) {
     | { id?: unknown }
     | null;
   const id = Number(body?.id);
-  if (!Number.isInteger(id)) {
+  if (!Number.isSafeInteger(id) || id <= 0) {
     return NextResponse.json({ error: '参数错误' }, { status: 400 });
+  }
+
+  if (getRuntimeBool('RATE_LIMIT_ENABLED', true)) {
+    const limit = checkRateLimit(`push-test:${user.id}`, 5);
+    if (!limit.ok) {
+      return NextResponse.json(
+        { error: '测试过于频繁，请稍后再试' },
+        {
+          status: 429,
+          headers: { 'Retry-After': String(limit.retryAfter) },
+        },
+      );
+    }
   }
 
   const channel = getChannelSecret(user.id, id);

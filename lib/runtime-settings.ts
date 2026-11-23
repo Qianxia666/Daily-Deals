@@ -1312,11 +1312,13 @@ export function getRuntimeEnv(key: string, fallback = ''): string {
   return raw === null ? fallback : raw;
 }
 
-/** 读取布尔型开关，只有显式填写 false 才视为关闭。 */
+/** 读取布尔型开关：0/false/no/off/disabled 均视为关闭，其余视为开启。 */
 export function getRuntimeBool(key: string, fallback = true): boolean {
   const raw = getRuntimeEnvRaw(key);
   if (raw === null || raw.trim() === '') return fallback;
-  return raw.trim() !== 'false';
+  return !['0', 'false', 'no', 'off', 'disabled'].includes(
+    raw.trim().toLowerCase(),
+  );
 }
 
 export function getRuntimeEnvNumber(

@@ -18,11 +18,31 @@ export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 export async function POST(request: NextRequest) {
+  const declared = Number(request.headers.get('content-length') ?? 0);
+  if (Number.isFinite(declared) && declared > 16_384) {
+    return NextResponse.json({ error: '请求体过大' }, { status: 413 });
+  }
+
   if (getRuntimeBool('RATE_LIMIT_ENABLED', true)) {
-    const result = checkRateLimit(
-      `login:${getClientIp(request)}`,
-      getRuntimeEnvNumber('ADMIN_LOGIN_RATE_LIMIT_PER_MINUTE', 5, 1, 60),
+    const limit = getRuntimeEnvNumber(
+      'ADMIN_LOGIN_RATE_LIMIT_PER_MINUTE',
+      5,
+      1,
+      60,
     );
+    if (process.env.TRUST_PROXY !== '1') {
+      const global = checkRateLimit('login:global', 60);
+      if (!global.ok) {
+        return NextResponse.json(
+          { error: '尝试过于频繁，请稍后再试' },
+          {
+            status: 429,
+            headers: { 'Retry-After': String(global.retryAfter) },
+          },
+        );
+      }
+    }
+    const result = checkRateLimit(`login:${getClientIp(request)}`, limit);
     if (!result.ok) {
       return NextResponse.json(
         { error: '尝试过于频繁，请稍后再试' },
@@ -42,8 +62,8 @@ export async function POST(request: NextRequest) {
     typeof body?.email === 'string' ? normalizeEmail(body.email) : '';
   const password = typeof body?.password === 'string' ? body.password : '';
 
-  if (!isValidEmail(email) || !password) {
-    return NextResponse.json({ error: '请输入邮箱和密码' }, { status: 400 });
+  if (!isValidEmail(email) || !password || password.length > 72) {
+    return NextResponse.json({ error: '邮箱或密码错误' }, { status: 401 });
   }
 
   const record = getUserAuthByEmail(email);
@@ -55,7 +75,7 @@ export async function POST(request: NextRequest) {
   if (!record || !valid) {
     await new Promise((resolve) => setTimeout(resolve, 300));
     return NextResponse.json(
-      { error: record?.disabled ? '该账号已被管理员禁用' : '邮箱或密码错误' },
+      { error: '邮箱或密码错误' },
       { status: 401 },
     );
   }

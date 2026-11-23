@@ -15,6 +15,7 @@ import {
   markDigestSent,
   matchDealToSubscriptions,
   pruneDailyDigests,
+  pruneRuntimeRecords,
   setDigestLastRun,
   type PendingDelivery,
   type SiteDigestDeal,
@@ -32,7 +33,16 @@ import type { DigestItem } from './types';
 const runtime = globalThis as typeof globalThis & {
   __dailyDealsDeliveryRunning?: boolean;
   __dailyDealsDigestRunning?: boolean;
+  __dailyDealsSentButUnmarked?: Set<number>;
 };
+
+/** 消息已发出但“标记已发送”写库失败时，记录在此避免下一轮重复推送。 */
+function sentButUnmarkedSet(): Set<number> {
+  if (!runtime.__dailyDealsSentButUnmarked) {
+    runtime.__dailyDealsSentButUnmarked = new Set<number>();
+  }
+  return runtime.__dailyDealsSentButUnmarked;
+}
 
 const DEFAULT_OVERFLOW_TIME = '20:30';
 const DEFAULT_SITE_TIME = '21:00';
@@ -44,7 +54,11 @@ function shanghaiNow(): { date: string; time: string } {
 }
 
 function runtimeEnabled(key: string): boolean {
-  return (getRuntimeEnvRaw(key) ?? 'true') !== 'false';
+  const raw = getRuntimeEnvRaw(key);
+  if (raw === null || raw.trim() === '') return true;
+  return !['0', 'false', 'no', 'off', 'disabled'].includes(
+    raw.trim().toLowerCase(),
+  );
 }
 
 function runtimeTime(key: string, fallback: string): string {
@@ -108,8 +122,20 @@ export async function deliverPending(): Promise<void> {
 
   try {
     const sentByUser = new Map<number, number>();
+    // 消息已发出但状态写库失败时，避免下一轮重复推送；此处仅重试标记。
+    const sentButUnmarked = sentButUnmarkedSet();
 
     for (const item of pending) {
+      if (sentButUnmarked.has(item.id)) {
+        try {
+          markDeliverySent(item.id);
+          sentButUnmarked.delete(item.id);
+        } catch {
+          // 继续留在集合里，下一轮再试。
+        }
+        continue;
+      }
+
       const sent = sentByUser.get(item.userId) ?? countUserPushesToday(item.userId);
       if (sent >= limits.dailyPush) {
         // 超出今日限额的留在队列，20:30 合并推送；不会顺延到次日。
@@ -138,7 +164,17 @@ export async function deliverPending(): Promise<void> {
             group: keyword,
           },
         );
-        markDeliverySent(item.id);
+        try {
+          markDeliverySent(item.id);
+        } catch (markError) {
+          // 已成功发出，先记入集合，下一轮只重试标记，不再重复推送。
+          sentButUnmarked.add(item.id);
+          console.warn(
+            `[delivery] 标记已发送失败 id=${item.id}：${
+              markError instanceof Error ? markError.message : markError
+            }`,
+          );
+        }
         sentByUser.set(item.userId, sent + 1);
       } catch (error) {
         markDeliveryFailed(
@@ -204,7 +240,23 @@ export async function runOverflowDigest(date: string): Promise<void> {
   if (!runtimeEnabled('DIGEST_OVERFLOW_ENABLED')) return;
 
   ensurePublicDigest(date);
-  const pending = listPendingDeliveries(500);
+
+  // 单次 LIMIT 会把超过上限的条目留在队列里被静默丢弃，
+  // 这里按 id 游标分批把整个待投递队列取完；安全上限防止异常数据导致死循环。
+  const BATCH_SIZE = 500;
+  const MAX_ITEMS = 50_000;
+  const pending: PendingDelivery[] = [];
+  let afterId: number | undefined;
+  while (pending.length < MAX_ITEMS) {
+    const batch = listPendingDeliveries(
+      BATCH_SIZE,
+      afterId === undefined ? {} : { afterId },
+    );
+    if (batch.length === 0) break;
+    pending.push(...batch);
+    afterId = batch[batch.length - 1].id;
+    if (batch.length < BATCH_SIZE) break;
+  }
   if (pending.length === 0) return;
 
   const limits = getAccountLimits();
@@ -356,11 +408,20 @@ export async function deliverPendingDigests(): Promise<void> {
         );
         markDigestSent(digest.id);
         if (digest.kind === 'overflow') {
-          markDeliveriesDigested(
-            digest.userId,
-            digest.channelId,
-            digest.items.map((item) => item.dealId),
-          );
+          try {
+            markDeliveriesDigested(
+              digest.userId,
+              digest.channelId,
+              digest.items.map((item) => item.dealId),
+            );
+          } catch (markError) {
+            // 消息已发出，后续标记失败不能把摘要改回待发送，否则下一轮会重复推送。
+            console.warn(
+              `[digest] 标记已合并失败 id=${digest.id}：${
+                markError instanceof Error ? markError.message : markError
+              }`,
+            );
+          }
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -415,6 +476,7 @@ export async function runScheduledDigests(): Promise<void> {
     } finally {
       setDigestLastRun('site', date);
       pruneDailyDigests(30);
+      pruneRuntimeRecords();
     }
   }
 }

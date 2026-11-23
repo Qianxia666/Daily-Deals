@@ -13,18 +13,18 @@ export async function generateMetadata(): Promise<Metadata> {
       : site.title;
 
   return {
-    metadataBase: new URL(origin),
+    ...(origin ? { metadataBase: new URL(origin) } : {}),
     title,
     description: site.tagline,
     applicationName: site.title,
     alternates: {
-      canonical: '/',
+      ...(origin ? { canonical: '/' } : {}),
       types: { 'application/rss+xml': '/feed.xml' },
     },
     openGraph: {
       title,
       description: site.tagline,
-      url: '/',
+      ...(origin ? { url: '/' } : {}),
       siteName: site.title,
       locale: 'zh_CN',
       type: 'website',

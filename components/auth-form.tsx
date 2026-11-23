@@ -157,14 +157,14 @@ export function AuthForm({
                 <Input
                   type="password"
                   required
-                  minLength={6}
+                  minLength={mode === 'register' ? 8 : 1}
                   maxLength={72}
                   autoComplete={
                     mode === 'login' ? 'current-password' : 'new-password'
                   }
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
-                  placeholder="至少 6 位"
+                  placeholder={mode === 'register' ? '至少 8 位' : '请输入密码'}
                   className="pl-10"
                 />
               </div>

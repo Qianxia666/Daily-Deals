@@ -150,11 +150,14 @@ export function buildPublicDigest(date: string): PublicDigest {
   ).length;
   const label = parts ? `${parts.month}月${parts.day}日` : date;
 
+  // 侧边热词只保留实际有分组的条目，避免出现指向不存在锚点的死链。
+  const visibleTags = ranked.filter((_, index) => buckets[index].length > 0);
+
   return {
     date,
     title: `${label}优惠汇总`,
     stats: [`当日收录 ${deals.length} 条，其中在架 ${active} 条`],
-    tags: ranked,
+    tags: visibleTags,
     groups,
   };
 }
@@ -166,7 +169,9 @@ export function ensurePublicDigest(date: string): PublicDigest {
     return existing;
   }
   const digest = buildPublicDigest(date);
-  savePublicDigest(digest);
+  // 空日期不落库：/digest/[date] 是未鉴权 GET，任意合法历史日期都会触发
+  // 全表扫描；若再逐日写入 public_digests，可被枚举出大量空快照。
+  if (digest.groups.length > 0) savePublicDigest(digest);
   return digest;
 }
 

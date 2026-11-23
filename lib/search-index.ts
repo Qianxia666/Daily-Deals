@@ -331,7 +331,12 @@ export function startSearchIndexRebuild(
 
         db.exec('BEGIN');
         try {
-          for (const row of rows) insertRow(db, row, maxChars);
+          for (const row of rows) {
+            // 重建期间新入库的条目可能已被 indexDealById 写入；
+            // 先删再插，避免同一 rowid 重复插入导致 FTS5 约束错误中断整个重建。
+            deleteRow(db, row.id);
+            insertRow(db, row, maxChars);
+          }
           db.exec('COMMIT');
         } catch (error) {
           db.exec('ROLLBACK');
@@ -423,14 +428,14 @@ export function ensureSearchIndex(
   ).count;
 
   if (version !== SEARCH_INDEX_VERSION || indexed !== deals) {
-    // 后台重建进行中时不要同步重建，避免并发清空/写入同一张表。
-    if (getProgress().running) return true;
-
-    const started = Date.now();
-    const total = rebuildSearchIndex(db, maxChars);
-    console.log(
-      `[search-index] rebuilt rows=${total} ms=${Date.now() - started}`,
-    );
+    // 重建一律放到后台，避免首个请求被全量索引阻塞；
+    // 重建期间 searchDealsByFts 会返回 null，查询自动回退到关键词扫描。
+    if (!getProgress().running) {
+      const progress = startSearchIndexRebuild(db, maxChars);
+      console.log(
+        `[search-index] background rebuild started total=${progress.total}`,
+      );
+    }
   }
 
   return true;
@@ -579,6 +584,9 @@ export function searchDealsByFts(
       )
       .all(match, ...scope.params, Math.min(options.limit, 500)) as RawSearchRow[];
 
+    // 后台重建期间索引不完整，任何查询都回退到扫描，避免返回残缺结果。
+    if (getProgress().running) return null;
+
     return rows.map(mapSearchRow);
   } catch (error) {
     console.warn('[search-index] FTS query failed', error);
@@ -600,10 +608,15 @@ export function searchDealsByTag(
          FROM deals d
          LEFT JOIN sources s ON s.id = d.source
          WHERE (
-           EXISTS (SELECT 1 FROM json_each(d.tags) WHERE json_each.value = ?)
+           EXISTS (
+             SELECT 1 FROM json_each(
+               CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END
+             ) WHERE json_each.value = ?
+           )
            OR EXISTS (
-             SELECT 1 FROM json_each(d.proposed_tags)
-             WHERE json_each.value = ?
+             SELECT 1 FROM json_each(
+               CASE WHEN json_valid(d.proposed_tags) THEN d.proposed_tags ELSE '[]' END
+             ) WHERE json_each.value = ?
            )
          )
          ${scope.sql}

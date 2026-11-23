@@ -1,22 +1,22 @@
-import { headers } from 'next/headers';
 import { getSiteUrl } from './runtime-settings';
 
 /**
  * 站点 Origin，用于 canonical、Open Graph、sitemap 与 robots。
- * 后台「站点公开地址」优先，保证反代、IP 直连等场景下输出稳定的正式域名；
- * 未配置时再回退到请求头推导。
+ * 只采用后台「站点公开地址」；未配置或非法时返回 null，
+ * 调用方应省略绝对链接，避免把可伪造的 Host 头写进页面与站点地图。
  */
-export async function getSiteOrigin(): Promise<string> {
+/** 只接受 http(s) 且可被 URL 解析的地址，避免错误配置让整站渲染抛错。 */
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+export async function getSiteOrigin(): Promise<string | null> {
   const configured = getSiteUrl();
-  if (configured) return configured;
-
-  const headerStore = await headers();
-  const host =
-    headerStore.get('x-forwarded-host')?.split(',')[0]?.trim() ||
-    headerStore.get('host') ||
-    'localhost:3000';
-  const proto =
-    headerStore.get('x-forwarded-proto')?.split(',')[0]?.trim() || 'http';
-
-  return `${proto}://${host}`;
+  if (configured && isHttpUrl(configured)) return configured;
+  return null;
 }

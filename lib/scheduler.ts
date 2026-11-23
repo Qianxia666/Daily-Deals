@@ -30,8 +30,8 @@ import {
 import { startBodyBackfillWorker } from './body-backfill';
 import {
   getGlobalIntervalMinutes,
+  getRuntimeBool,
   getRuntimeEnvNumber,
-  getRuntimeEnvRaw,
 } from './runtime-settings';
 import { SOURCE_TIMEOUT_MS } from './sources';
 import { getEmbeddingConfig } from './embeddings';
@@ -240,7 +240,7 @@ export function startScheduler(): void {
 
   const tick = () => {
     try {
-      runBackupIfDue();
+      void runBackupIfDue();
 
       const due = dueSources();
       if (due.length === 0) return;
@@ -342,9 +342,7 @@ export function startScheduler(): void {
       // 扩展补上之前抓到的文章不会自动重匹配，这里回扫最近 3 小时补齐。
       if (expanded > 0) {
         const created = backfillRecentDeals(180, {
-          expand:
-            (getRuntimeEnvRaw('SUBSCRIPTION_MATCH_EXPAND_ENABLED') ?? 'true') !==
-            'false',
+          expand: getRuntimeBool('SUBSCRIPTION_MATCH_EXPAND_ENABLED', true),
           minScore: getRuntimeEnvNumber(
             'SUBSCRIPTION_MATCH_MIN_SCORE',
             2,

@@ -199,9 +199,11 @@ export function DealsApp({
           if (Array.isArray(record.sources)) {
             setSelectedSources(
               new Set(
-                record.sources.filter(
-                  (value): value is string => typeof value === 'string',
-                ),
+                record.sources
+                  .filter(
+                    (value): value is string => typeof value === 'string',
+                  )
+                  .slice(0, 50),
               ),
             );
           }
@@ -242,6 +244,16 @@ export function DealsApp({
       // 浏览器禁用存储时静默降级为仅当前页面生效。
     }
   }, [filtersReady, selectedSources, favoritesOnly, preferencesOnly]);
+
+  // 首屏数据到达后丢弃本地缓存里已不存在的来源，避免筛选永远为空。
+  useEffect(() => {
+    if (!data) return;
+    const known = new Set<SourceId>(data.sources.map((source) => source.id));
+    setSelectedSources((previous) => {
+      const next = new Set([...previous].filter((id) => known.has(id)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [data]);
 
   // 首次进入且从未选择过偏好时，等首屏加载完成后再弹窗。
   useEffect(() => {
@@ -289,18 +301,46 @@ export function DealsApp({
         if (emptyIds) {
           params.set('metaOnly', '1');
         } else {
-          params.set('ids', ids.slice(0, 500).join(','));
           params.delete('cursor');
         }
       }
 
       try {
-        const response = await fetch(`/api/deals?${params.toString()}`, {
-          cache: 'no-store',
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        let payload: DealsListResponse;
+        if (ids && !emptyIds && ids.length > 500) {
+          // 收藏可能超过单次 500 条上限，按块请求后合并，避免静默丢条目。
+          const chunks: number[][] = [];
+          for (let index = 0; index < ids.length; index += 500) {
+            chunks.push(ids.slice(index, index + 500));
+          }
+          const pages = await Promise.all(
+            chunks.map(async (chunk) => {
+              const chunkParams = new URLSearchParams(params);
+              chunkParams.set('ids', chunk.join(','));
+              const response = await fetch(
+                `/api/deals?${chunkParams.toString()}`,
+                { cache: 'no-store' },
+              );
+              if (!response.ok) throw new Error(`HTTP ${response.status}`);
+              return (await response.json()) as DealsListResponse;
+            }),
+          );
+          payload = {
+            ...pages[0],
+            items: pages.flatMap((page) => page.items),
+            total: pages.reduce((sum, page) => sum + page.items.length, 0),
+            hasMore: false,
+            nextCursor: null,
+          };
+        } else {
+          if (ids && !emptyIds) params.set('ids', ids.join(','));
+          const response = await fetch(`/api/deals?${params.toString()}`, {
+            cache: 'no-store',
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          payload = (await response.json()) as DealsListResponse;
+        }
 
-        const payload = (await response.json()) as DealsListResponse;
         const items = payload.items.map((item) => {
           const override = localStatesRef.current[item.id];
           return override ? { ...item, ...override } : item;
@@ -578,6 +618,8 @@ export function DealsApp({
       sessionStorage.setItem(PENDING_SEARCH_KEY, query);
     } catch {
       // 浏览器禁用存储时退化为直接带参跳转。
+      router.push(`/search?q=${encodeURIComponent(query)}`);
+      return;
     }
     router.push('/search');
   }, [router, searchInput]);

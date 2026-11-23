@@ -5,6 +5,7 @@ import {
   getRuntimeEnvFloat,
   getRuntimeEnvNumber,
 } from './runtime-settings';
+import { request, readResponseText } from './http';
 
 /** 单次请求的文本条数，8B 模型下 16 条大约 8~10 秒。 */
 const BATCH_SIZE = 16;
@@ -75,35 +76,37 @@ export function vectorToBuffer(vector: Float32Array): Buffer {
 }
 
 export function bufferToVector(buffer: Buffer): Float32Array {
-  return new Float32Array(
-    buffer.buffer,
-    buffer.byteOffset,
-    Math.floor(buffer.byteLength / 4),
-  );
+  // SQLite 返回的 Buffer 可能不是 4 字节对齐的独立 ArrayBuffer，必须先复制。
+  const aligned = new ArrayBuffer(Math.floor(buffer.byteLength / 4) * 4);
+  new Uint8Array(aligned).set(buffer.subarray(0, aligned.byteLength));
+  return new Float32Array(aligned);
 }
 
 async function requestBatch(
   texts: string[],
   config: EmbeddingConfig,
 ): Promise<Float32Array[]> {
-  const response = await fetch(resolveEndpoint(config.url), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.key}`,
+  const response = await request(
+    resolveEndpoint(config.url),
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.key}`,
+      },
+      body: JSON.stringify({ model: config.model, input: texts }),
     },
-    body: JSON.stringify({ model: config.model, input: texts }),
-    signal: AbortSignal.timeout(config.timeoutMs),
-  });
+    config.timeoutMs,
+  );
 
   if (!response.ok) {
-    const detail = await response.text().catch(() => '');
+    const detail = await readResponseText(response).catch(() => '');
     throw new Error(
       `embedding HTTP ${response.status} ${detail.slice(0, 200)}`,
     );
   }
 
-  const payload = (await response.json()) as {
+  const payload = JSON.parse(await readResponseText(response)) as {
     data?: { embedding?: number[]; index?: number }[];
   };
   const data = payload.data;

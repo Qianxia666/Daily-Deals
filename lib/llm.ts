@@ -7,7 +7,7 @@ import {
   type AiPendingDeal,
   type AiTagPendingDeal,
 } from './db';
-import { request } from './http';
+import { readResponseText, request } from './http';
 import { matchSubscriptionsForDeal } from './delivery';
 import {
   getAiKeywordExpandTimeoutMs,
@@ -20,6 +20,7 @@ import {
   getAiTagsProposeEnabled,
   getAiTagsProposeMax,
   getAiTagVocabulary,
+  getRuntimeBool,
   getRuntimeEnv,
   getRuntimeEnvNumber,
 } from './runtime-settings';
@@ -427,7 +428,7 @@ async function callModelBatch(
         config.timeoutMs,
       );
 
-      const body = await response.text();
+      const body = await readResponseText(response);
 
       if (!response.ok) {
         const retryable = response.status === 429 || response.status >= 500;
@@ -493,7 +494,7 @@ async function runPool<T>(
  * 只改写已有文本，不新增事实；失败条目保留至下一轮重试。
  */
 export async function enrichPendingDeals(): Promise<void> {
-  if (getRuntimeEnv('LLM_ENABLED', 'true').trim() === 'false') return;
+  if (!getRuntimeBool('LLM_ENABLED', true)) return;
 
   const config = readConfig();
   if (!config) return;
@@ -705,7 +706,7 @@ async function callTagModelBatch(
         config.tagTimeoutMs,
       );
 
-      const body = await response.text();
+      const body = await readResponseText(response);
       if (!response.ok) {
         const retryable = response.status === 429 || response.status >= 500;
         if (retryable && attempt === 0) {
@@ -756,7 +757,7 @@ export function startTagBackfill(force = false): TagRunProgress {
     });
 
   if (!getAiTagsEnabled()) return fail('品类标签已在后台关闭');
-  if (getRuntimeEnv('LLM_ENABLED', 'true').trim() === 'false') {
+  if (!getRuntimeBool('LLM_ENABLED', true)) {
     return fail('AI 摘要已关闭，无法生成标签');
   }
 
@@ -973,7 +974,7 @@ async function callSearchModel(
         config.searchTimeoutMs,
       );
 
-      const body = await response.text();
+      const body = await readResponseText(response);
       if (!response.ok) {
         const retryable = response.status === 429 || response.status >= 500;
         if (retryable && attempt === 0) {
@@ -1061,7 +1062,7 @@ export async function expandKeywordsWithAi(
         config.expandTimeoutMs,
       );
 
-      const body = await response.text();
+      const body = await readResponseText(response);
 
       if (!response.ok) {
         const retryable = response.status === 429 || response.status >= 500;
@@ -1127,7 +1128,7 @@ export async function searchDealsWithAi(
   deals: AiSearchDeal[],
   limit = 20,
 ): Promise<AiSearchSelection | null> {
-  if (getRuntimeEnv('AI_SEARCH_ENABLED', 'true').trim() === 'false') {
+  if (!getRuntimeBool('AI_SEARCH_ENABLED', true)) {
     return null;
   }
 
@@ -1205,7 +1206,7 @@ export async function rewriteSearchQuery(
   timeoutMs: number,
   vocabulary: string[] = [],
 ): Promise<string[]> {
-  if (getRuntimeEnv('AI_SEARCH_ENABLED', 'true').trim() === 'false') {
+  if (!getRuntimeBool('AI_SEARCH_ENABLED', true)) {
     return [];
   }
 
@@ -1253,7 +1254,7 @@ ${tags.join('、')}
     );
 
     if (!response.ok) return [];
-    const body = await response.text();
+    const body = await readResponseText(response);
     const data = JSON.parse(body) as {
       choices?: { message?: { content?: string } }[];
     };
@@ -1345,7 +1346,7 @@ export async function suggestTagsForQuery(
   timeoutMs: number,
 ): Promise<string[] | null> {
   if (limit <= 0 || vocabulary.length === 0) return [];
-  if (getRuntimeEnv('AI_SEARCH_ENABLED', 'true').trim() === 'false') {
+  if (!getRuntimeBool('AI_SEARCH_ENABLED', true)) {
     return null;
   }
 
@@ -1386,7 +1387,7 @@ export async function suggestTagsForQuery(
     );
 
     if (!response.ok) return null;
-    const body = await response.text();
+    const body = await readResponseText(response);
     const data = JSON.parse(body) as {
       choices?: { message?: { content?: string } }[];
     };

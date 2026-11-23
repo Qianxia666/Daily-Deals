@@ -77,7 +77,12 @@ export async function fetchXianbaoText(
   );
 
   if (response.status === 403) {
-    await response.arrayBuffer().catch(() => undefined);
+    // 仅释放连接，不读取正文：403 校验页可能很大，读入内存没有意义。
+    try {
+      await response.body?.cancel();
+    } catch {
+      // 取消失败不影响后续重试。
+    }
 
     if (absorbCookies(origin, setCookiesOf(response))) {
       response = await request(

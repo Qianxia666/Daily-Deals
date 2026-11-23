@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { request } from './http';
+import { assertPublicUrl, isPrivateIp, request, readResponseText } from './http';
 import { getRuntimeEnvRaw, getSiteSettings } from './runtime-settings';
 import type { ChannelKind } from './types';
 
@@ -40,21 +40,23 @@ const ALLOWED_HOSTS: Record<Exclude<ChannelKind, 'bark'>, string[]> = {
 const TIMEOUT_MS = 8_000;
 
 function allowAnyHost(): boolean {
-  return (getRuntimeEnvRaw('NOTIFY_ALLOW_ANY_HOST') ?? '').trim() === '1';
+  const value = (getRuntimeEnvRaw('NOTIFY_ALLOW_ANY_HOST') ?? '')
+    .trim()
+    .toLowerCase();
+  return value === '1' || value === 'true';
 }
 
 function isPrivateHost(hostname: string): boolean {
-  const host = hostname.toLowerCase();
-  return (
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (
     host === 'localhost' ||
-    host === '::1' ||
+    host.endsWith('.localhost') ||
     host.endsWith('.local') ||
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
-  );
+    host.endsWith('.internal')
+  ) {
+    return true;
+  }
+  return isPrivateIp(host);
 }
 
 /** 校验用户填写的 Webhook；返回错误文案，通过时返回 null。 */
@@ -85,7 +87,11 @@ export function validateWebhook(
 }
 
 function markdownLabel(value: string): string {
-  return value.replace(/[[\]]/g, '');
+  return value
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[[\]()<>@*_~|`\\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function markdownUrl(value: string): string {
@@ -210,15 +216,14 @@ function barkEndpoint(target: NotifyTarget): string {
     return raw;
   }
 
-  const error = allowAnyHost() ? null : 'Bark 只支持 https 地址';
-  if (error) throw new Error(error);
+  // 纯设备 Key 是 Bark 官方用法，固定走官方域名，不需要放开任意主机。
   return `https://api.day.app/${encodeURIComponent(raw)}`;
 }
 
-async function readJson(response: {
-  text(): Promise<string>;
-}): Promise<Record<string, unknown>> {
-  const text = await response.text();
+async function readJson(
+  response: Awaited<ReturnType<typeof request>>,
+): Promise<Record<string, unknown>> {
+  const text = await readResponseText(response);
   if (!text) return {};
   try {
     return JSON.parse(text) as Record<string, unknown>;
@@ -261,8 +266,10 @@ export async function sendNotification(
     ]
       .filter(Boolean)
       .join('\n');
+    const endpoint = barkEndpoint(target);
+    await assertPublicUrl(endpoint);
     const response = await request(
-      barkEndpoint(target),
+      endpoint,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -294,6 +301,7 @@ export async function sendNotification(
 
   const error = validateWebhook(target.kind, webhook);
   if (error) throw new Error(error);
+  await assertPublicUrl(webhook);
 
   if (target.kind === 'feishu') {
     const payload: Record<string, unknown> = {

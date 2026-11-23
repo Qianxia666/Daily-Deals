@@ -54,11 +54,14 @@ export async function PATCH(request: NextRequest) {
     | { id?: unknown; enabled?: unknown }
     | null;
   const id = Number(body?.id);
-  if (!Number.isInteger(id)) {
+  if (!Number.isSafeInteger(id) || id <= 0) {
     return NextResponse.json({ error: '参数错误' }, { status: 400 });
   }
+  if (typeof body?.enabled !== 'boolean') {
+    return NextResponse.json({ error: 'enabled 必须为布尔值' }, { status: 400 });
+  }
 
-  const ok = setSubscriptionEnabled(user.id, id, body?.enabled === true);
+  const ok = setSubscriptionEnabled(user.id, id, body.enabled);
   if (!ok) return NextResponse.json({ error: '订阅不存在' }, { status: 404 });
   return NextResponse.json({ ok: true });
 }
@@ -71,7 +74,7 @@ export async function DELETE(request: NextRequest) {
     | { id?: unknown }
     | null;
   const id = Number(body?.id);
-  if (!Number.isInteger(id)) {
+  if (!Number.isSafeInteger(id) || id <= 0) {
     return NextResponse.json({ error: '参数错误' }, { status: 400 });
   }
 

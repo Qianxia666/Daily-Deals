@@ -298,6 +298,17 @@ interface DealRow {
   favorite: number;
 }
 
+/**
+ * 公开列表查询只取渲染字段，刻意排除 vector/vector_model/vector_at 等 BLOB，
+ * 避免 SELECT d.* 把向量读出造成内存与序列化放大。
+ */
+const DEAL_SELECT_COLUMNS = `
+  d.id, d.link, d.title, d.description, d.source, d.expires_at,
+  d.published_at, d.is_new, d.first_seen_at, d.last_seen_at,
+  d.ai_title, d.ai_summary, d.ai_value, d.ai_action,
+  d.ai_model, d.ai_at, d.ai_tags_at, d.tags, d.proposed_tags, d.entities
+`.trim();
+
 interface ExistingDealRow {
   id: number;
   title: string;
@@ -682,6 +693,13 @@ export function deleteSource(id: string): boolean {
 
   const remove = db.transaction(() => {
     deleteDealIndexesForSource(db, id);
+    // 先清掉引用这些条目的投递与匹配记录，避免留下孤儿行。
+    db.prepare(
+      'DELETE FROM deliveries WHERE deal_id IN (SELECT id FROM deals WHERE source = ?)',
+    ).run(id);
+    db.prepare(
+      'DELETE FROM vector_match_log WHERE deal_id IN (SELECT id FROM deals WHERE source = ?)',
+    ).run(id);
     db.prepare('DELETE FROM deals WHERE source = ?').run(id);
     db.prepare('DELETE FROM source_status WHERE source = ?').run(id);
     db.prepare('UPDATE sources SET state = ?, updated_at = ? WHERE id = ?').run(
@@ -838,7 +856,9 @@ export function getDataRetentionDays(): number {
 export function getAiSearchEnabled(): boolean {
   const raw = getRuntimeEnvRaw('AI_SEARCH_ENABLED');
   if (raw === null || raw.trim() === '') return true;
-  return raw.trim() !== 'false';
+  return !['0', 'false', 'no', 'off', 'disabled'].includes(
+    raw.trim().toLowerCase(),
+  );
 }
 
 export function searchDealsForQuery(
@@ -889,9 +909,64 @@ export function pruneDeals(): number {
     )
     .run(now, cutoff);
 
-  if (result.changes > 0) optimizeSearchIndex(db);
+  if (result.changes > 0) {
+    // deals 删除后，投递与向量匹配记录里可能残留已不存在的 deal_id。
+    db.prepare(
+      'DELETE FROM deliveries WHERE deal_id NOT IN (SELECT id FROM deals)',
+    ).run();
+    db.prepare(
+      'DELETE FROM vector_match_log WHERE deal_id NOT IN (SELECT id FROM deals)',
+    ).run();
+    optimizeSearchIndex(db);
+  }
 
   return result.changes;
+}
+
+/**
+ * 清理运行时产生的日志型数据，避免长期运行后无限增长。
+ * - deliveries：已结束且超过保留天数的记录
+ * - vector_match_log：超过保留天数的匹配记录
+ * - fetch_runs：仅保留最近若干轮
+ */
+export function pruneRuntimeRecords(options?: {
+  finishedDays?: number;
+  matchLogDays?: number;
+  keepFetchRuns?: number;
+}): void {
+  const finishedDays = Math.min(Math.max(options?.finishedDays ?? 30, 1), 365);
+  const matchLogDays = Math.min(Math.max(options?.matchLogDays ?? 30, 1), 365);
+  const keepFetchRuns = Math.min(
+    Math.max(options?.keepFetchRuns ?? 2000, 100),
+    100_000,
+  );
+  const finishedCutoff = new Date(
+    Date.now() - finishedDays * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  const logCutoff = new Date(
+    Date.now() - matchLogDays * 24 * 60 * 60 * 1000,
+  ).toISOString();
+
+  const db = getDb();
+  const prune = db.transaction(() => {
+    db.prepare(
+      `DELETE FROM deliveries
+       WHERE status IN ('sent', 'failed', 'skipped')
+         AND COALESCE(sent_at, created_at) < ?`,
+    ).run(finishedCutoff);
+    db.prepare('DELETE FROM vector_match_log WHERE created_at < ?').run(
+      logCutoff,
+    );
+    // 子查询返回 NULL 时（不足 keepFetchRuns 条）不会删除任何行。
+    db.prepare(
+      `DELETE FROM fetch_runs
+       WHERE id <= (
+         SELECT id FROM fetch_runs ORDER BY id DESC LIMIT 1 OFFSET ?
+       )`,
+    ).run(keepFetchRuns);
+  });
+
+  prune();
 }
 
 /** 记录本轮各来源状态与统计信息。 */
@@ -1036,6 +1111,9 @@ function mapDealRow(
   };
 }
 
+/** 首页快照最多返回的条目数，避免无界查询把全部历史读入内存。 */
+const SNAPSHOT_ITEM_LIMIT = 2000;
+
 /** 汇总页面所需的在架条目、可见来源与统计。 */
 export function getDealsSnapshot(): DealsSnapshot {
   const db = getDb();
@@ -1065,15 +1143,16 @@ export function getDealsSnapshot(): DealsSnapshot {
 
   const rows = db
     .prepare(
-      `SELECT d.*,
+      `SELECT ${DEAL_SELECT_COLUMNS},
               0 AS favorite
        FROM deals d
        WHERE (d.expires_at IS NULL OR d.expires_at > ?)
          AND d.first_seen_at >= ?
        ORDER BY COALESCE(d.published_at, d.first_seen_at) DESC,
-                d.id DESC`,
+                d.id DESC
+       LIMIT ?`,
     )
-    .all(now, retentionCutoff) as DealRow[];
+    .all(now, retentionCutoff, SNAPSHOT_ITEM_LIMIT) as DealRow[];
 
   const stored = listSources();
   const nameMap = new Map(stored.map((source) => [source.id, source.name]));
@@ -1098,12 +1177,35 @@ export function getDealsSnapshot(): DealsSnapshot {
     };
   });
 
+  const activeCount = visible.reduce(
+    (sum, source) => sum + (countMap.get(source.id) ?? 0),
+    0,
+  );
+
+  let newCount = 0;
+  if (visible.length > 0) {
+    const placeholders = visible.map(() => '?').join(', ');
+    newCount = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM deals
+           WHERE is_new = 1
+             AND (expires_at IS NULL OR expires_at > ?)
+             AND first_seen_at >= ?
+             AND source IN (${placeholders})`,
+        )
+        .get(now, retentionCutoff, ...visible.map((s) => s.id)) as {
+        count: number;
+      }
+    ).count;
+  }
+
   return {
     fetchedAt: lastRun?.fetched_at ?? null,
     sources,
     stats: {
-      activeCount: items.length,
-      newCount: items.filter((item) => item.isNew).length,
+      activeCount,
+      newCount,
     },
     announcement: getAnnouncement(),
     aiSearchEnabled: getAiSearchEnabled(),
@@ -1411,8 +1513,17 @@ export function listDealsByTag(
     .map((source) => source.id);
   if (visible.length === 0) return { items: [], total: 0 };
 
-  const limit = Math.min(Math.max(options.limit ?? 60, 1), 100);
-  const offset = Math.max(options.offset ?? 0, 0);
+  const rawLimit = options.limit ?? 60;
+  const rawOffset = options.offset ?? 0;
+  // 分页参数来自 URL，需拒绝 Infinity/NaN，否则 SQLite 绑定会抛错导致 500。
+  const limit = Math.min(
+    Math.max(Number.isFinite(rawLimit) ? Math.round(rawLimit) : 60, 1),
+    100,
+  );
+  // SQLite 的 OFFSET 超出 int64 时会抛 datatype mismatch（1e300 这类值仍通过 isFinite）。
+  const offset = Number.isFinite(rawOffset)
+    ? Math.min(Math.max(Math.round(rawOffset), 0), 10_000_000)
+    : 0;
   const where = `FROM deals d
      WHERE json_valid(d.tags)
        AND EXISTS (SELECT 1 FROM json_each(d.tags) WHERE json_each.value = ?)
@@ -1485,7 +1596,9 @@ export function getDealsList(query: DealsListQuery): DealsListResult {
   if (query.preferTags && query.preferTags.length > 0) {
     clauses.push(
       `EXISTS (
-        SELECT 1 FROM json_each(d.tags)
+        SELECT 1 FROM json_each(
+          CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END
+        )
         WHERE json_each.value IN (${query.preferTags.map(() => '?').join(', ')})
       )`,
     );
@@ -1509,7 +1622,7 @@ export function getDealsList(query: DealsListQuery): DealsListResult {
   if (ids) {
     const rows = db
       .prepare(
-        `SELECT d.*, 0 AS favorite
+        `SELECT ${DEAL_SELECT_COLUMNS}, 0 AS favorite
          FROM deals d
          WHERE ${where}
          ORDER BY COALESCE(d.published_at, d.first_seen_at) DESC,
@@ -1541,7 +1654,7 @@ export function getDealsList(query: DealsListQuery): DealsListResult {
 
   const pageRows = db
     .prepare(
-      `SELECT d.*, 0 AS favorite
+      `SELECT ${DEAL_SELECT_COLUMNS}, 0 AS favorite
        FROM deals d
        WHERE ${where} ${cursorSql}
        ORDER BY COALESCE(d.published_at, d.first_seen_at) DESC,
@@ -1716,7 +1829,12 @@ export function getTagStatus(): TagStatus {
   const raw = getRuntimeEnvRaw('AI_TAGS_ENABLED');
 
   return {
-    enabled: raw === null || raw.trim() === '' || raw.trim() !== 'false',
+    enabled:
+      raw === null ||
+      raw.trim() === '' ||
+      !['0', 'false', 'no', 'off', 'disabled'].includes(
+        raw.trim().toLowerCase(),
+      ),
     ...coverage,
     running: progress.running,
     processed: progress.processed,
@@ -2030,7 +2148,9 @@ function recordCandidates(db: Database.Database, tags: string[]): void {
          FROM tag_candidates c
          LEFT JOIN (
            SELECT j.value AS tag, COUNT(*) AS count
-           FROM deals d, json_each(d.proposed_tags) j
+           FROM deals d, json_each(
+             CASE WHEN json_valid(d.proposed_tags) THEN d.proposed_tags ELSE '[]' END
+           ) j
            GROUP BY j.value
          ) t ON t.tag = c.tag
          WHERE c.status = 'pending' AND COALESCE(t.count, 0) < 2
@@ -2046,7 +2166,9 @@ function recordCandidates(db: Database.Database, tags: string[]): void {
          FROM tag_candidates c
          LEFT JOIN (
            SELECT j.value AS tag, COUNT(*) AS count
-           FROM deals d, json_each(d.proposed_tags) j
+           FROM deals d, json_each(
+             CASE WHEN json_valid(d.proposed_tags) THEN d.proposed_tags ELSE '[]' END
+           ) j
            GROUP BY j.value
          ) t ON t.tag = c.tag
          WHERE c.status = 'pending'
@@ -2085,7 +2207,9 @@ export function getTagCandidates(limit = 100): TagCandidate[] {
        FROM tag_candidates c
        LEFT JOIN (
          SELECT j.value AS tag, COUNT(*) AS count
-         FROM deals d, json_each(d.proposed_tags) j
+         FROM deals d, json_each(
+           CASE WHEN json_valid(d.proposed_tags) THEN d.proposed_tags ELSE '[]' END
+         ) j
          GROUP BY j.value
        ) t ON t.tag = c.tag
        WHERE c.status <> 'pending' OR COALESCE(t.count, 0) >= ?
@@ -2125,7 +2249,9 @@ export function promoteTag(tag: string): void {
   const rows = db
     .prepare(
       `SELECT id, tags, proposed_tags FROM deals
-       WHERE EXISTS (SELECT 1 FROM json_each(proposed_tags) WHERE value = ?)
+       WHERE EXISTS (SELECT 1 FROM json_each(
+         CASE WHEN json_valid(proposed_tags) THEN proposed_tags ELSE '[]' END
+       ) WHERE value = ?)
        LIMIT 20000`,
     )
     .all(tag) as {
@@ -2142,20 +2268,15 @@ export function promoteTag(tag: string): void {
 
   const apply = db.transaction(() => {
     for (const row of rows) {
-      const tags = parseStoredTags(row.tags).filter((item) => item !== tag);
+      const tags = parseStoredTags(row.tags);
       const proposed = parseStoredTags(row.proposed_tags).filter(
         (item) => item !== tag,
       );
 
-      // 转正回填时按当前标签上限补位，已满则只清理候选。
+      // 转正回填时按当前标签上限补位；已满则只清理候选，不能移除已有正式标签。
       if (!tags.includes(tag) && tags.length < tagsMax) {
         tags.push(tag);
-        update.run(JSON.stringify(tags), JSON.stringify(proposed), row.id);
-        indexDealById(db, row.id, searchMaxChars);
-        continue;
       }
-
-      if (!tags.includes(tag)) continue;
       update.run(JSON.stringify(tags), JSON.stringify(proposed), row.id);
       indexDealById(db, row.id, searchMaxChars);
     }
@@ -2190,10 +2311,15 @@ export function mergeTag(from: string, to: string): void {
   const rows = db
     .prepare(
       `SELECT id, tags, proposed_tags FROM deals
-       WHERE EXISTS (SELECT 1 FROM json_each(proposed_tags) WHERE value = ?)
+       WHERE EXISTS (SELECT 1 FROM json_each(
+         CASE WHEN json_valid(proposed_tags) THEN proposed_tags ELSE '[]' END
+       ) WHERE value = ?)
+       OR EXISTS (SELECT 1 FROM json_each(
+         CASE WHEN json_valid(tags) THEN tags ELSE '[]' END
+       ) WHERE value = ?)
        LIMIT 20000`,
     )
-    .all(from) as {
+    .all(from, from) as {
     id: number;
     tags: string | null;
     proposed_tags: string | null;
@@ -2259,7 +2385,9 @@ export function listFormalTagCounts(
     .prepare(
       `SELECT j.value AS tag, COUNT(*) AS count
        FROM deals d
-       JOIN json_each(d.tags) j
+       JOIN json_each(
+         CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END
+       ) j
        WHERE 1 = 1 ${scope.sql}
        GROUP BY j.value
        HAVING count > 0
@@ -2295,7 +2423,9 @@ export function getTagSuggestions(
       .prepare(
         `SELECT j.value AS tag, COUNT(*) AS count
          FROM deals d
-         JOIN json_each(d.${column}) j
+         JOIN json_each(
+           CASE WHEN json_valid(d.${column}) THEN d.${column} ELSE '[]' END
+         ) j
          WHERE 1 = 1 ${scope.sql}
          GROUP BY j.value`,
       )
@@ -2355,7 +2485,10 @@ export function getTagSuggestions(
 }
 
 /** 使用 SQLite 在线备份生成快照，并只保留最近若干份。 */
-export function backupDatabase(dir: string, keep: number): string | null {
+export async function backupDatabase(
+  dir: string,
+  keep: number,
+): Promise<string | null> {
   const db = getDb();
   const targetDir = path.resolve(dir.trim() || path.join('data', 'backups'));
   fs.mkdirSync(targetDir, { recursive: true });
@@ -2367,7 +2500,10 @@ export function backupDatabase(dir: string, keep: number): string | null {
     .replace('T', '-');
   const file = path.join(targetDir, `app-${stamp}.db`);
 
-  db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+  // 使用 better-sqlite3 的异步备份，避免 VACUUM INTO 长时间阻塞事件循环。
+  // 同名文件可能来自上次失败的重试，先移除，否则 backup 会报 EEXIST。
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+  await db.backup(file);
 
   const oldFiles = fs
     .readdirSync(targetDir)
@@ -2694,20 +2830,41 @@ export function deleteInviteCode(id: number): boolean {
   );
 }
 
+export type RegisterError =
+  | 'EMAIL_EXISTS'
+  | 'INVITE_INVALID'
+  | 'INVITE_DISABLED'
+  | 'INVITE_EXPIRED'
+  | 'INVITE_EXHAUSTED';
+
 export type CreateUserResult =
   | { user: AccountUser }
   | {
-      error:
-        | 'EMAIL_EXISTS'
-        | 'INVITE_INVALID'
-        | 'INVITE_DISABLED'
-        | 'INVITE_EXPIRED'
-        | 'INVITE_EXHAUSTED';
+      error: RegisterError;
     };
 
 export interface RegisterInvite {
   code: string;
   consume: boolean;
+}
+
+/**
+ * 只读校验邀请码，用于在昂贵的密码哈希之前快速失败。
+ * 真正的扣减仍由 createUserWithInvite 在事务内完成，避免并发超用。
+ */
+export function checkInviteUsable(code: string): RegisterError | null {
+  const row = getDb()
+    .prepare('SELECT * FROM invite_codes WHERE code = ? COLLATE NOCASE')
+    .get(code) as InviteCodeRow | undefined;
+  if (!row) return 'INVITE_INVALID';
+  if (row.disabled === 1) return 'INVITE_DISABLED';
+  if (row.expires_at && Date.parse(row.expires_at) <= Date.now()) {
+    return 'INVITE_EXPIRED';
+  }
+  if (row.max_uses > 0 && row.used_count >= row.max_uses) {
+    return 'INVITE_EXHAUSTED';
+  }
+  return null;
 }
 
 /** 创建用户并在同一事务内校验/扣减邀请码，避免并发超用。 */
@@ -3529,7 +3686,7 @@ export function backfillRecentDeals(
 
 export function listPendingDeliveries(
   limit = 50,
-  options: { skipSaturatedUsers?: number } = {},
+  options: { skipSaturatedUsers?: number; afterId?: number } = {},
 ): PendingDelivery[] {
   // 已达今日限额的用户，其条目会一直留在队列里占位，
   // 若不在这里剔除，会让后续用户的待投递永远排不上（队列饥饿）。
@@ -3543,10 +3700,18 @@ export function listPendingDeliveries(
              AND sent.sent_at >= ?
          ) < ?`
       : '';
+  // 按 id 游标分批：合并摘要需要遍历整个待投递队列，
+  // 单次 LIMIT 会把超过上限的条目留在队列里被静默丢弃。
+  const afterId = options.afterId;
+  const cursorFilter =
+    typeof afterId === 'number' && Number.isInteger(afterId) && afterId > 0
+      ? 'AND d.id > ?'
+      : '';
   const params: unknown[] = [new Date().toISOString()];
   if (saturationFilter) {
     params.push(todayStartIso(), saturated);
   }
+  if (cursorFilter) params.push(afterId);
   params.push(limit);
 
   const rows = getDb()
@@ -3564,6 +3729,7 @@ export function listPendingDeliveries(
        WHERE d.status = 'pending' AND d.attempts < 3
          AND (deals.expires_at IS NULL OR deals.expires_at > ?)
          ${saturationFilter}
+         ${cursorFilter}
        ORDER BY d.id ASC
        LIMIT ?`,
     )
@@ -3877,7 +4043,7 @@ export function markDigestFailed(id: number, error: string): void {
        SET attempts = attempts + 1,
            status = CASE WHEN attempts + 1 >= 3 THEN 'failed' ELSE 'pending' END,
            error = ?
-       WHERE id = ?`,
+       WHERE id = ? AND status = 'pending'`,
     )
     .run(error.slice(0, 300), id);
 }
@@ -3997,7 +4163,9 @@ export function getSiteDigestStats(): SiteDigestStats {
     db
       .prepare(
         `SELECT json_each.value AS tag, COUNT(*) AS count
-         FROM deals d, json_each(d.tags)
+         FROM deals d, json_each(
+           CASE WHEN json_valid(d.tags) THEN d.tags ELSE '[]' END
+         )
          WHERE d.first_seen_at >= ?
            AND (d.expires_at IS NULL OR d.expires_at > ?)
            AND d.source IN (${placeholders})
@@ -4180,7 +4348,9 @@ export function getRelatedDeals(
        WHERE deals.id != ?
          AND (deals.expires_at IS NULL OR deals.expires_at > ?)
          AND EXISTS (
-           SELECT 1 FROM json_each(deals.tags) WHERE value IN (${tags
+           SELECT 1 FROM json_each(
+             CASE WHEN json_valid(deals.tags) THEN deals.tags ELSE '[]' END
+           ) WHERE value IN (${tags
              .map(() => '?')
              .join(', ')})
          )
@@ -4274,13 +4444,19 @@ export function upsertKeywordVector(
   ).run(normalized, vector, dims, model, count, new Date().toISOString());
 }
 
-/** 读取指定模型的全部关键词向量，供内存缓存使用。 */
-export function listKeywordVectors(model: string): KeywordVectorRecord[] {
+/** 读取指定模型的关键词向量，供内存缓存使用；限制条数避免无界载入。 */
+export function listKeywordVectors(
+  model: string,
+  limit = 5000,
+): KeywordVectorRecord[] {
   return getDb()
     .prepare(
-      `SELECT keyword, vector, dims FROM keyword_vectors WHERE model = ?`,
+      `SELECT keyword, vector, dims FROM keyword_vectors
+       WHERE model = ?
+       ORDER BY source_count DESC, keyword
+       LIMIT ?`,
     )
-    .all(model) as KeywordVectorRecord[];
+    .all(model, Math.min(Math.max(limit, 1), 20_000)) as KeywordVectorRecord[];
 }
 
 /** 刷新引用计数，并回收 30 天内无人使用的旧向量。 */

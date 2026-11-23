@@ -85,7 +85,7 @@ export async function PATCH(
   if (typeof body.password === 'string' && body.password) {
     if (!isValidPassword(body.password)) {
       return NextResponse.json(
-        { error: '密码长度需为 6–72 位' },
+        { error: '密码长度需为 8–72 位' },
         { status: 400 },
       );
     }

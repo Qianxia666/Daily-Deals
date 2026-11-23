@@ -19,6 +19,16 @@ services:
     # dns:
     #   - 223.5.5.5
     #   - 119.29.29.29
+    # 容器以 root 启动，entrypoint 修正数据目录属主后降权到 nextjs；
+    # 因此只保留 chown/setuid/setgid 三个能力，其余全部丢弃。
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
     volumes:
       - ./data:/app/data
     logging:

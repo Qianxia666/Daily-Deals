@@ -1,11 +1,15 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
+import { cache } from 'react';
 import { SOURCE_NAMES } from '@/lib/constants';
 import { ensurePublicDigest, isValidDigestDate } from '@/lib/digest';
 import { getSiteSettings } from '@/lib/runtime-settings';
 
 export const dynamic = 'force-dynamic';
+
+// generateMetadata 与页面在同一请求内各调用一次，用 cache() 合并为一次构建。
+const getDigest = cache((date: string) => ensurePublicDigest(date));
 
 export async function generateMetadata({
   params,
@@ -14,7 +18,7 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { date } = await params;
   if (!isValidDigestDate(date)) return { title: '优惠汇总' };
-  const digest = ensurePublicDigest(date);
+  const digest = getDigest(date);
   const site = getSiteSettings();
   return {
     title: `${digest.title} · ${site.title}`,
@@ -31,7 +35,7 @@ export default async function DigestDatePage({
   const { date } = await params;
   if (!isValidDigestDate(date)) notFound();
 
-  const digest = ensurePublicDigest(date);
+  const digest = getDigest(date);
   const site = getSiteSettings();
 
   return (

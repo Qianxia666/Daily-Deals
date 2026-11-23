@@ -36,7 +36,7 @@ import {
   getRuntimeEnvNumber,
   getSearchSuggestTags,
 } from '@/lib/runtime-settings';
-import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
+import { checkGlobalRateLimit, checkRateLimit, getClientIp } from '@/lib/rate-limit';
 import {
   rewriteSearchQuery,
   searchDealsWithAi,
@@ -72,6 +72,9 @@ interface CacheEntry {
   expiresAt: number;
   payload: SearchResponse;
 }
+
+/** 与 /api/deals 的单页上限保持一致，避免搜索结果比列表接口还能多出数倍。 */
+const KEYWORD_RESULT_CAP = 120;
 
 const aiCache = new Map<string, CacheEntry>();
 const rewriteCache = new Map<
@@ -285,6 +288,7 @@ async function buildSemanticSuggestions(
   query: string,
   keywords: string[],
   options: SearchScopeOptions,
+  limitKey: string,
 ): Promise<TagSuggestion[]> {
   const limit = getSearchSuggestTags();
   if (limit <= 0) return [];
@@ -298,7 +302,7 @@ async function buildSemanticSuggestions(
     if (counts.length === 0) return [];
 
     if (
-      !checkRateLimit('search-tag-suggest', getAiSearchRewritePerMinute()).ok
+      !checkRateLimit(`search-tag-suggest:${limitKey}`, getAiSearchRewritePerMinute()).ok
     ) {
       return buildSuggestions([query, ...keywords], options);
     }
@@ -332,13 +336,13 @@ async function buildSemanticSuggestions(
   }
 }
 
-function emptyResponse(
+function buildEmptyPayload(
   query: string,
   reason: string,
   windowDays: number,
   suggestedTags: TagSuggestion[] = [],
-): NextResponse {
-  const payload: SearchResponse = {
+): SearchResponse {
+  return {
     query,
     mode: 'keyword',
     ids: [],
@@ -346,10 +350,20 @@ function emptyResponse(
     windowDays,
     ...(suggestedTags.length > 0 ? { suggestedTags } : {}),
   };
+}
 
-  return NextResponse.json(payload, {
-    headers: { 'Cache-Control': 'no-store' },
-  });
+function emptyResponse(
+  query: string,
+  reason: string,
+  windowDays: number,
+  suggestedTags: TagSuggestion[] = [],
+): NextResponse {
+  return NextResponse.json(
+    buildEmptyPayload(query, reason, windowDays, suggestedTags),
+    {
+      headers: { 'Cache-Control': 'no-store' },
+    },
+  );
 }
 
 /**
@@ -419,6 +433,20 @@ export async function POST(request: NextRequest) {
       1,
       300,
     );
+    // 指纹可被轮换请求头绕过，全站兜底桶保证总量仍受控。
+    const global = checkGlobalRateLimit('search', Math.max(limit * 10, 600));
+    if (!global.ok) {
+      return NextResponse.json(
+        { error: '请求过于频繁，请稍后再试' },
+        {
+          status: 429,
+          headers: {
+            'Retry-After': String(global.retryAfter),
+            'Cache-Control': 'no-store',
+          },
+        },
+      );
+    }
     const result = checkRateLimit(`search:${getClientIp(request)}`, limit);
     if (!result.ok) {
       return NextResponse.json(
@@ -459,7 +487,10 @@ export async function POST(request: NextRequest) {
     : Math.max(1, Math.min(baseDays, retention));
   const windowDays = Math.max(1, Math.min(retention, days ?? retention));
 
-  const keywordMax = getKeywordSearchMaxResults();
+  const keywordMax = Math.min(
+    getKeywordSearchMaxResults(),
+    KEYWORD_RESULT_CAP,
+  );
   const recallLimit = getAiSearchRecallLimit();
   const rerankLimit = getAiSearchRerankLimit();
   const useSummary = getAiSearchUseSummary();
@@ -469,13 +500,46 @@ export async function POST(request: NextRequest) {
   const fetchLimit =
     mode === 'ai'
       ? Math.min(Math.max(recallLimit * 2, 120), 400)
-      : Math.min(Math.max(keywordMax * 2, 100), 500);
+      : Math.min(Math.max(keywordMax * 2, 100), KEYWORD_RESULT_CAP);
 
   const scopeOptions = {
     activeOnly,
     days,
     visibleSources: getVisibleSourceIds(),
     limit: fetchLimit,
+  };
+
+  const cacheEnabled = getRuntimeBool('AI_SEARCH_CACHE_ENABLED', true);
+  // 仅包含查询与配置的缓存键：命中时可直接返回，不再扣减 AI 配额。
+  const quotaFreeCacheKey = [
+    query,
+    activeOnly ? 'active' : `days:${days}`,
+    recallLimit,
+    rerankLimit,
+    useSummary ? 'summary' : 'title',
+    synonyms ? 'syn' : 'plain',
+    getAiSearchRerankEnabled() ? 'rerank' : 'plain',
+    getAiSearchMaxPerSource(),
+    getSearchSuggestTags(),
+    getLastFetchedAt() ?? '',
+  ].join('\u0000');
+
+  /** 写入进程内 AI 结果缓存；命中后无需再次扣减配额。 */
+  const cacheAiPayload = (key: string, payload: SearchResponse): void => {
+    if (!cacheEnabled) return;
+    if (aiCache.size > 500) {
+      const now = Date.now();
+      for (const [entryKey, entry] of aiCache) {
+        if (entry.expiresAt <= now) aiCache.delete(entryKey);
+      }
+      if (aiCache.size > 500) aiCache.clear();
+    }
+    aiCache.set(key, {
+      expiresAt:
+        Date.now() +
+        getRuntimeEnvNumber('AI_SEARCH_CACHE_MINUTES', 5, 1, 120) * 60_000,
+      payload,
+    });
   };
 
   // 用户点击标签后走精确标签过滤，不调用 AI，也不做关键词召回。
@@ -520,6 +584,7 @@ export async function POST(request: NextRequest) {
   }
 
   // AI 搜索仅对登录用户开放，并按日扣减配额；关键词搜索无需登录。
+  let aiSearchUserId: number | null = null;
   if (mode === 'ai') {
     const user = await getCurrentUser();
     if (!user) {
@@ -530,6 +595,17 @@ export async function POST(request: NextRequest) {
         },
         { status: 401, headers: { 'Cache-Control': 'no-store' } },
       );
+    }
+    aiSearchUserId = user.id;
+
+    // 缓存命中不消耗配额，也不触发任何 AI 调用。
+    if (cacheEnabled) {
+      const hit = aiCache.get(quotaFreeCacheKey);
+      if (hit && hit.expiresAt > Date.now()) {
+        return NextResponse.json(hit.payload, {
+          headers: { 'Cache-Control': 'no-store', 'X-Search-Cache': 'hit' },
+        });
+      }
     }
 
     const quota = consumeAiQuota(user.id, getAiSearchDailyLimit());
@@ -576,6 +652,32 @@ export async function POST(request: NextRequest) {
     if (recalled.candidates) candidates = recalled.candidates;
   }
 
+  const cacheKey = [
+    query,
+    activeOnly ? 'active' : `days:${days}`,
+    recallLimit,
+    rerankLimit,
+    useSummary ? 'summary' : 'title',
+    synonyms ? 'syn' : 'plain',
+    getAiSearchRerankEnabled() ? 'rerank' : 'plain',
+    getAiSearchMaxPerSource(),
+    getSearchSuggestTags(),
+    getLastFetchedAt() ?? '',
+    candidates?.length ?? 0,
+  ].join('\u0000');
+
+  /**
+   * AI 模式在召回为空时也已经扣减了配额；把空结果写进缓存，
+   * 相同查询重复请求可直接命中，不再重复扣费。
+   */
+  const cacheEmptyAi = (payload: SearchResponse): NextResponse => {
+    cacheAiPayload(cacheKey, payload);
+    cacheAiPayload(quotaFreeCacheKey, payload);
+    return NextResponse.json(payload, {
+      headers: { 'Cache-Control': 'no-store' },
+    });
+  };
+
   if (mode === 'keyword') {
     if (candidates && candidates.length > 0) {
       const ids = rankCandidates(candidates, 0, keywordMax).map(
@@ -603,7 +705,7 @@ export async function POST(request: NextRequest) {
       const payload: SearchResponse = {
         query,
         mode: 'keyword',
-        ids: keywordMatches(scoped, query, false),
+        ids: keywordMatches(scoped, query, false).slice(0, keywordMax),
         reason:
           requestedMode === 'ai'
             ? 'AI 搜索已被管理员关闭，已按关键词匹配'
@@ -645,12 +747,14 @@ export async function POST(request: NextRequest) {
       activeOnly ? isActive(item) : withinDays(item, windowDays),
     );
     if (scoped.length === 0) {
-      return emptyResponse(
-        query,
-        activeOnly
-          ? '当前没有可搜索的在架优惠'
-          : `最近 ${windowDays} 天没有可搜索的优惠`,
-        windowDays,
+      return cacheEmptyAi(
+        buildEmptyPayload(
+          query,
+          activeOnly
+            ? '当前没有可搜索的在架优惠'
+            : `最近 ${windowDays} 天没有可搜索的优惠`,
+          windowDays,
+        ),
       );
     }
 
@@ -664,47 +768,47 @@ export async function POST(request: NextRequest) {
       dealToSearchDeal(item, useSummary),
     );
   } else {
-    return emptyResponse(
-      query,
-      rewriteKeywords.length > 0
-        ? activeOnly
-          ? `在架优惠中没有找到相关结果，已尝试近义改写：${rewriteKeywords.join('、')}`
-          : `最近 ${windowDays} 天没有找到相关优惠，已尝试近义改写：${rewriteKeywords.join('、')}`
-        : activeOnly
-          ? '在架优惠中没有找到相关结果，试试换个说法'
-          : `最近 ${windowDays} 天没有找到相关优惠`,
-      windowDays,
-      await buildSemanticSuggestions(query, rewriteKeywords, scopeOptions),
+    return cacheEmptyAi(
+      buildEmptyPayload(
+        query,
+        rewriteKeywords.length > 0
+          ? activeOnly
+            ? `在架优惠中没有找到相关结果，已尝试近义改写：${rewriteKeywords.join('、')}`
+            : `最近 ${windowDays} 天没有找到相关优惠，已尝试近义改写：${rewriteKeywords.join('、')}`
+          : activeOnly
+            ? '在架优惠中没有找到相关结果，试试换个说法'
+            : `最近 ${windowDays} 天没有找到相关优惠`,
+        windowDays,
+        await buildSemanticSuggestions(
+          query,
+          rewriteKeywords,
+          scopeOptions,
+          String(aiSearchUserId ?? getClientIp(request)),
+        ),
+      ),
     );
   }
 
   if (searchable.length === 0) {
-    return emptyResponse(
-      query,
-      '没有找到相关优惠',
-      windowDays,
-      await buildSemanticSuggestions(query, rewriteKeywords, scopeOptions),
+    return cacheEmptyAi(
+      buildEmptyPayload(
+        query,
+        '没有找到相关优惠',
+        windowDays,
+        await buildSemanticSuggestions(
+          query,
+          rewriteKeywords,
+          scopeOptions,
+          String(aiSearchUserId ?? getClientIp(request)),
+        ),
+      ),
     );
   }
 
-  const cacheEnabled = getRuntimeBool('AI_SEARCH_CACHE_ENABLED', true);
   let rewritePrefix =
     rewriteKeywords.length > 0
       ? `已将搜索理解为「${rewriteKeywords.join('、')}」。`
       : '';
-  const cacheKey = [
-    query,
-    activeOnly ? 'active' : `days:${days}`,
-    recallLimit,
-    rerankLimit,
-    useSummary ? 'summary' : 'title',
-    synonyms ? 'syn' : 'plain',
-    getAiSearchRerankEnabled() ? 'rerank' : 'plain',
-    getAiSearchMaxPerSource(),
-    getSearchSuggestTags(),
-    getLastFetchedAt() ?? '',
-    candidates?.length ?? 0,
-  ].join('\u0000');
 
   if (cacheEnabled) {
     const hit = aiCache.get(cacheKey);
@@ -726,6 +830,9 @@ export async function POST(request: NextRequest) {
       reason: `${rewritePrefix}已按全文索引与新鲜度排序（AI 精排已关闭）`,
       windowDays,
     };
+    // 该分支虽然不调用 AI，但已扣减配额；写入缓存让相同查询直接命中，避免重复扣费。
+    cacheAiPayload(cacheKey, payload);
+    cacheAiPayload(quotaFreeCacheKey, payload);
     return NextResponse.json(payload, {
       headers: { 'Cache-Control': 'no-store' },
     });
@@ -794,7 +901,12 @@ export async function POST(request: NextRequest) {
     const ids = finalSelection.ids;
     const suggestedTags =
       ids.length === 0
-        ? await buildSemanticSuggestions(query, rewriteKeywords, scopeOptions)
+        ? await buildSemanticSuggestions(
+            query,
+            rewriteKeywords,
+            scopeOptions,
+            String(aiSearchUserId ?? getClientIp(request)),
+          )
         : [];
     const payload: SearchResponse = {
       query,
@@ -808,21 +920,9 @@ export async function POST(request: NextRequest) {
       ...(ids.length === 0 ? { suggestedTags } : {}),
     };
 
-    if (cacheEnabled) {
-      if (aiCache.size > 500) {
-        const now = Date.now();
-        for (const [key, entry] of aiCache) {
-          if (entry.expiresAt <= now) aiCache.delete(key);
-        }
-        if (aiCache.size > 500) aiCache.clear();
-      }
-      aiCache.set(cacheKey, {
-        expiresAt:
-          Date.now() +
-          getRuntimeEnvNumber('AI_SEARCH_CACHE_MINUTES', 5, 1, 120) * 60_000,
-        payload,
-      });
-    }
+    cacheAiPayload(cacheKey, payload);
+    // 同时写入查询级键，供配额检查前直接命中。
+    cacheAiPayload(quotaFreeCacheKey, payload);
 
     return NextResponse.json(payload, {
       headers: { 'Cache-Control': 'no-store' },

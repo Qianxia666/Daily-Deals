@@ -21,6 +21,22 @@ import { Button } from './ui/button';
 import { CollapsibleSection } from './ui/collapsible-section';
 import { Input } from './ui/input';
 
+/** 生成随机初始密码；crypto.randomUUID 在非安全上下文不可用，改用 getRandomValues。 */
+function randomPassword(length = 10): string {
+  const bytes = new Uint8Array(length);
+  if (
+    typeof crypto !== 'undefined' &&
+    typeof crypto.getRandomValues === 'function'
+  ) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(bytes, (byte) => (byte % 36).toString(36)).join('');
+}
+
 const KIND_LABELS: Record<ChannelKind, string> = {
   wecom: '企业微信',
   feishu: '飞书',
@@ -478,8 +494,10 @@ export function AdminUserManager() {
                     <label className="min-w-0 flex-1 text-[11px] text-slate-500">
                       重置密码
                       <Input
+                        type="password"
+                        autoComplete="new-password"
                         value={passwordDraft}
-                        placeholder="6–72 位，留空不修改"
+                        placeholder="8–72 位，留空不修改"
                         onChange={(event) =>
                           setPasswordDraft(event.target.value)
                         }
@@ -489,11 +507,7 @@ export function AdminUserManager() {
                     <Button
                       variant="ghost"
                       className="h-10"
-                      onClick={() =>
-                        setPasswordDraft(
-                          crypto.randomUUID().replace(/-/g, '').slice(0, 10),
-                        )
-                      }
+                      onClick={() => setPasswordDraft(randomPassword())}
                     >
                       随机生成
                     </Button>
