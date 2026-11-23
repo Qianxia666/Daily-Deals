@@ -1,7 +1,7 @@
-import { fetchText } from '../http';
 import { decodeEntities, stripHtml } from '../rss';
 import { SOURCE_TIMEOUT_MS } from '../sources';
 import type { RawDeal } from './types';
+import { fetchXianbaoText } from './xianbao-session';
 
 const DEFAULT_URL = 'https://new.xianbao.fun/category-weibo/';
 const ORIGIN = 'https://new.xianbao.fun';
@@ -83,15 +83,11 @@ export async function fetchXianbao(
   url: string = DEFAULT_URL,
   sourceId = 'xianbao',
 ): Promise<RawDeal[]> {
-  const html = await fetchText(
+  const html = await fetchXianbaoText(
     url,
     {
-      headers: {
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        Referer: `${ORIGIN}/`,
-        Cookie: 'xb_hpass=1',
-      },
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      Referer: `${ORIGIN}/`,
     },
     SOURCE_TIMEOUT_MS,
   );

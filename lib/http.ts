@@ -114,16 +114,10 @@ function detectCharset(contentType: string, head: string): string {
   return fromXml ? normalizeCharset(fromXml) : 'utf-8';
 }
 
-export async function fetchText(
-  url: string,
-  init: { headers?: HeadersInit } = {},
-  timeoutMs: number = SOURCE_TIMEOUT_MS,
+/** 按响应头与 XML 声明解码响应体，供需要自行处理状态码的调用方复用。 */
+export async function readResponseText(
+  response: Awaited<ReturnType<typeof request>>,
 ): Promise<string> {
-  const response = await request(url, init, timeoutMs);
-  if (!response.ok) {
-    throw new HttpError(response.status);
-  }
-
   const buffer = Buffer.from(await response.arrayBuffer());
   const head = buffer.subarray(0, 300).toString('latin1');
   const charset = detectCharset(
@@ -136,6 +130,18 @@ export async function fetchText(
   } catch {
     return buffer.toString('utf8');
   }
+}
+
+export async function fetchText(
+  url: string,
+  init: { headers?: HeadersInit } = {},
+  timeoutMs: number = SOURCE_TIMEOUT_MS,
+): Promise<string> {
+  const response = await request(url, init, timeoutMs);
+  if (!response.ok) {
+    throw new HttpError(response.status);
+  }
+  return readResponseText(response);
 }
 
 export function describeFetchError(

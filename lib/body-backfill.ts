@@ -1,6 +1,7 @@
 import { listPendingBodyDeals, markDealBodyFetched, saveDealBody } from './db';
 import type { PendingBodyDeal } from './db';
 import { extractBody, titleFromBody } from './fetchers/body';
+import { fetchXianbaoText } from './fetchers/xianbao-session';
 import { fetchText, HttpError } from './http';
 import { SOURCE_TIMEOUT_MS } from './sources';
 
@@ -19,11 +20,10 @@ const failures = new Map<string, number>();
 
 function headersFor(kind: string, link: string): Record<string, string> {
   if (kind === 'xianbao') {
-    // 线报酷使用 Cookie 校验通行，详情页同样需要。
+    // 线报酷的反爬 cookie 由 fetchXianbaoText 统一维护。
     return {
       Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
       Referer: `${new URL(link).origin}/`,
-      Cookie: 'xb_hpass=1',
     };
   }
 
@@ -45,11 +45,15 @@ type BodyResult =
 
 async function fetchBody(deal: PendingBodyDeal): Promise<BodyResult> {
   try {
-    const html = await fetchText(
-      deal.link,
-      { headers: headersFor(deal.kind, deal.link) },
-      SOURCE_TIMEOUT_MS,
-    );
+    const headers = headersFor(deal.kind, deal.link);
+    const html =
+      deal.kind === 'xianbao'
+        ? await fetchXianbaoText(deal.link, headers, SOURCE_TIMEOUT_MS)
+        : await fetchText(
+            deal.link,
+            { headers },
+            SOURCE_TIMEOUT_MS,
+          );
 
     const text = extractBody(deal.kind, html);
     if (!text) return { kind: 'empty' };

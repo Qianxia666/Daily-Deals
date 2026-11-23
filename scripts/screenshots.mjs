@@ -3,7 +3,7 @@
 import { chromium } from 'playwright-core';
 import { mkdir } from 'node:fs/promises';
 
-const BASE = (process.env.SITE_BASE || 'https://ym.996898.xyz').replace(/\/$/, '');
+const BASE = (process.env.SITE_BASE || 'http://localhost:3000').replace(/\/$/, '');
 const OUT = 'screenshots';
 const CHROME = process.env.CHROME_PATH || undefined;
 

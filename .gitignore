@@ -23,6 +23,7 @@ data/
 .claude/
 skills-lock.json
 *.tsbuildinfo
+.uploads/
 
 # logs & misc
 *.log
