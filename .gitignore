@@ -7,7 +7,7 @@ out/
 next-env.d.ts
 
 # database / local data
-data/
+/data/
 *.db
 *.db-wal
 *.db-shm
